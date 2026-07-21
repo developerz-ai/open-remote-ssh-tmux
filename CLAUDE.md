@@ -179,3 +179,7 @@ duplicate/zombie session).
   user or risks orphaned sessions, surface it — don't ship it quietly.
 - tmux is Unix-only — degrade gracefully on Windows remotes, never break the base
   SSH connect.
+
+## Note
+
+Do not use git worktrees — work directly in this checkout. See `.claude/commands/feature.md` and `.claude/commands/planx.md`.

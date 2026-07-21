@@ -62,6 +62,10 @@ zombie sessions).
    degradation**. Inject `Log` and collaborators via constructors, as
    `extension.ts` already does. Keep upstream files un-reformatted so future
    merges from `jeanp413/open-remote-ssh` stay clean.
+   **No git worktrees.** Work directly in this checkout — never `isolation:
+   worktree`, never a per-agent worktree dir. Parallel `Task` agents share this
+   one tree and coordinate: disjoint files per agent, one branch for the batch,
+   stage only your own paths, never stash or check out over another agent's work.
 
 4. **Verify.** The green gate is:
    - **Unit tests green** — written test-first (TDD). If the runner isn't wired up
