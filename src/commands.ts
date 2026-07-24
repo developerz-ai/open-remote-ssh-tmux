@@ -69,6 +69,14 @@ export async function openSSHConfigFile() {
 export const KILL_SESSIONS_CONFIRM_LABEL = 'Kill Sessions';
 
 /**
+ * The kill command's id — single source of truth shared by `extension.ts`'s
+ * `registerCommand` call and `package.json`'s `contributes.commands` entry.
+ * Exported so a drift-guard test can assert the manifest and the registration stay
+ * in lockstep (see `test/package-manifest.test.ts`).
+ */
+export const KILL_WORKSPACE_SESSIONS_COMMAND_ID = 'openremotessh.tmux.killWorkspaceSessions';
+
+/**
  * The reaper capability the kill command needs, declared here as a narrow local
  * interface (ISP) so this module depends on a behaviour, not on the tmux layer's
  * types: force-kill every persistent session of one (host, workspace), returning the

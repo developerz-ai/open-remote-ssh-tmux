@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import Log from './common/logger';
 import { RemoteSSHResolver, REMOTE_SSH_AUTHORITY } from './authResolver';
-import { killWorkspaceSessions, openSSHConfigFile, promptOpenRemoteSSHWindow, type WorkspaceKillTarget } from './commands';
+import { KILL_WORKSPACE_SESSIONS_COMMAND_ID, killWorkspaceSessions, openSSHConfigFile, promptOpenRemoteSSHWindow, type WorkspaceKillTarget } from './commands';
 import { HostTreeDataProvider } from './hostTreeView';
 import { getRemoteWorkspaceLocationData, RemoteLocationHistory } from './remoteLocationHistory';
 import { TmuxTerminalProvider, type OpenTerminal } from './tmux/terminalProvider';
@@ -37,7 +37,7 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(vscode.commands.registerCommand('openremotessh.openEmptyWindowInCurrentWindow', () => promptOpenRemoteSSHWindow(true)));
     context.subscriptions.push(vscode.commands.registerCommand('openremotessh.openConfigFile', () => openSSHConfigFile()));
     context.subscriptions.push(vscode.commands.registerCommand('openremotessh.showLog', () => logger.show()));
-    context.subscriptions.push(vscode.commands.registerCommand('openremotessh.tmux.killWorkspaceSessions', () => killWorkspaceSessions(() => resolveKillTarget(remoteSSHResolver, logger))));
+    context.subscriptions.push(vscode.commands.registerCommand(KILL_WORKSPACE_SESSIONS_COMMAND_ID, () => killWorkspaceSessions(() => resolveKillTarget(remoteSSHResolver, logger))));
 }
 
 /**
