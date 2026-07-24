@@ -10,7 +10,12 @@ DISTRO_VSCODIUM_RELEASE="%%DISTRO_VSCODIUM_RELEASE%%"
 SERVER_APP_NAME="%%SERVER_APP_NAME%%"
 SERVER_INITIAL_EXTENSIONS="%%SERVER_INITIAL_EXTENSIONS%%"
 SERVER_LISTEN_FLAG="%%SERVER_LISTEN_FLAG%%"
-SERVER_DATA_DIR="%%SERVER_DATA_DIR%%"
+# Unquoted: serverSetup.ts's escapeCustomInstallPath already emits a fully
+# shell-safe expression here (a single-quoted literal, optionally prefixed
+# with a raw, still-expandable `$HOME`) — wrapping it in another layer of
+# double quotes would turn its escaping single-quotes into literal
+# characters in the resulting path instead of quoting them away.
+SERVER_DATA_DIR=%%SERVER_DATA_DIR%%
 SERVER_DATA_DIR_FLAG="%%SERVER_DATA_DIR_FLAG%%"
 SERVER_DIR="$SERVER_DATA_DIR/bin/$DISTRO_COMMIT"
 SERVER_SCRIPT="$SERVER_DIR/bin/$SERVER_APP_NAME"
@@ -141,7 +146,10 @@ if [[ $OS_RELEASE_ID = alpine ]]; then
   PLATFORM=$OS_RELEASE_ID
 fi
 
-SERVER_DOWNLOAD_URL="$(echo "%%SERVER_DOWNLOAD_URL_TEMPLATE%%" | sed "s/\${quality}/$DISTRO_QUALITY/g" | sed "s/\${version}/$DISTRO_VERSION/g" | sed "s/\${commit}/$DISTRO_COMMIT/g" | sed "s/\${os}/$PLATFORM/g" | sed "s/\${arch}/$SERVER_ARCH/g" | sed "s/\${release}/$DISTRO_VSCODIUM_RELEASE/g")"
+# %%SERVER_DOWNLOAD_URL_TEMPLATE%% is substituted as an already single-quoted
+# literal (serverSetup.ts) — unquoted here so that quoting is used as-is
+# instead of being nested inside another pair of double quotes.
+SERVER_DOWNLOAD_URL="$(echo %%SERVER_DOWNLOAD_URL_TEMPLATE%% | sed "s/\${quality}/$DISTRO_QUALITY/g" | sed "s/\${version}/$DISTRO_VERSION/g" | sed "s/\${commit}/$DISTRO_COMMIT/g" | sed "s/\${os}/$PLATFORM/g" | sed "s/\${arch}/$SERVER_ARCH/g" | sed "s/\${release}/$DISTRO_VSCODIUM_RELEASE/g")"
 
 # Check if server script is already installed
 if [[ ! -f "$SERVER_SCRIPT" ]]; then

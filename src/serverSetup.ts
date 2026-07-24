@@ -2,6 +2,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import Log from './common/logger';
+import { escapeShellArg } from './common/shellQuote';
 import { getVSCodeServerConfig, ServerVersion, ServerValidation } from './serverConfig';
 import SSHConnection from './ssh/sshConnection';
 import { fetchRelease, IRelease } from './fetchRelease';
@@ -10,11 +11,17 @@ import { fetchRelease, IRelease } from './fetchRelease';
  * Reads a script template from <extensionPath>/scripts/<templateName> and
  * replaces every %%KEY%% occurrence with the matching value from `variables`.
  */
-function compileTemplate(templateName: string, variables: Record<string, string>, extensionPath: string): string {
+export function compileTemplate(templateName: string, variables: Record<string, string>, extensionPath: string): string {
     const templatePath = path.join(extensionPath, 'src', 'scripts', templateName);
     let content = fs.readFileSync(templatePath, 'utf8');
     for (const [key, value] of Object.entries(variables)) {
-        content = content.replace(new RegExp(`%%${key}%%`, 'g'), value);
+        // A replacer *function* is required here, not the raw `value` string:
+        // String.replace(regex, someString) treats "$&"/"$$"/"$1" etc. in the
+        // replacement string as special patterns (insert-the-match,
+        // literal-$, insert-capture-group). A templated value containing any
+        // of those (e.g. a URL query string, a path) would silently corrupt
+        // the compiled script. `() => value` always inserts it literally.
+        content = content.replace(new RegExp(`%%${key}%%`, 'g'), () => value);
     }
     return content;
 }
@@ -266,7 +273,15 @@ export async function installCodeServer(
     };
 }
 
-function parseServerInstallOutput(str: string, scriptId: string): { [k: string]: string } | undefined {
+// Each result line is emitted by the scripts as `key==value==` (see
+// print_install_results_and_exit in server-setup.sh/.ps1). A plain
+// `line.split('==')` breaks on a value that itself contains "==" (e.g. a
+// URL query string) — the destructured `[key, value]` silently drops
+// everything past the 2nd segment. Anchoring on the trailing "==" and
+// capturing greedily up to it preserves any "==" inside the value.
+const RESULT_LINE_PATTERN = /^(\w+)==(.*)==$/;
+
+export function parseServerInstallOutput(str: string, scriptId: string): { [k: string]: string } | undefined {
     const startResultStr = `${scriptId}: start`;
     const endResultStr = `${scriptId}: end`;
 
@@ -285,17 +300,45 @@ function parseServerInstallOutput(str: string, scriptId: string): { [k: string]:
     const resultMap: { [k: string]: string } = {};
     const resultArr = installResult.split(/\r?\n/);
     for (const line of resultArr) {
-        const [key, value] = line.split('==');
+        if (!line) {
+            // Blank lines (leading/trailing newline around the markers)
+            // previously produced a bogus resultMap[''] entry.
+            continue;
+        }
+        const match = line.match(RESULT_LINE_PATTERN);
+        if (!match) {
+            continue;
+        }
+        const [, key, value] = match;
         resultMap[key] = value;
     }
 
     return resultMap;
 }
 
-function generateBashInstallScript({ id, quality, version, commit, release, extensionIds, envVariables, useSocketPath, serverApplicationName, serverDataFolderName, serverDownloadUrlTemplate, customInstallPath, serverValidation }: ServerInstallOptions, extensionPath: string): string {
+// `customInstallPath` comes from the user-configurable `remote.SSH.serverInstallPath`
+// setting (per-host path map, see authResolver.ts's `findServerInstallPath`
+// lookup) that server-setup.sh's
+// `SERVER_DATA_DIR=%%SERVER_DATA_DIR%%` assignment splices in unquoted, so
+// the *value itself* must supply safe shell quoting — a bare double-quoted
+// substitution can't defend against embedded `"`/`` ` ``/`$( )` (CLAUDE.md
+// injection guardrail). `~`/`~/…` still needs runtime `$HOME` expansion, so
+// that prefix is emitted raw (unquoted, safe in an assignment RHS — bash
+// doesn't word-split there) and only the remainder is single-quoted.
+export function escapeCustomInstallPath(customInstallPath: string): string {
+    const homeShorthand = customInstallPath.match(/^~(?=\/|$)/);
+    if (!homeShorthand) {
+        return escapeShellArg(customInstallPath);
+    }
+
+    const rest = customInstallPath.slice(1);
+    return rest ? `$HOME${escapeShellArg(rest)}` : '$HOME';
+}
+
+export function generateBashInstallScript({ id, quality, version, commit, release, extensionIds, envVariables, useSocketPath, serverApplicationName, serverDataFolderName, serverDownloadUrlTemplate, customInstallPath, serverValidation }: ServerInstallOptions, extensionPath: string): string {
     const extensions = extensionIds.map(extId => '--install-extension ' + extId).join(' ');
     const serverDataDir = customInstallPath
-        ? customInstallPath.replace(/^~(?=\/|$)/, '$HOME')
+        ? escapeCustomInstallPath(customInstallPath)
         : `$HOME/${serverDataFolderName}`;
     const listenFlag = useSocketPath
         ? `--socket-path="$TMP_DIR/vscode-server-sock-${crypto.randomUUID()}"`
@@ -313,7 +356,12 @@ function generateBashInstallScript({ id, quality, version, commit, release, exte
         SERVER_DATA_DIR: serverDataDir,
         SERVER_DATA_DIR_FLAG: customInstallPath ? '--server-data-dir="$SERVER_DATA_DIR"' : '',
         SERVER_VALIDATION_FLAG: serverValidation === 'skip' ? '--disable-client-validation' : '',
-        SERVER_DOWNLOAD_URL_TEMPLATE: serverDownloadUrlTemplate.replace(/\$\{/g, '\\${'),
+        // Single-quoted at template time (see server-setup.sh's now-unquoted
+        // `SERVER_DOWNLOAD_URL="$(echo %%SERVER_DOWNLOAD_URL_TEMPLATE%% | ...)"`)
+        // so the whole user-configurable URL template is inert shell data —
+        // this also makes the old `${` → `\${` escaping unnecessary, since
+        // single quotes already stop all expansion before it reaches `sed`.
+        SERVER_DOWNLOAD_URL_TEMPLATE: escapeShellArg(serverDownloadUrlTemplate),
         SCRIPT_ID: id,
         ENV_VAR_LINES: envVarLines,
         MODIFY_PRODUCT_JSON: serverValidation === 'force' ? 'true' : 'false',
