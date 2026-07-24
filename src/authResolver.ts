@@ -19,6 +19,7 @@ import { isWindows } from './common/platform';
 import * as os from 'os';
 import { isNullable } from '@zokugun/is-it-type';
 import { ServerVersion } from './serverConfig';
+import { probeTmux, type TmuxCapability } from './tmux/tmuxBootstrap';
 
 const PASSWORD_RETRY_COUNT = 3;
 const PASSPHRASE_RETRY_COUNT = 3;
@@ -113,6 +114,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
 
     private socksTunnel: SSHTunnelConfig | undefined;
     private tunnels: TunnelInfo[] = [];
+    private tmuxCapability: TmuxCapability | undefined;
 
     private labelFormatterDisposable: vscode.Disposable | undefined;
 
@@ -264,6 +266,15 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                     this.logger,
                     this.context.extensionPath
                 );
+
+                // Probe for tmux capability on the remote
+                this.tmuxCapability = await probeTmux(
+                    (cmd) => this.sshConnection!.exec(cmd),
+                    installResult.platform
+                );
+                if (!this.tmuxCapability.available) {
+                    this.logger.info(`Persistent terminals unavailable: ${this.tmuxCapability.reason}`);
+                }
 
                 for (const key of Object.keys(envVariables)) {
                     if (!isNullable(installResult[key])) {
