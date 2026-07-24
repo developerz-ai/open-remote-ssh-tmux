@@ -1,7 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { decideTmuxWiring, idempotentResolveHandler, lazyExec, readTmuxSettings } from '../src/extension';
+import { decideDefaultProfile, decideTmuxWiring, idempotentResolveHandler, lazyExec, readTmuxSettings, reconcileDefaultTerminalProfile, TMUX_PROFILE_TITLE } from '../src/extension';
 import type { RemoteSSHResolver } from '../src/authResolver';
-import { configOverrides } from './mocks/vscode';
+import type Log from '../src/common/logger';
+import { ConfigurationTarget, configOverrides, inspectOverrides, updateCalls } from './mocks/vscode';
+
+/** A no-op Log — the default-profile reconcile only calls `trace` on the (untaken) error path. */
+const noopLog = { trace: (): void => { /* no-op */ } } as unknown as Log;
+
+/** The fully-qualified setting id the terminal layer writes its Workspace-scope default to. */
+const DEFAULT_PROFILE_ID = 'terminal.integrated.defaultProfile.linux';
 
 // extension.ts is activation wiring only; these tests pin the two behaviours the
 // reconnect-safety fix (headline #3, "post-reconnect terminals fail") introduces:
@@ -129,5 +136,84 @@ describe('decideTmuxWiring: enabled setting × tmux availability', () => {
     it('an unknown value degrades to auto behaviour', () => {
         expect(decideTmuxWiring('weird', true)).toBe('wire');
         expect(decideTmuxWiring('weird', false)).toBe('skip');
+    });
+});
+
+// `terminal.integrated.defaultProfile.linux` is the one settings write the terminal layer
+// makes — Workspace scope only. The old check inspected `workspaceValue` alone, so a
+// User/Global (or remote-user) default was silently clobbered by the Workspace write, and a
+// stale write was never removed when tmux went off/unavailable (leaving the default pointing
+// at an unregistered profile). `decideDefaultProfile` is the pure rule; `reconcile…` applies it.
+describe('decideDefaultProfile: workspace default-profile write vs. user scopes', () => {
+    it('wiring + nothing set at any scope → set', () => {
+        expect(decideDefaultProfile(undefined, true)).toBe('set');
+        expect(decideDefaultProfile({}, true)).toBe('set');
+    });
+
+    it('wiring + a user default at any scope → none (never override)', () => {
+        expect(decideDefaultProfile({ workspaceValue: 'zsh' }, true)).toBe('none');
+        expect(decideDefaultProfile({ globalValue: 'zsh' }, true)).toBe('none');
+        expect(decideDefaultProfile({ workspaceFolderValue: 'zsh' }, true)).toBe('none');
+    });
+
+    it('wiring + only our own prior workspace write present → none (idempotent, no re-write)', () => {
+        expect(decideDefaultProfile({ workspaceValue: TMUX_PROFILE_TITLE }, true)).toBe('none');
+    });
+
+    it('not wiring + our own stale workspace write → clear', () => {
+        expect(decideDefaultProfile({ workspaceValue: TMUX_PROFILE_TITLE }, false)).toBe('clear');
+    });
+
+    it('not wiring + a user workspace choice → none (never remove the user\'s value)', () => {
+        expect(decideDefaultProfile({ workspaceValue: 'zsh' }, false)).toBe('none');
+    });
+
+    it('not wiring + nothing set → none', () => {
+        expect(decideDefaultProfile(undefined, false)).toBe('none');
+        expect(decideDefaultProfile({}, false)).toBe('none');
+    });
+
+    it('not wiring + a global value (not ours to clean) → none', () => {
+        expect(decideDefaultProfile({ globalValue: TMUX_PROFILE_TITLE }, false)).toBe('none');
+    });
+});
+
+describe('reconcileDefaultTerminalProfile: applies the decision to Workspace scope only', () => {
+    beforeEach(() => {
+        inspectOverrides.clear();
+        updateCalls.length = 0;
+    });
+
+    it('wiring + nothing set → one Workspace-scope write of the tmux profile', () => {
+        reconcileDefaultTerminalProfile(noopLog, true);
+        expect(updateCalls).toEqual([
+            { id: DEFAULT_PROFILE_ID, value: TMUX_PROFILE_TITLE, target: ConfigurationTarget.Workspace },
+        ]);
+    });
+
+    it('wiring + a Workspace default already set → no write', () => {
+        inspectOverrides.set(DEFAULT_PROFILE_ID, { workspaceValue: 'zsh' });
+        reconcileDefaultTerminalProfile(noopLog, true);
+        expect(updateCalls).toHaveLength(0);
+    });
+
+    it('wiring + a User/Global default set → no write (a Workspace write would clobber it)', () => {
+        inspectOverrides.set(DEFAULT_PROFILE_ID, { globalValue: 'zsh' });
+        reconcileDefaultTerminalProfile(noopLog, true);
+        expect(updateCalls).toHaveLength(0);
+    });
+
+    it('not wiring + a stale write of ours → one Workspace-scope removal (undefined)', () => {
+        inspectOverrides.set(DEFAULT_PROFILE_ID, { workspaceValue: TMUX_PROFILE_TITLE });
+        reconcileDefaultTerminalProfile(noopLog, false);
+        expect(updateCalls).toEqual([
+            { id: DEFAULT_PROFILE_ID, value: undefined, target: ConfigurationTarget.Workspace },
+        ]);
+    });
+
+    it('not wiring + nothing of ours to clean → no write', () => {
+        inspectOverrides.set(DEFAULT_PROFILE_ID, { workspaceValue: 'zsh' });
+        reconcileDefaultTerminalProfile(noopLog, false);
+        expect(updateCalls).toHaveLength(0);
     });
 });

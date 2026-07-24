@@ -17,8 +17,9 @@ import {
 //   * Invisible — profiles are plain `{shellPath:'tmux', shellArgs, cwd}`, the tab
 //     is titled after the workspace folder (never "tmux"); no tmux UI (Route A, see
 //     docs/idea/tmux-approach.md). The one settings write in the whole layer —
-//     `terminal.integrated.defaultProfile.linux`, Workspace-scoped, only when unset —
-//     lives in `extension.ts`'s `setDefaultTerminalProfileIfUnset`, not here.
+//     `terminal.integrated.defaultProfile.linux`, Workspace-scoped, only when the user
+//     has no default at any scope — lives in `extension.ts`'s
+//     `reconcileDefaultTerminalProfile`, not here.
 //   * No zombies / no stealing — a *new* terminal takes the lowest slot not open
 //     in this window and not currently attached by another client on the remote,
 //     so a second client (laptop while the PC is attached) lands on a fresh slot

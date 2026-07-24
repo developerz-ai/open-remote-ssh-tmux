@@ -75,12 +75,17 @@ function wireTmuxTerminalLayer(
             // The one path that reaches the user: they required tmux but it isn't there.
             // Best-effort notification; the failed connection is already succeeded.
             void vscode.window.showErrorMessage(TMUX_REQUIRED_UNAVAILABLE_MESSAGE);
+            // Not wiring → remove any stale tmux default we wrote on a prior (tmux-capable)
+            // connect, so "New Terminal" falls back to the base shell instead of a profile
+            // we never registered.
+            reconcileDefaultTerminalProfile(logger, false);
             return;
         }
         if (decision !== 'wire' || !capability?.available) {
             // `'skip'` (disabled, or unavailable under `'auto'`). The `!capability?.available`
             // clause is redundant given `decision === 'wire'` implies availability — it is
             // there only to re-narrow `capability` to non-undefined for the compiler below.
+            reconcileDefaultTerminalProfile(logger, false); // clean up a stale tmux default, as above
             return;
         }
 
@@ -89,6 +94,8 @@ function wireTmuxTerminalLayer(
         const sessionContext = currentTmuxSessionContext();
         if (!sessionContext) {
             // Not on a remote; shouldn't happen since this is called from the resolve callback.
+            // Still reconcile the default toward cleanup — we are not wiring the layer here.
+            reconcileDefaultTerminalProfile(logger, false);
             return;
         }
         const { hostKey, workspaceKey } = sessionContext;
@@ -141,14 +148,15 @@ function wireTmuxTerminalLayer(
         context.subscriptions.push(vscode.window.onDidOpenTerminal(t => terminalProvider.handleTerminalOpened(t)));
         context.subscriptions.push(vscode.window.onDidCloseTerminal(t => terminalProvider.handleTerminalClosed(t)));
 
-        // Make it the default so a plain "New Terminal" already lands on tmux — the
-        // whole point of "invisible UX" (tmux-approach.md:33: "the default terminal on
-        // a resolved Unix host"). Contributed profiles have no manifest-level default
-        // flag (VS Code's terminal extension point only has id/title/icon), so this is
-        // the one settings write the terminal layer makes — scoped to this Workspace
-        // (never User/Global, never the remote's own ~/.tmux.conf) and only when unset,
-        // so a user who deliberately picked a different default is never overridden.
-        setDefaultTerminalProfileIfUnset(logger);
+        // Make tmux the default so a plain "New Terminal" already lands on it — the whole
+        // point of "invisible UX" (tmux-approach.md:33: "the default terminal on a resolved
+        // Unix host"). Contributed profiles carry no manifest-level default flag (the
+        // terminal extension point is only id/title/icon), so this is the one settings write
+        // the terminal layer makes — Workspace scope only, and only when the user hasn't set
+        // a default at ANY scope (a Workspace write silently overrides a User/Remote one).
+        // The mirror case (not wiring → remove a stale write of ours) is reconciled on the
+        // skip returns above, so the default never points at an unregistered profile.
+        reconcileDefaultTerminalProfile(logger, true);
 
         // Construct the session reaper (housekeeping for empty/detached sessions).
         // Uses current time as the clock for age-based reap decisions.
@@ -310,29 +318,75 @@ export const TMUX_REQUIRED_UNAVAILABLE_MESSAGE =
     'remote.SSH.tmux.enabled is set to "on" (persistent terminals required), but tmux is not available on this remote. Install tmux, or set the setting to "auto" or "off".';
 
 /** Title of the contributed profile (`package.json` contributes.terminal.profiles) —
- * the value `terminal.integrated.defaultProfile.linux` must reference to select it. */
-const TMUX_PROFILE_TITLE = 'Persistent Shell';
+ * the value `terminal.integrated.defaultProfile.linux` must reference to select it.
+ * Exported so tests pin the exact string the reconcile writes/cleans up. */
+export const TMUX_PROFILE_TITLE = 'Persistent Shell';
 
 /**
- * Set `terminal.integrated.defaultProfile.linux` to the tmux-backed profile, scoped to
- * this Workspace only, and only when nothing is set there yet — so "New Terminal"
- * lands on tmux by default (tmux-approach.md's "default terminal on a resolved Unix
- * host") without ever overriding a user's own deliberate choice, and without touching
- * User/Global settings (those aren't remote-scoped and would leak into unrelated
- * workspaces). Best-effort: a failure here must not break the (already-succeeded)
- * connection, so it only logs.
+ * The `inspect()` scopes a user's own `terminal.integrated.defaultProfile.linux` choice
+ * can live in. Any of these being set means the user (or their User/Remote settings) owns
+ * the default, so the terminal layer must not clobber it with a Workspace-scope write. In a
+ * remote window `globalValue` already reflects the remote user settings for this
+ * machine-overridable setting, so it also covers a remote-scope default. A structural subset
+ * of VS Code's `inspect()` result — the full object is assignable to it.
  */
-function setDefaultTerminalProfileIfUnset(logger: Log): void {
+export interface DefaultProfileScopes {
+    readonly globalValue?: string;
+    readonly workspaceValue?: string;
+    readonly workspaceFolderValue?: string;
+}
+
+/** What {@link decideDefaultProfile} resolves to — the action to take on the *Workspace*-scope
+ * `defaultProfile.linux` value: `'set'` our tmux profile, `'clear'` a stale write of ours, or
+ * `'none'` (leave settings untouched). */
+export type DefaultProfileAction = 'set' | 'clear' | 'none';
+
+/**
+ * Pure decision for the workspace default-profile write, from what `inspect()` reports and
+ * whether the tmux layer is being wired this connect:
+ *  - wiring, and no default set at ANY scope → `'set'` (make tmux the default);
+ *  - wiring, but a default already exists at any scope → `'none'` (never override the user's —
+ *    or our own prior — choice; a Workspace write silently beats a User/Remote default);
+ *  - not wiring, and the Workspace value is our own prior write → `'clear'` (remove it, else the
+ *    default points at a profile we never registered and "New Terminal" errors);
+ *  - not wiring otherwise → `'none'` (nothing of ours to clean; never touch a user's value).
+ * Pure + exported so the matrix is unit-tested without the VS Code terminal surface.
+ */
+export function decideDefaultProfile(inspected: DefaultProfileScopes | undefined, wiring: boolean): DefaultProfileAction {
+    const workspaceValue = inspected?.workspaceValue;
+    if (wiring) {
+        const anyScopeSet = inspected?.globalValue !== undefined
+            || workspaceValue !== undefined
+            || inspected?.workspaceFolderValue !== undefined;
+        return anyScopeSet ? 'none' : 'set';
+    }
+    // Not wiring: only undo *our* stale Workspace write; never remove a user's own value.
+    return workspaceValue === TMUX_PROFILE_TITLE ? 'clear' : 'none';
+}
+
+/**
+ * Reconcile `terminal.integrated.defaultProfile.linux` (Workspace scope only) with whether the
+ * tmux layer is wired this connect — see {@link decideDefaultProfile} for the rule. When
+ * wiring, make the tmux profile the default ("default terminal on a resolved Unix host") but
+ * only if the user hasn't chosen a default at *any* scope (User/Global, Remote, Workspace, or
+ * folder), since a Workspace write silently overrides those. When *not* wiring, remove a stale
+ * prior write of ours so the default never points at an unregistered profile. Never touches
+ * User/Global or the remote's own ~/.tmux.conf. Best-effort: a failure here must not break the
+ * (already-succeeded) connection, so it only logs.
+ */
+export function reconcileDefaultTerminalProfile(logger: Log, wiring: boolean): void {
     const terminalConfig = vscode.workspace.getConfiguration('terminal.integrated');
     const inspected = terminalConfig.inspect<string>('defaultProfile.linux');
-    if (inspected?.workspaceValue !== undefined) {
-        return; // user (or a prior connect) already chose one — never override
+    const action = decideDefaultProfile(inspected, wiring);
+    if (action === 'none') {
+        return;
     }
+    const value = action === 'set' ? TMUX_PROFILE_TITLE : undefined;
     terminalConfig
-        .update('defaultProfile.linux', TMUX_PROFILE_TITLE, vscode.ConfigurationTarget.Workspace)
+        .update('defaultProfile.linux', value, vscode.ConfigurationTarget.Workspace)
         .then(
             undefined,
-            (err: unknown) => logger.trace(`Could not set default tmux terminal profile: ${err instanceof Error ? err.message : String(err)}`)
+            (err: unknown) => logger.trace(`Could not ${action} default tmux terminal profile: ${err instanceof Error ? err.message : String(err)}`)
         );
 }
 

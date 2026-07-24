@@ -16,12 +16,51 @@ export const env = {
  */
 export const configOverrides = new Map<string, unknown>();
 
+/**
+ * Per-setting `inspect()` scope values a test can seed to model *where* a user's choice
+ * lives — User/Global (`globalValue`; in a remote window this also reflects the remote
+ * user settings), Workspace, or folder. Keyed by fully-qualified id; an unseeded id
+ * inspects as "nothing set at any scope".
+ */
+export const inspectOverrides = new Map<string, { globalValue?: unknown; workspaceValue?: unknown; workspaceFolderValue?: unknown }>();
+
+/**
+ * Every `config.update(...)` call, recorded as `(id, value, target)` so a test can assert
+ * what — and whether — the extension wrote, and at which scope.
+ */
+export const updateCalls: { id: string; value: unknown; target: unknown }[] = [];
+
+/** Mirror of `vscode.ConfigurationTarget` (values match the real enum) — the default-profile
+ * write targets `Workspace`; exposed so a test can assert the scope. */
+export enum ConfigurationTarget {
+    Global = 1,
+    Workspace = 2,
+    WorkspaceFolder = 3,
+}
+
 class MockWorkspaceConfiguration {
     public constructor(private readonly section: string | undefined) {}
 
     public get<T>(key: string, defaultValue?: T): T | undefined {
         const id = this.section ? `${this.section}.${key}` : key;
         return configOverrides.has(id) ? (configOverrides.get(id) as T) : defaultValue;
+    }
+
+    public inspect<T>(key: string): { key: string; globalValue?: T; workspaceValue?: T; workspaceFolderValue?: T } {
+        const id = this.section ? `${this.section}.${key}` : key;
+        const seeded = inspectOverrides.get(id) ?? {};
+        return {
+            key: id,
+            globalValue: seeded.globalValue as T | undefined,
+            workspaceValue: seeded.workspaceValue as T | undefined,
+            workspaceFolderValue: seeded.workspaceFolderValue as T | undefined,
+        };
+    }
+
+    public update(key: string, value: unknown, target?: unknown): Promise<void> {
+        const id = this.section ? `${this.section}.${key}` : key;
+        updateCalls.push({ id, value, target });
+        return Promise.resolve();
     }
 }
 
