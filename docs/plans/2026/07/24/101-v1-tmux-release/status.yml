@@ -1,0 +1,39 @@
+plan: 101-v1-tmux-release
+title: v1.0.0 — tmux terminals, tests, rebrand, docs
+status: not_started
+created_by: sebi
+worked_by: ""
+owner: sebi
+percent: 0
+current_focus: ""
+slices:
+  - file: 01-test-harness.md
+    status: not_started
+    percent: 0
+  - file: 02-session-model.md
+    status: not_started
+    percent: 0
+  - file: 03-remote-bootstrap.md
+    status: not_started
+    percent: 0
+  - file: 04-terminal-profile.md
+    status: not_started
+    percent: 0
+  - file: 05-package-contributes.md
+    status: not_started
+    percent: 0
+  - file: 06-rebrand-identity.md
+    status: not_started
+    percent: 0
+  - file: 07-docs-update.md
+    status: not_started
+    percent: 0
+  - file: 08-release-infra.md
+    status: not_started
+    percent: 0
+  - file: 09-verify.md
+    status: not_started
+    percent: 0
+evidence: []
+notes: "Multi-client rules (no stealing / per-client mapping / adoption) confirmed by owner 2026-07-24 — see overview.md Context and 04 steps 1/2/2b."
+last_updated: 2026-07-24
