@@ -1,0 +1,4 @@
+#!/bin/sh
+# Compile, lint, and test
+
+npm run compile:src && npm run lint && npm test

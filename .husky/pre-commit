@@ -1,3 +1,4 @@
 #!/bin/sh
 
 npx lint-staged
+npm run compile:src && npm test

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Run development watch
+
+npm run watch:src
