@@ -40,6 +40,75 @@ re-attachable from **any** machine — that's the machine hand-off.
    vscode-server); if missing, guide install. Ship a sane default tmux config
    (mouse on, large history, sensible status) without clobbering the user's.
 
+## Spike decision: terminal profile provider spawns on the remote (2026-07-24)
+
+`package.json` sets `extensionKind: ["ui"]` (`:436`) — the extension itself
+(and any `window.registerTerminalProfileProvider` callback it registers) runs
+in VS Code's **local** extension host even when the window is connected to a
+remote SSH host. Slice `04-terminal-profile.md` flagged this as the plan's
+biggest assumption: if `shellPath`/`shellArgs` returned by a locally-running
+provider caused the shell to spawn on the *local* machine, Route A (the
+profile-provider route) would be dead on arrival and we'd need Route B
+(inject `terminal.integrated.defaultProfile.linux` / `profiles.linux` into
+remote Machine settings instead).
+
+**Decision: Route A — `TerminalProfileProvider` / `contributes.terminal.profiles`.**
+The provider spawns its process on the **remote**, regardless of the calling
+extension's `extensionKind`.
+
+**Method.** The step-0 plan called for an EDH click-test (register a throwaway
+provider returning `tmux new-session -A -s spike`, open a real remote window,
+confirm the process on the remote host). This execution environment has no
+VS Code desktop/Electron binary and no display, so that literal click-test
+isn't runnable here — see "residual risk" below for what still closes the
+loop. Instead the mechanism was traced directly in current `microsoft/vscode`
+source, which settles the *architectural* question with equal confidence:
+
+- `vscode.window.createTerminal()` (and thus a profile provider's returned
+  `TerminalOptions`) is handled on the main-thread side by
+  `MainThreadTerminalService.$createTerminal`
+  ([`src/vs/workbench/api/browser/mainThreadTerminalService.ts:139-172`](https://github.com/microsoft/vscode/blob/main/src/vs/workbench/api/browser/mainThreadTerminalService.ts#L139-L172)).
+  The `IShellLaunchConfig` it builds from the extension's `shellPath`/`shellArgs`
+  carries **no per-call remote/authority field** — it's just
+  `executable`/`args`/`cwd`/`env`. It's handed to the single window-wide
+  `_terminalService.createTerminal(...)`, the same singleton every extension
+  host (local UI or remote workspace) talks to via its own RPC proxy.
+- `TerminalService.createTerminal()`
+  ([`src/vs/workbench/contrib/terminal/browser/terminalService.ts:975`](https://github.com/microsoft/vscode/blob/main/src/vs/workbench/contrib/terminal/browser/terminalService.ts))
+  resolves the pty backend via
+  `this._terminalInstanceService.getBackend(this._environmentService.remoteAuthority)`
+  (`:279`, `:453-457`) — `remoteAuthority` here is the **window's** resolved
+  remote authority (set once for the whole workbench when it connects to our
+  `ssh-remote` authority), not anything derived from which extension host
+  issued the call.
+
+So process placement is a property of **the window's connection**, not of the
+calling extension's `extensionKind`. A `ui`-kind extension's provider code
+*runs* locally, but the `shellPath`/`shellArgs` it *returns* are just data —
+the actual `tmux new-session -A -s <name>` process is spawned by the remote
+pty host, on the remote machine, exactly like a bare default shell profile
+would be. This lines up with why `open-remote-ssh` upstream (and every other
+Remote-SSH terminal profile) already works this way without needing
+`extensionKind: ["workspace"]`.
+
+**Residual risk / where real confirmation still happens.** This is a
+source-grounded architectural read, not a click-observed one — `04`'s own
+`## Verify` matrix step 1 ("New terminal → prompt appears; `tmux ls` on
+remote shows one `code-*`") is the actual empirical gate and is unchanged by
+this decision; it must still pass on a real Unix remote via F5 before `04`
+ships. If it somehow doesn't (e.g. a VS Code version regresses this), the
+fallback is still Route B as originally scoped — no plan changes needed to
+pivot, just swap the injection point in `terminalProvider.ts`.
+
+**Route A implications carried into `04`:**
+- No remote Machine-settings mutation needed — lower risk, no risk of us
+  clobbering the user's own `terminal.integrated.*` settings.
+- `contributes.terminal.profiles` (05) + `registerTerminalProfileProvider`
+  is the real (non-spike) implementation shape for step 1 of `04`.
+- Dedupe against VS Code's own persistent-terminal revive (`04` step 3) is
+  still required — this decision only settles *where the process spawns*,
+  not the double-persistence question.
+
 ## Ownership: let tmux own persistence
 
 VS Code has its own persistent-terminal reconnection. Layering it on top of tmux
@@ -81,8 +150,9 @@ sessions with no purpose.**
   user-named? a `vscode-<workspaceHash>` scheme?).
 - **Resize / reflow.** tmux status bar, mouse mode, and tmux's own scrollback vs
   VS Code's — get the UX clean, not doubled.
-- **Terminal profile vs. wrapper vs. shell-init** as the injection point — which
-  is least invasive and most reliable across shells (bash/zsh/fish).
+- ~~**Terminal profile vs. wrapper vs. shell-init** as the injection point~~ —
+  resolved: terminal profile provider (Route A), confirmed to spawn on the
+  remote regardless of `extensionKind` — see "Spike decision" above.
 - **Claude Code specifically** — a first-class "attach to my long task" command,
   or just a well-known session name?
 - **Windows remotes** — tmux is Unix-only; degrade gracefully (feature off, or
