@@ -356,6 +356,26 @@ describe('restore mapping (per client, on reload)', () => {
     });
 });
 
+describe('reconnect re-reconcile (initialize is idempotent, no duplicate tab)', () => {
+    // A transient SSH reconnect re-fires resolve-success on the *same* extension
+    // host, so extension.ts calls initialize() again ("refresh provider state"). A
+    // slot already backing an open terminal in this window must not spawn a second,
+    // mirrored tab: reopen() skips slots already in openSlots, so only genuinely-not-
+    // open survivors/orphans are (re)opened on the second pass.
+    it('does not re-open an already-open survivor when initialize() runs again', async () => {
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const exec = fakeExec({ list: [row(name(0), false)], existing: [name(0)] });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ state, exec, opened });
+
+        await provider.initialize(); // first connect: restore slot 0 (opens once)
+        await provider.initialize(); // reconnect: reconcile again — must not re-open
+
+        expect(opened.map(targetSession)).toEqual([name(0)]); // opened exactly once
+        expect(provider.mappedSlots()).toEqual([0]);
+    });
+});
+
 describe('adoption (hand-off / reconciliation)', () => {
     it('re-attaches mapped, adopts detached-unmapped, leaves another client\'s attached', async () => {
         const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });

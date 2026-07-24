@@ -86,6 +86,7 @@
 		"onCommand:openremotessh.openConfigFile",
 		"onCommand:openremotessh.showLog",
 		"onResolveRemoteAuthority:ssh-remote",
+		"onTerminalProfile:tmux",
 		"onView:sshHosts"
 	],
 	"contributes": {

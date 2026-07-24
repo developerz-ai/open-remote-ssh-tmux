@@ -17,8 +17,9 @@ import {
 //   * Invisible — profiles are plain `{shellPath:'tmux', shellArgs, cwd}`, the tab
 //     is titled after the workspace folder (never "tmux"); no tmux UI (Route A, see
 //     docs/idea/tmux-approach.md). The one settings write in the whole layer —
-//     `terminal.integrated.defaultProfile.linux`, Workspace-scoped, only when unset —
-//     lives in `extension.ts`'s `setDefaultTerminalProfileIfUnset`, not here.
+//     `terminal.integrated.defaultProfile.linux`, Workspace-scoped, only when the user
+//     has no default at any scope — lives in `extension.ts`'s
+//     `reconcileDefaultTerminalProfile`, not here.
 //   * No zombies / no stealing — a *new* terminal takes the lowest slot not open
 //     in this window and not currently attached by another client on the remote,
 //     so a second client (laptop while the PC is attached) lands on a fresh slot
@@ -379,8 +380,14 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         return slot;
     }
 
-    /** Open (or re-attach — `-A` is idempotent) a terminal for `slot`. */
+    /** Open (or re-attach — `-A` is idempotent) a terminal for `slot`. Idempotent
+     * across reconnects: a re-resolve re-runs {@link reconcile} over the same mapping,
+     * so a slot already backing an open terminal in this window is skipped rather than
+     * spawning a second, mirrored tab. Only genuinely-not-open survivors/orphans open. */
     private reopen(slot: number): void {
+        if (this.openSlots.has(slot)) {
+            return;
+        }
         this.openSlots.add(slot);
         this.openTerminal(this.buildOptions(slot));
     }
