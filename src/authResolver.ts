@@ -109,6 +109,73 @@ export function splitProxyCommand(value: string | string[]): string[] {
     return out;
 }
 
+/**
+ * Expand OpenSSH-style `%x` config tokens (`HostName`, `ProxyCommand` args)
+ * against a token→value map, honouring `%%` as a literal `%`.
+ *
+ * The code this replaces chained single-shot `String.replace(token, value)`
+ * calls per token, which only ever substituted the *first* occurrence of a
+ * repeated token (`%h %h` left the second `%h` untouched) and had no escape
+ * for a literal `%` at all. This scans the template once, left to right, so
+ * every occurrence is replaced and `%%` is never mistaken for a token.
+ */
+export function expandTokens(template: string, tokens: Record<string, string>): string {
+    let out = '';
+    for (let i = 0; i < template.length; i++) {
+        const ch = template[i];
+        if (ch === '%' && i + 1 < template.length) {
+            const next = template[i + 1];
+            if (next === '%') {
+                out += '%';
+                i += 1;
+                continue;
+            }
+            if (Object.prototype.hasOwnProperty.call(tokens, next)) {
+                out += tokens[next];
+                i += 1;
+                continue;
+            }
+        }
+        out += ch;
+    }
+    return out;
+}
+
+/**
+ * Resolve an SSH hop's port: an explicit ssh_config `Port` wins, else the
+ * port embedded in the ProxyJump destination string, else `fallback` (22).
+ *
+ * Shared by the hop's own connection port and the *next* hop's forward-out
+ * destination port so both agree — the hop's own port previously fell back
+ * to the final destination's port (`sshPort`) instead of 22, which is wrong
+ * whenever the final host listens on a non-standard port.
+ */
+export function resolveHopPort(configuredPort: string | undefined, jumpPort: number | undefined, fallback = 22): number {
+    return configuredPort ? parseInt(configuredPort, 10) : (jumpPort || fallback);
+}
+
+/**
+ * Decide what to hand ssh2's keyboard-interactive `finish()` callback once
+ * prompt collection ends. ssh2 expects a responses array exactly as long as
+ * the prompts it sent; if the user dismissed (`showInputBox` → `undefined`)
+ * partway through, sending a *shorter* array desyncs the protocol instead of
+ * just failing auth cleanly. Padding the remainder keeps the array the right
+ * length regardless of where the user cancelled, and `retriesExhausted`
+ * tells the caller to set (not decrement) the retry counter exactly once —
+ * avoiding the prior double-adjustment (zeroed on cancel, then decremented
+ * again unconditionally) that pushed it negative.
+ */
+export function buildKeyboardInteractiveFinish(promptCount: number, responses: string[], cancelled: boolean): { finishWith: string[]; retriesExhausted: boolean } {
+    if (!cancelled) {
+        return { finishWith: responses, retriesExhausted: false };
+    }
+    const padded = responses.slice(0, promptCount);
+    while (padded.length < promptCount) {
+        padded.push('');
+    }
+    return { finishWith: padded, retriesExhausted: true };
+}
+
 export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode.Disposable {
 
     private proxyConnections: SSHConnection[] = [];
@@ -179,7 +246,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
             try {
                 const sshconfig = await SSHConfiguration.loadFromFS();
                 const sshHostConfig = sshconfig.getHostConfiguration(sshDest.hostname);
-                const sshHostName = sshHostConfig['HostName'] ? sshHostConfig['HostName'].replace('%h', sshDest.hostname) : sshDest.hostname;
+                const sshHostName = sshHostConfig['HostName'] ? expandTokens(sshHostConfig['HostName'], { h: sshDest.hostname }) : sshDest.hostname;
                 const sshUser = sshHostConfig['User'] || sshDest.user || os.userInfo().username || ''; // https://github.com/openssh/openssh-portable/blob/5ec5504f1d328d5bfa64280cd617c3efec4f78f3/sshconnect.c#L1561-L1562
                 const sshPort = sshHostConfig['Port'] ? parseInt(sshHostConfig['Port'], 10) : (sshDest.port || 22);
 
@@ -207,7 +274,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                         const [proxy, proxyHostConfig] = proxyJumps[i];
                         const proxyHostName = proxyHostConfig['HostName'] || proxy.hostname;
                         const proxyUser = proxyHostConfig['User'] || proxy.user || sshUser;
-                        const proxyPort = proxyHostConfig['Port'] ? parseInt(proxyHostConfig['Port'], 10) : (proxy.port || sshPort);
+                        const proxyPort = resolveHopPort(proxyHostConfig['Port'], proxy.port);
 
                         const proxyAgentForward = enableAgentForwarding && (proxyHostConfig['ForwardAgent'] || 'no').toLowerCase() === 'yes';
                         const proxyAgent = proxyAgentForward && this.sshAgentSock ? new ssh2.OpenSSHAgent(this.sshAgentSock) : undefined;
@@ -233,12 +300,12 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
 
                         const nextProxyJump = i < proxyJumps.length - 1 ? proxyJumps[i + 1] : undefined;
                         const destIP = nextProxyJump ? (nextProxyJump[1]['HostName'] || nextProxyJump[0].hostname) : sshHostName;
-                        const destPort = nextProxyJump ? ((nextProxyJump[1]['Port'] && parseInt(nextProxyJump[1]['Port'], 10)) || nextProxyJump[0].port || 22) : sshPort;
+                        const destPort = nextProxyJump ? resolveHopPort(nextProxyJump[1]['Port'], nextProxyJump[0].port) : sshPort;
                         proxyStream = await proxyConnection.forwardOut('127.0.0.1', 0, destIP, destPort);
                     }
                 } else if (sshHostConfig['ProxyCommand']) {
                     let proxyArgs = splitProxyCommand(sshHostConfig['ProxyCommand'] as unknown as string | string[])
-                        .map((arg) => arg.replace('%h', sshHostName).replace('%n', sshDest.hostname).replace('%p', sshPort.toString()).replace('%r', sshUser));
+                        .map((arg) => expandTokens(arg, { h: sshHostName, n: sshDest.hostname, p: sshPort.toString(), r: sshUser }));
                     let proxyCommand = proxyArgs.shift()!;
 
                     let options = {};
@@ -601,6 +668,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                     username: sshUser,
                     prompt: async (_name, _instructions, _instructionsLang, prompts, finish) => {
                         const responses: string[] = [];
+                        let cancelled = false;
                         for (const prompt of prompts) {
                             const response = await vscode.window.showInputBox({
                                 title: `(${sshUser}@${sshHostName}) ${prompt.prompt}`,
@@ -608,13 +676,18 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                                 ignoreFocusOut: true
                             });
                             if (response === undefined) {
-                                keyboardRetryCount = 0;
+                                cancelled = true;
                                 break;
                             }
                             responses.push(response);
                         }
-                        keyboardRetryCount--;
-                        finish(responses);
+                        const { finishWith, retriesExhausted } = buildKeyboardInteractiveFinish(prompts.length, responses, cancelled);
+                        if (retriesExhausted) {
+                            keyboardRetryCount = 0;
+                        } else {
+                            keyboardRetryCount--;
+                        }
+                        finish(finishWith);
                     }
                 });
             }
