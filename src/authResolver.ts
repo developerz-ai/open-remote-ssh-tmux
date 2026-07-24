@@ -11,6 +11,7 @@ import SSHDestination from './ssh/sshDestination';
 import SSHConnection, { SSHTunnelConfig } from './ssh/sshConnection';
 import SSHConfiguration from './ssh/sshConfig';
 import { gatherIdentityFiles } from './ssh/identityFiles';
+import { verifyKnownHost, hostKeyIdentity } from './ssh/hostfile';
 import { untildify, exists as fileExists } from './common/files';
 import { findRandomPort } from './common/ports';
 import { disposeAll } from './common/disposable';
@@ -222,6 +223,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                             strictVendor: false,
                             agentForward: proxyAgentForward,
                             agent: proxyAgent,
+                            hostVerifier: this.buildHostVerifier(proxyHostName, proxyPort),
                             authHandler: (arg0, arg1, arg2) => (proxyAuthHandler(arg0, arg1, arg2), undefined)
                         });
                         this.proxyConnections.push(proxyConnection);
@@ -262,6 +264,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                     strictVendor: false,
                     agentForward,
                     agent,
+                    hostVerifier: this.buildHostVerifier(sshHostName, sshPort),
                     authHandler: (arg0, arg1, arg2) => (sshAuthHandler(arg0, arg1, arg2), undefined),
                 });
                 await this.sshConnection.connect();
@@ -432,6 +435,61 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
         }
 
         return new TunnelInfo(localPort, remotePortOrSocketPath, disposables);
+    }
+
+    /**
+     * Build the ssh2 `hostVerifier` for a target (the destination or a ProxyJump
+     * hop). Upstream shipped none, so every host key was accepted silently — any
+     * MITM went through. We verify the presented key against known_hosts: a known
+     * key connects, an unseen host prompts for first-connect consent (then records
+     * it), and a changed key hard-fails with no click-through. All decision/record
+     * logic is the pure, unit-tested `verifyKnownHost`; this only adds the vscode
+     * UI and bridges ssh2's key argument (see below).
+     */
+    private buildHostVerifier(host: string, port: number): NonNullable<ssh2.ConnectConfig['hostVerifier']> {
+        const identity = hostKeyIdentity(host, port);
+        return (keyHash, callback) => {
+            // We never set `hostHash`, so ssh2 hands us the raw wire-format host-key
+            // Buffer here even though @types/ssh2 declares the parameter `string`.
+            // known_hosts stores that blob base64-encoded, which is what
+            // verifyKnownHost compares against.
+            const key = keyHash as unknown as Buffer;
+            void verifyKnownHost({
+                host: identity,
+                key,
+                promptForUnknownHost: (id, fingerprint) => this.promptNewHostKey(id, fingerprint),
+            }).then(
+                ({ verdict, verified }) => {
+                    if (verdict === 'mismatch') {
+                        this.logger.error(`Host key verification failed for ${identity}: presented key does not match known_hosts`);
+                        void vscode.window.showErrorMessage(
+                            `Host key verification failed for '${identity}': the key does not match the one recorded in known_hosts. This may indicate a man-in-the-middle attack, so the connection was refused. If the host key legitimately changed, remove the stale entry from your known_hosts file and reconnect.`,
+                            { modal: true },
+                        );
+                    }
+                    callback(verified);
+                },
+                (err) => {
+                    // Read/record failure (e.g. EACCES) — fail closed, never accept.
+                    this.logger.error(`Host key verification errored for ${identity}`, err);
+                    callback(false);
+                },
+            );
+        };
+    }
+
+    /**
+     * First-connect consent prompt for an unknown host key (OpenSSH-style wording,
+     * fingerprint shown). Cancelling or dismissing the modal rejects the key.
+     */
+    private async promptNewHostKey(identity: string, fingerprint: string): Promise<boolean> {
+        const cont = 'Continue';
+        const answer = await vscode.window.showWarningMessage(
+            `The authenticity of host '${identity}' can't be established.\nKey fingerprint is ${fingerprint}.\n\nAre you sure you want to continue connecting? The key will be added to your known_hosts file.`,
+            { modal: true },
+            cont,
+        );
+        return answer === cont;
     }
 
     private getSSHAuthHandler(sshUser: string, sshHostName: string, identityKeys: SSHKey[], preferredAuthentications: string[]) {

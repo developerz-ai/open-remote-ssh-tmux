@@ -108,6 +108,86 @@ export function verifyHostKey(host: string, key: Buffer, knownHostsContent: stri
     return seenHost ? 'mismatch' : 'unknown';
 }
 
+/**
+ * The known_hosts host identity for a target: the bare hostname on the default
+ * SSH port, or OpenSSH's `[host]:port` form otherwise. Every known_hosts
+ * lookup/record for a host must use this same string so match and append agree.
+ */
+export function hostKeyIdentity(host: string, port: number): string {
+    return port && port !== 22 ? `[${host}]:${port}` : host;
+}
+
+/**
+ * OpenSSH-style SHA256 host-key fingerprint (`SHA256:` + unpadded base64), shown
+ * in the first-connect consent prompt so the user can compare it out-of-band.
+ */
+export function hostKeyFingerprint(key: Buffer): string {
+    return `SHA256:${crypto.createHash('sha256').update(key).digest('base64').replace(/=+$/, '')}`;
+}
+
+/**
+ * The host-key algorithm name (e.g. `ssh-ed25519`) — the first length-prefixed
+ * field of the SSH wire-format host-key blob, which known_hosts stores as field
+ * 2. Returns `''` for a malformed/truncated blob (field 2 is cosmetic for our
+ * base64-only matching, so an empty type never breaks re-verification).
+ */
+function hostKeyType(key: Buffer): string {
+    if (key.length < 4) {
+        return '';
+    }
+    const length = key.readUInt32BE(0);
+    if (length <= 0 || key.length < 4 + length) {
+        return '';
+    }
+    return key.toString('ascii', 4, 4 + length);
+}
+
+/**
+ * The ssh2 `hostVerifier` decision for one host: read known_hosts, get the pure
+ * verdict, and on a first connect obtain consent (injected — it is UI) before
+ * recording the key. The one place that ties verify → prompt → append together;
+ * kept free of vscode/ssh2 so it stays unit-testable (prompt is a callback, path
+ * is injectable):
+ *   - `known`    → accept; no prompt, no write.
+ *   - `mismatch` → refuse; never prompt, never write (possible MITM, no bypass).
+ *   - `unknown`  → prompt; on accept record the key and accept, else refuse.
+ * A read error other than ENOENT (a missing file just means "no hosts yet")
+ * rejects, so the caller fails closed.
+ */
+export async function verifyKnownHost(
+    params: {
+        host: string;
+        key: Buffer;
+        promptForUnknownHost: (host: string, fingerprint: string) => Promise<boolean>;
+    },
+    knownHostsFile: string = KNOW_HOST_FILE,
+): Promise<{ verdict: HostKeyVerdict; verified: boolean }> {
+    const { host, key, promptForUnknownHost } = params;
+
+    let content = '';
+    try {
+        content = await fs.promises.readFile(knownHostsFile, { encoding: 'utf8' });
+    } catch (e) {
+        // No known_hosts yet (fresh machine) → treat as empty (verdict 'unknown').
+        // Any other error (e.g. EACCES) is genuine — rethrow so the verifier fails
+        // closed rather than silently accepting an unverifiable key.
+        if (!(isNodeError(e) && e.code === 'ENOENT')) {
+            throw e;
+        }
+    }
+
+    const verdict = verifyHostKey(host, key, content);
+    if (verdict !== 'unknown') {
+        return { verdict, verified: verdict === 'known' };
+    }
+
+    const accepted = await promptForUnknownHost(host, hostKeyFingerprint(key));
+    if (accepted) {
+        await addHostToHostFile(host, key, hostKeyType(key), knownHostsFile);
+    }
+    return { verdict, verified: accepted };
+}
+
 export async function addHostToHostFile(host: string, hostKey: Buffer, type: string, knownHostsFile: string = KNOW_HOST_FILE): Promise<void> {
     // `recursive: true` creates the parent chain and is a no-op when it already
     // exists. The previous guard never awaited `exists()`, so `!Promise` was always

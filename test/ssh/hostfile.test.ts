@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { addHostToHostFile, checkNewHostInHostkeys, verifyHostKey } from '../../src/ssh/hostfile';
+import { addHostToHostFile, checkNewHostInHostkeys, hostKeyFingerprint, hostKeyIdentity, verifyHostKey, verifyKnownHost } from '../../src/ssh/hostfile';
 
 // Unit coverage for hostfile.ts — the sole owner of ~/.ssh/known_hosts reads and
 // writes for host-key verification. Every test injects a temp known_hosts path so
@@ -213,5 +213,134 @@ describe('verifyHostKey', () => {
             '# trailing comment',
         ].join('\n');
         expect(verifyHostKey('example.com', keyA, content)).toBe('known');
+    });
+});
+
+describe('hostKeyIdentity', () => {
+    it('uses the bare hostname on the default SSH port', () => {
+        expect(hostKeyIdentity('example.com', 22)).toBe('example.com');
+    });
+
+    it('uses OpenSSH [host]:port form for a non-default port', () => {
+        expect(hostKeyIdentity('example.com', 2222)).toBe('[example.com]:2222');
+    });
+
+    it('treats a missing/zero port as the default (bare host, no brackets)', () => {
+        expect(hostKeyIdentity('example.com', 0)).toBe('example.com');
+    });
+});
+
+describe('hostKeyFingerprint', () => {
+    it('formats an unpadded SHA256 base64 fingerprint with the SHA256: prefix', () => {
+        const key = Buffer.from('some-host-key-bytes');
+        const expected = `SHA256:${crypto.createHash('sha256').update(key).digest('base64').replace(/=+$/, '')}`;
+        const fingerprint = hostKeyFingerprint(key);
+        expect(fingerprint).toBe(expected);
+        expect(fingerprint.startsWith('SHA256:')).toBe(true);
+        expect(fingerprint.endsWith('=')).toBe(false);
+    });
+
+    it('produces different fingerprints for different keys', () => {
+        expect(hostKeyFingerprint(Buffer.from('key-one'))).not.toBe(hostKeyFingerprint(Buffer.from('key-two')));
+    });
+});
+
+// Build an SSH wire-format host-key blob: a uint32-length-prefixed algorithm name
+// followed by the key payload — the exact shape ssh2 hands the hostVerifier, so
+// the recorded known_hosts line gets a real field-2 type and re-verification works.
+function wireHostKey(type: string, payload: string): Buffer {
+    const typeBuf = Buffer.from(type, 'ascii');
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(typeBuf.length, 0);
+    return Buffer.concat([len, typeBuf, Buffer.from(payload)]);
+}
+
+describe('verifyKnownHost', () => {
+    const keyA = wireHostKey('ssh-ed25519', 'alpha-key-payload');
+    const keyB = wireHostKey('ssh-ed25519', 'bravo-key-payload');
+    let tmpDir: string;
+
+    afterEach(async () => {
+        if (tmpDir) {
+            await fs.promises.rm(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    async function withKnownHosts(content: string): Promise<string> {
+        tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'hostfile-test-'));
+        const knownHosts = path.join(tmpDir, 'known_hosts');
+        await fs.promises.writeFile(knownHosts, content);
+        return knownHosts;
+    }
+
+    // A prompt spy that records its args and answers with a fixed decision, so the
+    // orchestration can be driven without any vscode UI (the prompt is injected).
+    function spyPrompt(answer: boolean) {
+        const calls: Array<{ host: string; fingerprint: string }> = [];
+        return {
+            calls,
+            prompt: async (host: string, fingerprint: string): Promise<boolean> => {
+                calls.push({ host, fingerprint });
+                return answer;
+            },
+        };
+    }
+
+    it('accepts a known key without prompting or writing', async () => {
+        const file = await withKnownHosts(khLine('h.example', keyA, true) + '\n');
+        const before = await fs.promises.readFile(file, 'utf8');
+        const spy = spyPrompt(true);
+
+        const result = await verifyKnownHost({ host: 'h.example', key: keyA, promptForUnknownHost: spy.prompt }, file);
+
+        expect(result).toEqual({ verdict: 'known', verified: true });
+        expect(spy.calls).toHaveLength(0);
+        expect(await fs.promises.readFile(file, 'utf8')).toBe(before);
+    });
+
+    it('rejects a changed key (mismatch) without prompting or writing — no bypass', async () => {
+        const file = await withKnownHosts(khLine('h.example', keyA, true) + '\n');
+        const before = await fs.promises.readFile(file, 'utf8');
+        const spy = spyPrompt(true); // even a "yes" prompt must not be consulted
+
+        const result = await verifyKnownHost({ host: 'h.example', key: keyB, promptForUnknownHost: spy.prompt }, file);
+
+        expect(result).toEqual({ verdict: 'mismatch', verified: false });
+        expect(spy.calls).toHaveLength(0);
+        expect(await fs.promises.readFile(file, 'utf8')).toBe(before);
+    });
+
+    it('prompts on an unknown host and, on accept, records the key and accepts', async () => {
+        const file = await withKnownHosts('');
+        const spy = spyPrompt(true);
+
+        const result = await verifyKnownHost({ host: 'h.example', key: keyA, promptForUnknownHost: spy.prompt }, file);
+
+        expect(result).toEqual({ verdict: 'unknown', verified: true });
+        expect(spy.calls).toEqual([{ host: 'h.example', fingerprint: hostKeyFingerprint(keyA) }]);
+        // The key is now on file → a later verify is 'known'.
+        expect(verifyHostKey('h.example', keyA, await fs.promises.readFile(file, 'utf8'))).toBe('known');
+    });
+
+    it('prompts on an unknown host and, on reject, records nothing and refuses', async () => {
+        const file = await withKnownHosts('');
+        const spy = spyPrompt(false);
+
+        const result = await verifyKnownHost({ host: 'h.example', key: keyA, promptForUnknownHost: spy.prompt }, file);
+
+        expect(result).toEqual({ verdict: 'unknown', verified: false });
+        expect(spy.calls).toHaveLength(1);
+        expect(await checkNewHostInHostkeys('h.example', file)).toBe(true);
+    });
+
+    it('treats a missing known_hosts as unknown and creates it on accept', async () => {
+        tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'hostfile-test-'));
+        const file = path.join(tmpDir, 'nested', '.ssh', 'known_hosts');
+        const spy = spyPrompt(true);
+
+        const result = await verifyKnownHost({ host: 'h.example', key: keyA, promptForUnknownHost: spy.prompt }, file);
+
+        expect(result).toEqual({ verdict: 'unknown', verified: true });
+        expect(await checkNewHostInHostkeys('h.example', file)).toBe(false);
     });
 });
