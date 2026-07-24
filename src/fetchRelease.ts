@@ -51,10 +51,12 @@ export async function fetchRelease(serverDownloadUrlTemplate: string, version: s
 
     const parts = downloadUrl.pathname.split('/');
     if (parts.length < 3) {
-        console.info('Cannot parse the Github repository from the url template: ' + downloadUrl);
+        logger.info('Cannot parse the Github repository from the url template: ' + downloadUrl);
         return {version, build};
     }
-    const apiUrl = `https://api.github.com/repos/${parts[1]}/${parts[2]}/releases`;
+    // per_page=100 (Github's max) so a repository with more than the default
+    // 30 releases doesn't silently hide the release we're looking for.
+    const apiUrl = `https://api.github.com/repos/${parts[1]}/${parts[2]}/releases?per_page=100`;
 
     let found: IRelease | undefined;
     try {
@@ -65,18 +67,36 @@ export async function fetchRelease(serverDownloadUrlTemplate: string, version: s
                 'Accept': 'application/vnd.github+json',
                 'X-GitHub-Api-Version': '2022-11-28',
             },
+            // Never hang indefinitely on a stalled connection.
+            signal: AbortSignal.timeout(10_000),
         });
+
+        if (!response.ok) {
+            if (response.status === 403) {
+                logger.info(`Github API rate limit exceeded while fetching releases from ${apiUrl}`);
+            } else {
+                logger.info(`Failed to fetch releases from ${apiUrl}: ${response.status} ${response.statusText}`);
+            }
+            return {version, build};
+        }
+
         const data = await response.json() as Array<githubReleasesData>;
 
-        // Parse and sort all releases descending by semver,
-        // using hyphen to separate the version from the build/release number.
+        // Parse and sort all releases descending by (version, build).
+        // Sorting used to compare `${version}-${build}` as a single semver
+        // string, but semver rejects numeric prerelease identifiers with
+        // leading zeros (e.g. build "03593"), silently dropping otherwise
+        // legit releases. Validate/sort the version and build separately.
         const releases = data
             .map(releaseInfo => splitRelease(releaseInfo.name))
-            .filter(r => semver.valid(`${r.version}-${r.build}`))
-            .sort((a, b) => semver.rcompare(
-                `${a.version}-${a.build}`,
-                `${b.version}-${b.build}`
-            ));
+            .filter(r => semver.valid(r.version))
+            .sort((a, b) => {
+                const versionCompare = semver.rcompare(a.version, b.version);
+                if (versionCompare !== 0) {
+                    return versionCompare;
+                }
+                return Number(b.build || 0) - Number(a.build || 0);
+            });
 
         if (objective === 'latest') {
             // Latest version
@@ -85,10 +105,16 @@ export async function fetchRelease(serverDownloadUrlTemplate: string, version: s
             // Newest release whose version matches the requested version
             found = releases.find(r => r.version === version);
         } else {
-            // Specific version+release or version match
+            // Specific version+release or version match.
+            // Normalize the objective through splitRelease so a pin can be
+            // written in any of the supported schemes (e.g. the pre-1.99
+            // dot-separated "1.96.4.25026") and still match a release parsed
+            // from a differently-formatted name — comparing the raw
+            // concatenation `${r.version}${r.build}` against the objective
+            // string lost the separator and never matched.
+            const target = splitRelease(objective);
             found = releases.find(r =>
-                `${r.version}${r.build}` === objective ||
-                (r.version === objective)
+                r.version === target.version && (target.build === '' || r.build === target.build)
             );
         }
 
