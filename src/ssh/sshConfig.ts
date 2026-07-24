@@ -71,13 +71,16 @@ function normalizeSSHConfig(config: SSHConfig) {
     return config;
 }
 
-async function parseSSHConfigFromFile(filePath: string, userConfig: boolean) {
-    let content = '';
-    if (await fileExists(filePath)) {
-        content = (await fs.promises.readFile(filePath, 'utf8')).trim();
-    }
-    const config = normalizeSSHConfig(SSHConfig.parse(content));
+// OpenSSH caps nested Include expansion at 16 levels (sshd's `includedepth`)
+// and errors out beyond that; we mirror the cap but degrade gracefully
+// (stop expanding further) rather than throwing, since a malformed/cyclic
+// config shouldn't take down the whole extension.
+const MAX_INCLUDE_DEPTH = 16;
 
+// Walks `config` looking for Include directives to expand in place, and
+// recurses into Host/Match sections so a host-scoped Include (inside a
+// `Host foo { Include ... }` block) is honoured too, not just top-level ones.
+async function resolveIncludes(config: SSHConfig, userConfig: boolean, visited: Set<string>): Promise<void> {
     const includedConfigs: [number, SSHConfig[]][] = [];
     for (let i = 0; i < config.length; i++) {
         const line = config[i];
@@ -90,15 +93,39 @@ async function parseSSHConfigFromFile(filePath: string, userConfig: boolean) {
                     cwd: normalizeToSlash(path.dirname(userConfig ? defaultSSHConfigPath : systemSSHConfig))
                 });
                 for (const p of includePaths) {
-                    configs.push(await parseSSHConfigFromFile(p, userConfig));
+                    configs.push(await parseSSHConfigFromFile(p, userConfig, visited));
                 }
             }
             includedConfigs.push([i, configs]);
+        } else if (isHostSection(line)) {
+            await resolveIncludes(line.config, userConfig, visited);
         }
     }
     for (const [idx, includeConfigs] of includedConfigs.reverse()) {
         config.splice(idx, 1, ...includeConfigs.flat());
     }
+}
+
+async function parseSSHConfigFromFile(filePath: string, userConfig: boolean, visited: Set<string> = new Set()): Promise<SSHConfig> {
+    // Guard against Include cycles (self-include, mutual A<->B include) and
+    // runaway include chains, both of which would otherwise hang the
+    // resolver by recursing forever. `visited` tracks the ancestor chain for
+    // this branch only, so a diamond-shaped Include (two branches pulling in
+    // the same, non-cyclic file) is still expanded normally.
+    const resolvedPath = path.resolve(filePath);
+    if (visited.has(resolvedPath) || visited.size >= MAX_INCLUDE_DEPTH) {
+        return SSHConfig.parse('');
+    }
+
+    let content = '';
+    if (await fileExists(filePath)) {
+        content = (await fs.promises.readFile(filePath, 'utf8')).trim();
+    }
+    const config = normalizeSSHConfig(SSHConfig.parse(content));
+
+    const nestedVisited = new Set(visited);
+    nestedVisited.add(resolvedPath);
+    await resolveIncludes(config, userConfig, nestedVisited);
 
     return config;
 }
@@ -119,10 +146,14 @@ export default class SSHConfiguration {
         const hosts = new Set<string>();
         for (const line of this.sshConfig) {
             if (isHostSection(line)) {
-                const value = Array.isArray(line.value) ? line.value[0].val : line.value;
-                const isPattern = /^!/.test(value) || /[?*]/.test(value);
-                if (!isPattern) {
-                    hosts.add(value);
+                // `Host` accepts a space-separated list of patterns (e.g. `Host dev staging`);
+                // every name in the list is a distinct host, not just the first one.
+                const values = Array.isArray(line.value) ? line.value.map(v => v.val) : [line.value];
+                for (const value of values) {
+                    const isPattern = /^!/.test(value) || /[?*]/.test(value);
+                    if (!isPattern) {
+                        hosts.add(value);
+                    }
                 }
             }
         }
