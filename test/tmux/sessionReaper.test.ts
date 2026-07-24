@@ -4,16 +4,16 @@ import { buildKillSession, sessionName } from '../../src/tmux/tmuxSession';
 
 // The reaper is the anti-zombie backstop that complements the terminal provider:
 // on a successful connect (and on manual refresh) it lists the remote's tmux
-// sessions and kills exactly the *empty, detached* ones THIS extension owns — the
-// corpses left behind when a terminal's shell exits while the client is
-// disconnected. The kill DECISION lives in the session model (`shouldReap`, 02);
-// this module only orchestrates list -> parse -> decide -> kill. It is dependency-
-// inverted (injected exec / clock / log, no ssh2 / vscode), so the whole contract
-// is unit-testable here. It is deliberately conservative: an attached session, a
-// session with a live window (a detached long-running task — the point of the
-// fork), a foreign session, or a just-created one are all left strictly untouched;
-// a probe failure degrades to "reaped nothing" and never throws (reaping must
-// never break the connect).
+// sessions and kills exactly the *dead, detached* ones THIS extension owns — the
+// corpses left when a pane's process exits but the session lingers (`remain-on-exit`),
+// which the provider's create/close path can't clean up because no client is around
+// to see them. The kill DECISION lives in the session model (`shouldReap`, 02); this
+// module only orchestrates list -> parse -> decide -> kill. It is dependency-inverted
+// (injected exec / clock / log, no ssh2 / vscode), so the whole contract is
+// unit-testable here. It is deliberately conservative: an attached session, a session
+// with a live pane (a detached long-running task — the point of the fork), a foreign
+// session, or a just-created one are all left strictly untouched; a probe failure
+// degrades to "reaped nothing" and never throws (reaping must never break the connect).
 
 const HOST = 'example.com';
 const WS = '/home/user/proj';
@@ -25,9 +25,20 @@ const ours = (slot: number): string => sessionName(HOST, WS, slot);
 const NOW = 1_700_000_000;
 const OLD = NOW - 3600;
 
-/** A `tmux list-sessions -F` stdout line: `<name> <attached> <windows> <created>`. */
-const row = (name: string, attached: boolean, windows: number, created = OLD): string =>
-    `${name} ${attached ? 1 : 0} ${windows} ${created}`;
+/**
+ * A `tmux list-sessions -F` stdout line: `<name> <attached> <windows> <created> <paneDead>`.
+ * A reapable corpse is detached with a dead pane (`paneDead: true`); a live session
+ * has `paneDead: false`. `windows` is ≥1 for any real session and is never the reap gate.
+ */
+const row = (
+    name: string,
+    attached: boolean,
+    opts: { windows?: number; paneDead?: boolean; created?: number } = {},
+): string => {
+    const windows = opts.windows ?? 1;
+    const created = opts.created ?? OLD;
+    return `${name} ${attached ? 1 : 0} ${windows} ${created} ${opts.paneDead ? 1 : 0}`;
+};
 
 /**
  * An exec that answers `list-sessions` with the given rows and `kill-session` with
@@ -71,12 +82,12 @@ const killCommands = (exec: ReturnType<typeof fakeExec>): string[] =>
     exec.mock.calls.map(call => call[0]).filter(command => command.includes('kill-session'));
 
 describe('reap — selection (list -> parse -> shouldReap -> kill)', () => {
-    it('kills exactly the empty, detached session we own; leaves attached + foreign', async () => {
+    it('kills exactly the dead, detached session we own; leaves attached + foreign', async () => {
         const exec = fakeExec({
             list: [
-                row(ours(0), false, 0),   // ours, detached, empty     -> reap
-                row(ours(1), true, 1),    // ours, attached            -> keep
-                row('main', false, 0),    // foreign, detached, empty  -> keep (not ours)
+                row(ours(0), false, { paneDead: true }),  // ours, detached, dead pane  -> reap
+                row(ours(1), true, { paneDead: true }),   // ours, attached (dead pane) -> keep
+                row('main', false, { paneDead: true }),   // foreign, dead pane         -> keep (not ours)
             ],
         });
         const { reaper, log } = makeReaper({ exec });
@@ -88,8 +99,8 @@ describe('reap — selection (list -> parse -> shouldReap -> kill)', () => {
         expect(log.info).toHaveBeenCalledTimes(1);
     });
 
-    it('never kills a session with a live window (a detached long-running task)', async () => {
-        const exec = fakeExec({ list: [row(ours(0), false, 2)] });
+    it('never kills a live detached session (a detached long-running task)', async () => {
+        const exec = fakeExec({ list: [row(ours(0), false, { windows: 2, paneDead: false })] });
         const { reaper, log } = makeReaper({ exec });
 
         expect(await reaper.reap()).toBe(0);
@@ -97,8 +108,8 @@ describe('reap — selection (list -> parse -> shouldReap -> kill)', () => {
         expect(log.info).not.toHaveBeenCalled();
     });
 
-    it('reaps every empty-detached owned session in one pass, logged as one count line', async () => {
-        const exec = fakeExec({ list: [row(ours(0), false, 0), row(ours(3), false, 0)] });
+    it('reaps every dead detached owned session in one pass, logged as one count line', async () => {
+        const exec = fakeExec({ list: [row(ours(0), false, { paneDead: true }), row(ours(3), false, { paneDead: true })] });
         const { reaper, log } = makeReaper({ exec });
 
         expect(await reaper.reap()).toBe(2);
@@ -118,13 +129,13 @@ describe('reap — selection (list -> parse -> shouldReap -> kill)', () => {
 });
 
 describe('reap — startup grace (injected clock)', () => {
-    it('spares an empty owned session younger than the grace, reaps it once past the grace', async () => {
-        const young = fakeExec({ list: [row(ours(0), false, 0, NOW)] });
+    it('spares a young dead session younger than the grace, reaps it once past the grace', async () => {
+        const young = fakeExec({ list: [row(ours(0), false, { paneDead: true, created: NOW })] });
         const youngReaper = makeReaper({ exec: young, now: NOW });
         expect(await youngReaper.reaper.reap()).toBe(0);
         expect(killCommands(young)).toEqual([]);
 
-        const aged = fakeExec({ list: [row(ours(0), false, 0, NOW - DEFAULT_REAP_GRACE_SECONDS)] });
+        const aged = fakeExec({ list: [row(ours(0), false, { paneDead: true, created: NOW - DEFAULT_REAP_GRACE_SECONDS })] });
         const agedReaper = makeReaper({ exec: aged, now: NOW });
         expect(await agedReaper.reaper.reap()).toBe(1);
         expect(killCommands(aged)).toEqual([buildKillSession(ours(0))]);
@@ -144,7 +155,7 @@ describe('reap — failure handling (never breaks the connect)', () => {
 
     it('keeps reaping the rest when one kill fails, and never throws (no kill storm)', async () => {
         const exec = fakeExec({
-            list: [row(ours(0), false, 0), row(ours(1), false, 0)],
+            list: [row(ours(0), false, { paneDead: true }), row(ours(1), false, { paneDead: true })],
             throwKillFor: ours(0),
         });
         const { reaper, log } = makeReaper({ exec });
@@ -163,10 +174,10 @@ describe('killWorkspaceSessions — force-kill this workspace (manual escape hat
     it('kills EVERY session of this workspace — attached or with live windows too — and nothing else', async () => {
         const exec = fakeExec({
             list: [
-                row(ours(0), false, 0),     // ours, empty detached  -> kill
-                row(ours(1), true, 2),      // ours, attached + live -> kill (force ignores state)
-                row(otherWs(0), false, 0),  // sibling workspace     -> keep (different hash)
-                row('main', false, 3),      // foreign               -> keep (not ours)
+                row(ours(0), false),                    // ours, detached        -> kill
+                row(ours(1), true, { windows: 2 }),     // ours, attached + live -> kill (force ignores state)
+                row(otherWs(0), false),                 // sibling workspace     -> keep (different hash)
+                row('main', false, { windows: 3 }),     // foreign               -> keep (not ours)
             ],
         });
         const { reaper, log } = makeReaper({ exec });
@@ -179,7 +190,7 @@ describe('killWorkspaceSessions — force-kill this workspace (manual escape hat
     });
 
     it('kills a young session (no startup grace on an explicit force)', async () => {
-        const exec = fakeExec({ list: [row(ours(0), false, 0, NOW)] });
+        const exec = fakeExec({ list: [row(ours(0), false, { created: NOW })] });
         const { reaper } = makeReaper({ exec, now: NOW });
 
         expect(await reaper.killWorkspaceSessions(HOST, WS)).toBe(1);
@@ -187,7 +198,7 @@ describe('killWorkspaceSessions — force-kill this workspace (manual escape hat
     });
 
     it('returns 0 and logs nothing when this workspace has no sessions', async () => {
-        const exec = fakeExec({ list: [row(otherWs(0), false, 0), row('main', true, 1)] });
+        const exec = fakeExec({ list: [row(otherWs(0), false), row('main', true)] });
         const { reaper, log } = makeReaper({ exec });
 
         expect(await reaper.killWorkspaceSessions(HOST, WS)).toBe(0);
@@ -206,7 +217,7 @@ describe('killWorkspaceSessions — force-kill this workspace (manual escape hat
 
     it('keeps killing the rest when one kill fails, and never throws', async () => {
         const exec = fakeExec({
-            list: [row(ours(0), false, 0), row(ours(1), false, 0)],
+            list: [row(ours(0), false), row(ours(1), false)],
             throwKillFor: ours(0),
         });
         const { reaper } = makeReaper({ exec });
