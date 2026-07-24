@@ -31,8 +31,14 @@ export interface TmuxSession {
     readonly name: string;
     /** `#{session_attached}` as a boolean (client count > 0). */
     readonly attached: boolean;
-    /** `#{session_windows}` — 0 means the session has no panes/processes left. */
+    /** `#{session_windows}` — window count. Always ≥ 1 for a live session: tmux
+     * destroys a session when its last window closes (we set `remain-on-exit off`),
+     * so this never reaches 0 and is NOT a corpse signal — see `paneDead`. */
     readonly windows: number;
+    /** `#{pane_dead}` of the session's active pane — true when the pane's process
+     * exited but the session lingers (a `remain-on-exit on` corpse). This, not
+     * `windows`, is the reapable-corpse signal `shouldReap` gates on. */
+    readonly paneDead: boolean;
     /** `#{session_created}` — unix epoch seconds. */
     readonly createdEpoch: number;
 }
@@ -45,8 +51,9 @@ export interface AttachOrCreateOptions {
 
 /** Inputs to the reap decision beyond the session itself. */
 export interface ReapOptions {
-    /** Never reap a session younger than this many seconds — guards a session
-     * that is mid-startup (0 windows for a moment) from being killed. Default 0. */
+    /** Never reap a session younger than this many seconds — guards a session in a
+     * create/list race (a pane that dies the instant it spawns) from being killed
+     * before it stabilises. Default 0. */
     readonly minAgeSeconds?: number;
 }
 
@@ -103,41 +110,7 @@ export function isOurSession(name: string): boolean {
 }
 
 /**
- * `tmux new-session -A -s <name> -c <cwd> [<shell>]` plus per-session hardening
- * and cosmetics, chained into one atomic tmux invocation. `-A` (attach-or-create)
- * is the anti-zombie core: an existing session is re-attached, not duplicated.
- *
- * Options are set per session with `set-option -t`/`set-window-option -t` — NEVER
- * globally and NEVER touching the user's `~/.tmux.conf` (invisible-UX invariant),
- * and NEVER `destroy-unattached on` (which would kill detached work — e.g. a
- * Claude Code run — the moment the client disconnects). `remain-on-exit off` lets
- * an empty session die naturally; `status off` hides the tmux chrome; `history-limit`
- * applies to windows opened after create.
- */
-export function buildAttachOrCreate(
-    name: string,
-    cwd: string,
-    shell?: string,
-    opts: AttachOrCreateOptions = {},
-): string {
-    const target = escapeShellArg(name);
-    const historyLimit = opts.historyLimit ?? DEFAULT_HISTORY_LIMIT;
-
-    let create = `tmux new-session -A -s ${target} -c ${escapeShellArg(cwd)}`;
-    if (shell !== undefined) {
-        create += ` ${escapeShellArg(shell)}`;
-    }
-
-    return [
-        create,
-        `set-window-option -t =${target} remain-on-exit off`,
-        `set-option -t =${target} status off`,
-        `set-option -t =${target} history-limit ${historyLimit}`,
-    ].join(' \\; ');
-}
-
-/**
- * The argv form of `buildAttachOrCreate` — the array a VS Code terminal profile
+ * The argv form for attach-or-create — the array a VS Code terminal profile
  * carries as `shellArgs` (with `shellPath: 'tmux'`). The pty host hands argv to
  * `execve` **directly, with no intervening shell**, so — unlike the shell-string
  * builder — elements are NOT escaped and there is no injection surface: a hostile
@@ -166,11 +139,16 @@ export function buildAttachOrCreateArgv(
 
 /**
  * `tmux list-sessions` with a stable `-F` format — the reap/restore paths must
- * parse machine output, never the localised human table.
+ * parse machine output, never the localised human table. `#{pane_dead}` reports the
+ * session's active pane's dead state (tmux resolves a session format against its
+ * current window's active pane); for our single-window sessions that is the corpse
+ * signal `shouldReap` needs — `#{session_windows}` can never fall to 0 on a live
+ * session (tmux destroys it with its last window). It expands to `0`/`1`, so it is
+ * always a token and safe as the right-anchored final field.
  */
 export function buildListSessions(): string {
     return 'tmux list-sessions -F '
-        + escapeShellArg('#{session_name} #{session_attached} #{session_windows} #{session_created}');
+        + escapeShellArg('#{session_name} #{session_attached} #{session_windows} #{session_created} #{pane_dead}');
 }
 
 // `-t <name>` is prefix/fuzzy target matching in tmux — `has-session -t code-<h>-0`
@@ -194,9 +172,9 @@ export function buildKillSession(name: string): string {
 /**
  * Parse `buildListSessions` output into typed rows. Tolerant by design: empty
  * output, whitespace-only, and the `no server running …` message all mean "zero
- * sessions" (not an error); malformed lines are skipped. The three trailing
- * fields are numeric, so fields are read from the right — a foreign session name
- * containing spaces still parses.
+ * sessions" (not an error); malformed lines are skipped. The four trailing fields
+ * are numeric, so fields are read from the right — a foreign session name containing
+ * spaces still parses.
  */
 export function parseListSessions(stdout: string): TmuxSession[] {
     const sessions: TmuxSession[] = [];
@@ -206,19 +184,22 @@ export function parseListSessions(stdout: string): TmuxSession[] {
             continue;
         }
         const tokens = line.split(/\s+/);
-        if (tokens.length < 4) {
+        if (tokens.length < 5) {
             continue;
         }
-        const createdEpoch = toNonNegativeInt(tokens[tokens.length - 1]);
-        const windows = toNonNegativeInt(tokens[tokens.length - 2]);
-        const attachedCount = toNonNegativeInt(tokens[tokens.length - 3]);
-        if (createdEpoch === undefined || windows === undefined || attachedCount === undefined) {
+        const paneDeadFlag = toNonNegativeInt(tokens[tokens.length - 1]);
+        const createdEpoch = toNonNegativeInt(tokens[tokens.length - 2]);
+        const windows = toNonNegativeInt(tokens[tokens.length - 3]);
+        const attachedCount = toNonNegativeInt(tokens[tokens.length - 4]);
+        if (paneDeadFlag === undefined || createdEpoch === undefined
+            || windows === undefined || attachedCount === undefined) {
             continue;
         }
         sessions.push({
-            name: tokens.slice(0, tokens.length - 3).join(' '),
+            name: tokens.slice(0, tokens.length - 4).join(' '),
             attached: attachedCount > 0,
             windows,
+            paneDead: paneDeadFlag > 0,
             createdEpoch,
         });
     }
@@ -228,9 +209,16 @@ export function parseListSessions(stdout: string): TmuxSession[] {
 /**
  * Conservative reap decision — pure, with the clock injected (`now`, epoch
  * seconds; no `Date.now()` inside). Reap iff the session is one of OURS, is not
- * attached, has no live windows, and has cleared the startup grace window. When
- * in doubt, keep: a foreign session, an attached session, or any session with a
- * live window (a detached long-running task) is never touched.
+ * attached, is a genuine corpse (its active pane is dead — the process exited but
+ * the session lingers under `remain-on-exit`), and has cleared the startup grace
+ * window. When in doubt, keep: a foreign session, an attached session, or any
+ * session with a live pane (a detached long-running task) is never touched.
+ *
+ * The gate is `paneDead`, NOT `windows`: gating on `windows === 0` was a no-op,
+ * because tmux destroys a session when its last window closes (we set
+ * `remain-on-exit off`), so an owned session never appears with 0 windows — a
+ * corpse surfaces as a live-window/dead-pane session instead. That unreachable
+ * predicate is what left the reaper doing nothing; `paneDead` is what makes it fire.
  */
 export function shouldReap(session: TmuxSession, now: number, opts: ReapOptions = {}): boolean {
     if (!isOurSession(session.name)) {
@@ -239,7 +227,7 @@ export function shouldReap(session: TmuxSession, now: number, opts: ReapOptions 
     if (session.attached) {
         return false;
     }
-    if (session.windows > 0) {
+    if (!session.paneDead) {
         return false;
     }
     const minAgeSeconds = opts.minAgeSeconds ?? 0;

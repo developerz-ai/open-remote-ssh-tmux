@@ -9,11 +9,11 @@ import {
 
 // Connect-time housekeeping — the anti-zombie backstop that complements the
 // terminal provider. On a successful resolve (and on manual refresh) it lists the
-// remote's tmux sessions and kills exactly the *empty, detached* ones THIS
-// extension owns: the corpses left behind when a terminal's shell exits while the
-// client is disconnected, which the provider's create/close path can't clean up
-// because no window is around to see them die. The kill DECISION itself lives in
-// the session model (`shouldReap`, 02) — this module only orchestrates
+// remote's tmux sessions and kills exactly the *dead, detached* ones THIS
+// extension owns: the corpses left when a pane's process exits but the session
+// lingers (`remain-on-exit`), which the provider's create/close path can't clean up
+// because no client is around to see them. The kill DECISION itself lives in the
+// session model (`shouldReap`, 02) — this module only orchestrates
 // list -> parse -> decide -> kill and keeps a count for one invisible log line, so
 // there is no tmux string concatenation outside 02.
 //
@@ -26,7 +26,7 @@ import {
 // "should tmux run at all?" in one place instead of smeared across collaborators.
 //
 // Conservative by construction: a foreign session, an attached session, a session
-// with a live window (a detached long-running task — the whole point of the fork),
+// with a live pane (a detached long-running task — the whole point of the fork),
 // or a just-created one are all left untouched. Any probe failure degrades to
 // "reaped nothing" and never throws — reaping must never break the connect.
 // See docs/plans/2026/07/24/101-v1-tmux-release/04-terminal-profile.md (step 5).
@@ -53,16 +53,16 @@ export interface SessionReaperDeps {
     readonly exec: RemoteExec;
     readonly now: Clock;
     readonly log: TmuxLog;
-    /** Never reap a session younger than this many seconds — guards a session that
-     * is momentarily empty mid-startup from being killed. Defaults to
-     * `DEFAULT_REAP_GRACE_SECONDS`; an un-reaped young corpse is simply cleared on
+    /** Never reap a session younger than this many seconds — guards a session whose
+     * pane dies in a create/list race from being killed before it stabilises. Defaults
+     * to `DEFAULT_REAP_GRACE_SECONDS`; an un-reaped young corpse is simply cleared on
      * the next connect/refresh (deterministic naming means it is never duplicated). */
     readonly minAgeSeconds?: number;
 }
 
-/** Default startup grace: an empty owned session must be at least this old before
- * the reaper touches it. Small — our sessions only sit at 0 windows once truly
- * dead — but non-zero to survive a create/list race. */
+/** Default startup grace: a dead owned session must be at least this old before
+ * the reaper touches it. Small — our sessions only show a dead pane once the
+ * process has truly exited — but non-zero to survive a create/list race. */
 export const DEFAULT_REAP_GRACE_SECONDS = 10;
 
 /**
@@ -87,11 +87,12 @@ export class SessionReaper {
 
     /**
      * List -> parse -> decide -> kill. Returns the number of sessions reaped (0 when
-     * the list probe fails or nothing qualifies). Never throws: a failed
-     * `list-sessions` yields 0 and a trace line; a failed `kill-session` is traced
-     * and skipped so one dead target can't abort the rest (nor retry — no kill
-     * storm). Logs a single info line only when it actually reaped something
-     * (invisible UX — silence otherwise).
+     * the list probe fails or nothing qualifies). Only dead-pane (corpse), detached,
+     * past-grace owned sessions qualify — the decision is `shouldReap` (02). Never
+     * throws: a failed `list-sessions` yields 0 and a trace line; a failed
+     * `kill-session` is traced and skipped so one dead target can't abort the rest
+     * (nor retry — no kill storm). Logs a single info line only when it actually
+     * reaped something (invisible UX — silence otherwise).
      */
     async reap(): Promise<number> {
         const sessions = await this.listSessions();
@@ -110,7 +111,7 @@ export class SessionReaper {
         }
 
         if (reaped > 0) {
-            this.log.info(`tmux reaper: reaped ${reaped} empty session(s)`);
+            this.log.info(`tmux reaper: reaped ${reaped} dead session(s)`);
         }
         return reaped;
     }

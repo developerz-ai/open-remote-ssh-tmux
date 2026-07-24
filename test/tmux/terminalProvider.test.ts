@@ -48,9 +48,9 @@ function fakeState(initial: Record<string, unknown> = {}) {
     };
 }
 
-/** A `list-sessions` stdout line for a session. */
-const row = (sessionId: string, attached: boolean, windows = 1, created = 1700000000): string =>
-    `${sessionId} ${attached ? 1 : 0} ${windows} ${created}`;
+/** A `list-sessions` stdout line: `<name> <attached> <windows> <created> <paneDead>`. */
+const row = (sessionId: string, attached: boolean, windows = 1, created = 1700000000, paneDead = false): string =>
+    `${sessionId} ${attached ? 1 : 0} ${windows} ${created} ${paneDead ? 1 : 0}`;
 
 /**
  * An exec that answers `list-sessions` with the given rows and `has-session`

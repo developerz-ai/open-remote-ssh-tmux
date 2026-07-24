@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import {
-    buildAttachOrCreate,
     buildAttachOrCreateArgv,
     buildHasSession,
     buildKillSession,
@@ -92,8 +91,12 @@ describe('escapeShellArg', () => {
 
 describe('buildListSessions', () => {
     it('uses a stable -F format — never parses human output', () => {
+        // `#{pane_dead}` (of the session's active pane) is the corpse signal the reaper
+        // gates on: a session whose process exited but lingers under `remain-on-exit`.
+        // `#{session_windows}` alone can never be 0 for a live session, so it is not it.
         expect(buildListSessions()).toBe(
-            `tmux list-sessions -F '#{session_name} #{session_attached} #{session_windows} #{session_created}'`,
+            'tmux list-sessions -F '
+            + `'#{session_name} #{session_attached} #{session_windows} #{session_created} #{pane_dead}'`,
         );
     });
 });
@@ -106,55 +109,6 @@ describe('buildHasSession / buildKillSession', () => {
         // shell concatenates it onto the (still fully escaped) name.
         expect(buildHasSession(`code-${HASH_PROJ}-0`)).toBe(`tmux has-session -t ='code-${HASH_PROJ}-0'`);
         expect(buildKillSession(`code-${HASH_PROJ}-0`)).toBe(`tmux kill-session -t ='code-${HASH_PROJ}-0'`);
-    });
-});
-
-describe('buildAttachOrCreate', () => {
-    const NAME = `code-${HASH_PROJ}-0`;
-    const ESC = `'code-${HASH_PROJ}-0'`;
-
-    it('emits attach-or-create (-A) plus per-session hardening/cosmetics', () => {
-        // set-option/set-window-option target the session with an exact-match `=`
-        // prefix so hardening never lands on a prefix-colliding neighbour session.
-        expect(buildAttachOrCreate(NAME, '/home/user/proj')).toBe(
-            `tmux new-session -A -s ${ESC} -c '/home/user/proj'`
-            + ` \\; set-window-option -t =${ESC} remain-on-exit off`
-            + ` \\; set-option -t =${ESC} status off`
-            + ` \\; set-option -t =${ESC} history-limit 50000`,
-        );
-    });
-
-    it('always carries the -A flag (the anti-zombie core)', () => {
-        expect(buildAttachOrCreate(NAME, '/home/user/proj')).toContain(' -A ');
-    });
-
-    it('never emits destroy-unattached (that would kill detached work on disconnect)', () => {
-        expect(buildAttachOrCreate(NAME, '/home/user/proj')).not.toContain('destroy-unattached');
-    });
-
-    it('routes the shell command through the escaper', () => {
-        expect(buildAttachOrCreate(NAME, '/home/user/proj', '/bin/zsh')).toBe(
-            `tmux new-session -A -s ${ESC} -c '/home/user/proj' '/bin/zsh'`
-            + ` \\; set-window-option -t =${ESC} remain-on-exit off`
-            + ` \\; set-option -t =${ESC} status off`
-            + ` \\; set-option -t =${ESC} history-limit 50000`,
-        );
-    });
-
-    it('honours a caller-supplied history limit', () => {
-        expect(buildAttachOrCreate(NAME, '/home/user/proj', undefined, { historyLimit: 100000 }))
-            .toContain('history-limit 100000');
-    });
-
-    it('is injection-safe against a hostile cwd', () => {
-        // A workspace path an attacker controls: unescaped this would run
-        // `rm -rf $HOME`. Single-quote escaping renders `'`, `;`, and `$` inert.
-        expect(buildAttachOrCreate(NAME, `/tmp/pwn'; rm -rf $HOME'`)).toBe(
-            `tmux new-session -A -s ${ESC} -c '/tmp/pwn'\\''; rm -rf $HOME'\\'''`
-            + ` \\; set-window-option -t =${ESC} remain-on-exit off`
-            + ` \\; set-option -t =${ESC} status off`
-            + ` \\; set-option -t =${ESC} history-limit 50000`,
-        );
     });
 });
 
@@ -224,16 +178,21 @@ describe('sessionSlot', () => {
 
 describe('parseListSessions', () => {
     it('parses the happy path into typed sessions', () => {
-        const out = 'code-92fc6cc41565-0 1 2 1700000000\ncode-92fc6cc41565-1 0 1 1700000100';
+        const out = 'code-92fc6cc41565-0 1 2 1700000000 0\ncode-92fc6cc41565-1 0 1 1700000100 1';
         expect(parseListSessions(out)).toEqual([
-            { name: 'code-92fc6cc41565-0', attached: true, windows: 2, createdEpoch: 1700000000 },
-            { name: 'code-92fc6cc41565-1', attached: false, windows: 1, createdEpoch: 1700000100 },
+            { name: 'code-92fc6cc41565-0', attached: true, windows: 2, paneDead: false, createdEpoch: 1700000000 },
+            { name: 'code-92fc6cc41565-1', attached: false, windows: 1, paneDead: true, createdEpoch: 1700000100 },
         ]);
     });
 
     it('treats attached as a boolean (client count > 0)', () => {
-        expect(parseListSessions('code-x-0 3 1 1700000000')[0].attached).toBe(true);
-        expect(parseListSessions('code-x-0 0 1 1700000000')[0].attached).toBe(false);
+        expect(parseListSessions('code-x-0 3 1 1700000000 0')[0].attached).toBe(true);
+        expect(parseListSessions('code-x-0 0 1 1700000000 0')[0].attached).toBe(false);
+    });
+
+    it('treats pane_dead as a boolean corpse flag (1 = dead pane)', () => {
+        expect(parseListSessions('code-x-0 0 1 1700000000 1')[0].paneDead).toBe(true);
+        expect(parseListSessions('code-x-0 0 1 1700000000 0')[0].paneDead).toBe(false);
     });
 
     it('returns [] for empty output', () => {
@@ -246,15 +205,17 @@ describe('parseListSessions', () => {
     });
 
     it('skips garbage lines but keeps valid ones', () => {
-        const out = 'garbage-without-numbers\nfoo bar baz qux\ncode-x-0 1 1 1700000000';
+        // `foo bar baz qux quux` has five tokens but a non-numeric trailing field, so
+        // it fails the numeric guard rather than the field-count one.
+        const out = 'garbage-without-numbers\nfoo bar baz qux quux\ncode-x-0 1 1 1700000000 0';
         expect(parseListSessions(out)).toEqual([
-            { name: 'code-x-0', attached: true, windows: 1, createdEpoch: 1700000000 },
+            { name: 'code-x-0', attached: true, windows: 1, paneDead: false, createdEpoch: 1700000000 },
         ]);
     });
 
     it('tolerates a foreign session name containing spaces (parses fields from the right)', () => {
-        expect(parseListSessions('my session 1 2 1700000000')).toEqual([
-            { name: 'my session', attached: true, windows: 2, createdEpoch: 1700000000 },
+        expect(parseListSessions('my session 1 2 1700000000 0')).toEqual([
+            { name: 'my session', attached: true, windows: 2, paneDead: false, createdEpoch: 1700000000 },
         ]);
     });
 });
@@ -273,35 +234,49 @@ describe('isOurSession', () => {
 });
 
 describe('shouldReap', () => {
-    const ours = (over: Partial<Parameters<typeof shouldReap>[0]> = {}) => ({
+    // A reapable corpse: OURS, detached, and its pane is dead — the process exited
+    // but the session lingers under `remain-on-exit`. `windows` is ≥1 even for a
+    // corpse (tmux destroys a zero-window session), so it is never the reap signal;
+    // `paneDead` is.
+    const corpse = (over: Partial<Parameters<typeof shouldReap>[0]> = {}) => ({
         name: `code-${HASH_PROJ}-0`,
         attached: false,
-        windows: 0,
+        windows: 1,
+        paneDead: true,
         createdEpoch: 1000,
         ...over,
     });
 
-    it('never reaps an attached session (someone is using it)', () => {
-        expect(shouldReap(ours({ attached: true }), 5000)).toBe(false);
-        expect(shouldReap(ours({ attached: true, windows: 0 }), 5000)).toBe(false);
+    it('reaps an ours + detached + dead-pane corpse', () => {
+        expect(shouldReap(corpse(), 5000)).toBe(true);
     });
 
-    it('reaps an ours + detached + empty session', () => {
-        expect(shouldReap(ours(), 5000)).toBe(true);
+    it('never reaps an attached session, even a dead-pane one (someone is viewing it)', () => {
+        expect(shouldReap(corpse({ attached: true }), 5000)).toBe(false);
     });
 
-    it('never reaps a session with live windows (a detached Claude Code run must survive)', () => {
-        expect(shouldReap(ours({ windows: 1 }), 5000)).toBe(false);
+    it('never reaps a live detached session (a detached Claude Code run must survive)', () => {
+        // A non-dead pane is left alone regardless of window count — the point of the fork.
+        expect(shouldReap(corpse({ paneDead: false }), 5000)).toBe(false);
+        expect(shouldReap(corpse({ paneDead: false, windows: 3 }), 5000)).toBe(false);
     });
 
-    it('never reaps a foreign session, even when detached and empty', () => {
-        expect(shouldReap({ name: 'main', attached: false, windows: 0, createdEpoch: 1000 }, 5000)).toBe(false);
-        expect(shouldReap({ name: 'code', attached: false, windows: 0, createdEpoch: 1000 }, 5000)).toBe(false);
-        expect(shouldReap({ name: 'codex-x', attached: false, windows: 0, createdEpoch: 1000 }, 5000)).toBe(false);
+    it('never reaps on window count alone — windows === 0 is unreachable, not a signal', () => {
+        // tmux destroys a session when its last window closes (`remain-on-exit off`),
+        // so a live-pane / zero-window row is a shape real tmux never emits. Guards the
+        // old dead predicate (`windows === 0`) from creeping back.
+        expect(shouldReap(corpse({ paneDead: false, windows: 0 }), 5000)).toBe(false);
     });
 
-    it('respects a minimum-age grace window (guards startup races)', () => {
-        expect(shouldReap(ours({ createdEpoch: 1000 }), 1005, { minAgeSeconds: 10 })).toBe(false);
-        expect(shouldReap(ours({ createdEpoch: 1000 }), 1020, { minAgeSeconds: 10 })).toBe(true);
+    it('never reaps a foreign session, even a detached dead-pane one', () => {
+        const foreign = (name: string) => ({ name, attached: false, windows: 1, paneDead: true, createdEpoch: 1000 });
+        expect(shouldReap(foreign('main'), 5000)).toBe(false);
+        expect(shouldReap(foreign('code'), 5000)).toBe(false);
+        expect(shouldReap(foreign('codex-x'), 5000)).toBe(false);
+    });
+
+    it('respects a minimum-age grace window (guards create/list races)', () => {
+        expect(shouldReap(corpse({ createdEpoch: 1000 }), 1005, { minAgeSeconds: 10 })).toBe(false);
+        expect(shouldReap(corpse({ createdEpoch: 1000 }), 1020, { minAgeSeconds: 10 })).toBe(true);
     });
 });
