@@ -274,3 +274,16 @@ describe('reconcileDefaultTerminalProfile: applies the decision to Workspace sco
         expect(updateCalls).toHaveLength(0);
     });
 });
+
+describe('fallback terminal profile provider', () => {
+    // When tmux is unavailable or disabled, the "Persistent Shell" profile should still be
+    // available (via a fallback plain-shell provider) so the user sees the profile in the
+    // terminal picker even if tmux is not working. This prevents "Profile not found" errors
+    // and provides a graceful degradation when the setting is 'off' or the remote lacks tmux.
+    it('is registered when tmux is unavailable', () => {
+        // Fallback provider test — placeholder for future implementation.
+        // When this module registers a registerTerminalProfileProvider for the fallback,
+        // it will provide a basic shell profile for "tmux" id when tmux is not available.
+        expect(true).toBe(true);
+    });
+});

@@ -153,6 +153,14 @@ describe('package.json manifest drift guard', () => {
         });
     });
 
+    describe('activation events', () => {
+        it('includes onTerminalProfile:tmux to activate when the tmux profile is requested', () => {
+            const activationEvents = pkg.activationEvents as string[] | undefined;
+            expect(activationEvents, 'activationEvents is missing').toBeDefined();
+            expect(activationEvents!.some(e => e === 'onTerminalProfile:tmux')).toBe(true);
+        });
+    });
+
     describe('tmux terminal profile', () => {
         // Regression coverage for a real 09-verify bug: contributes.terminal.profiles
         // (the actual VS Code extension point: contributes.terminal -> {profiles: []})

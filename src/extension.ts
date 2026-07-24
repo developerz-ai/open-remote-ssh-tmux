@@ -6,6 +6,7 @@ import { KILL_WORKSPACE_SESSIONS_COMMAND_ID, killWorkspaceSessions, openSSHConfi
 import { HostTreeDataProvider } from './hostTreeView';
 import { getRemoteWorkspaceLocationData, RemoteLocationHistory } from './remoteLocationHistory';
 import { TmuxTerminalProvider, type OpenTerminal, type RemoteExec } from './tmux/terminalProvider';
+import { FallbackTerminalProvider } from './tmux/fallbackTerminalProvider';
 import { SessionReaper } from './tmux/sessionReaper';
 
 export async function activate(context: vscode.ExtensionContext) {
@@ -41,6 +42,14 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(vscode.commands.registerCommand('openremotessh.openConfigFile', () => openSSHConfigFile()));
     context.subscriptions.push(vscode.commands.registerCommand('openremotessh.showLog', () => logger.show()));
     context.subscriptions.push(vscode.commands.registerCommand(KILL_WORKSPACE_SESSIONS_COMMAND_ID, () => killWorkspaceSessions(() => resolveKillTarget(remoteSSHResolver, logger))));
+
+    // Register a fallback terminal profile provider for the "tmux" profile id. This
+    // ensures the "Persistent Shell" profile is always available in the terminal picker,
+    // even when tmux is unavailable or disabled, providing graceful degradation. When
+    // tmux is available on an SSH remote, wireTmuxTerminalLayer will register the real
+    // TmuxTerminalProvider, which overrides this fallback for that case.
+    const fallbackProvider = new FallbackTerminalProvider();
+    context.subscriptions.push(vscode.window.registerTerminalProfileProvider('tmux', fallbackProvider));
 }
 
 /**
