@@ -1,5 +1,5 @@
 ---
-description: End-to-end feature workflow for open-remote-ssh-tmux — understand, explore, build (SRP-first, one module per concern), verify in the Extension Development Host, PR against master. Reads intent from the prompt.
+description: End-to-end feature workflow for open-remote-ssh-tmux — understand, explore, build (SRP-first, one module per concern), verify in the Extension Development Host, PR against main. Reads intent from the prompt.
 argument-hint: <what you want built, plain language> [+ reference URL(s) / upstream issue]
 allowed-tools: Read, Write, Edit, Glob, Grep, Bash, Task, Skill, WebFetch, mcp__codegraph, mcp__playwright
 ---
@@ -11,7 +11,7 @@ extension that connects to remote dev hosts over SSH (a fork of
 [jeanp413/open-remote-ssh](https://github.com/jeanp413/open-remote-ssh)) and adds
 **tmux-backed persistent terminals** so long tasks survive disconnects and hand
 off between machines. Take a feature from plain-language idea to a merged PR on
-`master`. **Read `CLAUDE.md` and `docs/idea/` before designing** — the scope
+`main`. **Read `CLAUDE.md` and `docs/idea/` before designing** — the scope
 (terminals only), the invisible-UX and no-zombie requirements, the SRP module
 map, and why-tmux-not-mosh are non-negotiable context.
 
@@ -82,7 +82,7 @@ zombie sessions).
    Test-first → unit green + typecheck + clean lint + a real persistence-verified
    connect is the bar.
 
-5. **PR against `master`.** Branch off `master` (never commit to it directly).
+5. **PR against `main`.** Branch off `main` (never commit to it directly).
    Commit with **Conventional Commits** (commitlint + husky enforce it; types:
    `build ci docs enhance feat fix perf refactor remodel revert style test vcs`;
    body ≤ 200 chars/line; scope = the module/area). Push, `gh pr create` with a
@@ -112,5 +112,5 @@ strict, 4-space indent, npm + Node 20. Commit/push only when asked.
 Concern:    <module(s) touched>  →  SRP: <new src/tmux/* | UI | contributes>
 Invariants: invisible <✓/✗>  no-zombies <✓/✗>  terminals-only <✓/✗>  windows-safe <✓/✗>
 Verify:     tsc <✓/✗>  lint <✓/✗>  bundle <✓/✗>  persistence connect <✓/✗/n-a>
-PR:         #NNN  (branch <name>, base master)   upstream ref: <#… or none>
+PR:         #NNN  (branch <name>, base main)   upstream ref: <#… or none>
 ```

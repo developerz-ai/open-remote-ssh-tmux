@@ -163,7 +163,7 @@ outstanding gate — see
 - **Conventional Commits**, enforced by commitlint + husky. Allowed types:
   `build ci docs enhance feat fix perf refactor remodel revert style test vcs`.
   Body lines ≤ 200 chars.
-- Branch off `master`; never commit straight to it.
+- Branch off `main`; never commit straight to it.
 - **Fork hygiene:** we track upstream `jeanp413/open-remote-ssh`. Keep the tmux
   changes isolated and well-labelled (their own `src/tmux/*` module) so upstream
   fixes still merge cleanly. Don't gratuitously reformat upstream files — it

@@ -150,7 +150,7 @@ last_updated: <YYYY-MM-DD>
 - Stack rules: TypeScript strict, no `any`, no unused locals/params, explicit
   `override`. 4-space indent (`.editorconfig`). npm + Node 20. Conventional
   Commits (commitlint types: `build ci docs enhance feat fix perf refactor remodel
-  revert style test vcs`). Branch off `master`.
+  revert style test vcs`). Branch off `main`.
 - Dependency direction: `extension` → feature modules (`tmux/*`, `hostTreeView`,
   `commands`) → `ssh/*` | `serverSetup` → `common/*`; `common/*` never imports
   upward.
