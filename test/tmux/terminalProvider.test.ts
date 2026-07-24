@@ -134,6 +134,79 @@ describe('slot allocation', () => {
     });
 });
 
+describe('init race (no duplicate/mirrored tab on a slot being restored or adopted)', () => {
+    // extension.ts kicks off initialize() fire-and-forget, then registers the
+    // profile provider. A "New Terminal" (or the auto-terminal VS Code opens on
+    // connect) could call provideTerminalProfile() *before* initialize() finished
+    // restoring/adopting — and allocateSlot, ignoring the persisted mapping and the
+    // pending restore, handed out slot 0 too. Two terminals on one tmux session →
+    // shared view, mirrored keystrokes. Two complementary guards close it: mapped
+    // slots are reserved synchronously (before initialize()'s first await), and
+    // provideTerminalProfile awaits `initialized` so adoption (remote-discovered,
+    // not yet in the mapping) also completes first.
+
+    it('reserves a mapped survivor slot so a new terminal never collides with it', async () => {
+        // A survivor mapping from a previous window: slot 0 is spoken for. Even
+        // before initialize() runs, a brand-new terminal must skip it → slot 1.
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const { provider } = makeProvider({ state });
+        expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(1));
+    });
+
+    it('awaits initialize() so a terminal created mid-restore does not collide with an adopted orphan', async () => {
+        // Force the race a near-synchronous fake exec would hide: hold initialize()'s
+        // list-sessions probe open. There is a detached orphan on slot 0 that no client
+        // holds and this client has not mapped (hand-off) — initialize() will adopt it.
+        // Without the gate, provideTerminalProfile races ahead and allocates the very
+        // slot 0 that adoption is about to claim (mirrored tab). The gate must keep it
+        // pending until initialize() settles, then hand out slot 1.
+        let releaseList!: () => void;
+        const listGate = new Promise<void>(res => { releaseList = res; });
+        let firstList = true;
+        const exec = vi.fn(async (command: string) => {
+            if (command.includes('list-sessions')) {
+                if (firstList) {
+                    firstList = false;
+                    await listGate; // only initialize()'s probe blocks
+                }
+                return { stdout: row(name(0), false), stderr: '' };
+            }
+            return { stdout: '', stderr: '' };
+        });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ exec, opened });
+
+        const initP = provider.initialize(); // fire-and-forget, exactly like extension.ts
+        let profile: { options: unknown } | undefined;
+        const profileP = provider.provideTerminalProfile().then(p => { profile = p; });
+
+        // Drain every pending microtask; without the gate, allocation would have run.
+        await new Promise<void>(res => setTimeout(res, 0));
+        expect(profile).toBeUndefined(); // still gated on initialize()
+
+        releaseList();
+        await initP;
+        await profileP;
+
+        expect(targetSession(optionsOf(profile!))).toBe(name(1)); // new terminal took slot 1
+        expect(opened.map(targetSession)).toEqual([name(0)]);     // orphan adopted once, on slot 0
+    });
+
+    it('drains reservations after initialize so a closed-then-reopened slot is reusable', async () => {
+        // Reservation must be a connect-time guard, not permanent: once initialize()
+        // has resolved every survivor into an open terminal, closing one and opening a
+        // new terminal must reuse that slot (same client re-attaching its own session).
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const exec = fakeExec({ list: [row(name(0), false)], existing: [name(0)] });
+        const { provider } = makeProvider({ state, exec });
+
+        await provider.initialize(); // restores slot 0 into an open terminal
+        provider.releaseSlot(0);     // user closes it (detach, mapping kept)
+
+        expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(0));
+    });
+});
+
 describe('live terminal close wiring (onDidOpenTerminal / onDidCloseTerminal)', () => {
     // Regression coverage for a real 09-verify bug: `releaseSlot` is pure and
     // unit-tested (see "reuses the lowest freed slot" above), but nothing ever

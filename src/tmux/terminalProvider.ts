@@ -112,6 +112,16 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
     /** Slots a *remote* session is currently attached to (any client) — the
      * no-steal guard, refreshed from `list-sessions` at connect and on each create. */
     private attachedRemoteSlots = new Set<number>();
+    /** Slots held for connect-time restore/adoption. Seeded synchronously from the
+     * persisted mapping in the constructor — *before* {@link initialize}'s first
+     * `await` — so a `provideTerminalProfile` that races (or precedes) `initialize`
+     * cannot hand a survivor's slot to a brand-new terminal: that produced a second,
+     * mirrored tab on slot 0. Drained once reconciliation has resolved every survivor
+     * into `openSlots` (or pruned it), so a later close-then-reopen can still reuse a
+     * slot ({@link releaseSlot}). */
+    private readonly reservedSlots: Set<number>;
+    /** Backing store for {@link initialized}. */
+    private reconciliation: Promise<void> = Promise.resolve();
 
     constructor(deps: TmuxTerminalDeps) {
         this.ctx = deps.ctx;
@@ -121,6 +131,16 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         this.log = deps.log;
         this.historyLimit = deps.historyLimit;
         this.mapping = readMapping(deps.state);
+        this.reservedSlots = new Set(this.mapping.keys());
+    }
+
+    /** Resolves when connect-time reconciliation ({@link initialize}) has settled;
+     * an already-resolved promise until `initialize` is first invoked. Awaited by
+     * {@link provideTerminalProfile} so a new terminal never allocates a slot that
+     * restore/adoption is about to claim (the init race). Assigned synchronously at
+     * `initialize` entry, before its first `await`. */
+    get initialized(): Promise<void> {
+        return this.reconciliation;
     }
 
     /**
@@ -130,7 +150,19 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
      * reconciliation: PC reconnects → its own + the laptop's orphan). Attached
      * sessions of another client are left strictly untouched (no steal, no mirror).
      */
-    async initialize(): Promise<void> {
+    initialize(): Promise<void> {
+        // Publish the gate *before* the first `await` (assignment is synchronous, so
+        // extension.ts wiring `initialize()` ahead of registering the provider arms the
+        // gate before any `provideTerminalProfile`). Once reconciliation settles, every
+        // survivor is in `openSlots` (or pruned), so drop the connect-time reservations
+        // — `finally` so a failed probe never wedges them on — letting a later
+        // close-then-reopen reuse a slot ({@link releaseSlot}). Callers keep awaiting
+        // the returned promise as before.
+        this.reconciliation = this.reconcile().finally(() => this.reservedSlots.clear());
+        return this.reconciliation;
+    }
+
+    private async reconcile(): Promise<void> {
         const remote = await this.refreshRemote();
         const remoteBySlot = new Map(remote.map(s => [s.slot, s]));
 
@@ -185,6 +217,10 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
      * token param is intentionally omitted (nothing to cancel in this cheap path).
      */
     async provideTerminalProfile(): Promise<vscode.TerminalProfile> {
+        // Wait out connect-time restore/adoption so a brand-new terminal never races
+        // onto a slot it is about to claim (duplicate mirrored tab). A failed restore
+        // must not block new terminals, so its rejection is swallowed here.
+        await this.initialized.catch(() => { /* restore failure never blocks a new terminal */ });
         await this.refreshRemote(); // no-steal snapshot, refreshed on create
         const slot = this.allocateSlot();
         this.openSlots.add(slot);
@@ -259,10 +295,11 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         return [...this.mapping.keys()].sort((a, b) => a - b);
     }
 
-    /** Lowest slot not open in this window and not attached elsewhere on the remote. */
+    /** Lowest slot not open in this window, not attached elsewhere on the remote, and
+     * not reserved for connect-time restore/adoption (the init-race guard). */
     private allocateSlot(): number {
         let slot = 0;
-        while (this.openSlots.has(slot) || this.attachedRemoteSlots.has(slot)) {
+        while (this.openSlots.has(slot) || this.attachedRemoteSlots.has(slot) || this.reservedSlots.has(slot)) {
             slot++;
         }
         return slot;
