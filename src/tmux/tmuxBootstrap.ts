@@ -24,15 +24,25 @@ export interface TmuxCapability {
     readonly available: boolean;
     /** Reported tmux version token (e.g. `3.2a`) when a numeric version was parsed. */
     readonly version?: string;
+    /** Absolute path to the tmux binary, as resolved by `command -v` on the remote.
+     * Present only when tmux is available and the probe printed a path line. Lets the
+     * terminal layer invoke tmux by absolute path instead of re-resolving PATH under a
+     * possibly non-login shell — nix / `~/.local/bin` installs aren't on the default
+     * PATH, so a bare `tmux` would fail there. */
+    readonly path?: string;
     /** Why tmux is unavailable. Absent when `available` is true. */
     readonly reason?: TmuxUnavailableReason;
 }
 
-/** Exact remote command: resolve the binary, then print its version. If tmux is
+/** Exact remote command: resolve the binary, then print its version. Wrapped in
+ * `sh -c '…'` so it runs under POSIX sh even when the remote login shell is
+ * csh/tcsh — those lack a `command` builtin and treat `&&` differently, so the raw
+ * form errors and tmux would be silently disabled on those hosts. If tmux is
  * absent, `command -v tmux` exits non-zero and `&&` short-circuits, so no version
  * line is printed — that absence is how we detect "not installed" (the real
- * `SSHConnection#exec` surfaces no exit code, so detection is by parsed stdout). */
-const PROBE_COMMAND = 'command -v tmux && tmux -V';
+ * `SSHConnection#exec` surfaces no exit code, so detection is by parsed stdout). On
+ * success stdout is two lines: the resolved path (`command -v`) then `tmux <version>`. */
+const PROBE_COMMAND = `sh -c 'command -v tmux && tmux -V'`;
 
 /** Minimum tmux the session model's options require. Bumping this is a real
  * compatibility decision — keep it as named constants, not inline magic numbers. */
@@ -72,16 +82,19 @@ export async function probeTmux(exec: TmuxExec, platform?: string): Promise<Tmux
         return { available: false, reason: 'not-installed' };
     }
 
+    // Only surfaced on the available branches: an unusable tmux (too old / absent)
+    // has no path worth threading downstream. Omitted when no path line was printed.
+    const path = parsePath(stdout);
     const meetsFloor = versionMeetsFloor(version);
     if (meetsFloor === undefined) {
         // Exotic build (e.g. `tmux master`): can't compare, so don't punish it —
         // assume usable, but report no version since we couldn't parse one.
-        return { available: true };
+        return path ? { available: true, path } : { available: true };
     }
     if (!meetsFloor) {
         return { available: false, version, reason: 'too-old' };
     }
-    return { available: true, version };
+    return path ? { available: true, version, path } : { available: true, version };
 }
 
 /** Extract the version token `tmux -V` prints (the `<version>` in `tmux <version>`),
@@ -89,6 +102,19 @@ export async function probeTmux(exec: TmuxExec, platform?: string): Promise<Tmux
  * the `command -v` path line (`/usr/bin/tmux`) never matches. */
 function parseVersionToken(stdout: string): string | undefined {
     return /^tmux (\S+)/m.exec(stdout)?.[1];
+}
+
+/** Extract the resolved binary path that `command -v tmux` prints on the first
+ * stdout line. POSIX `command -v` prints an absolute path for an external command,
+ * so we require a leading `/` — that also cleanly rejects the `tmux <version>` line
+ * (present when the probe skipped straight to `tmux -V`) so it is never mistaken for
+ * a path. Returns `undefined` when no such line was printed. */
+function parsePath(stdout: string): string | undefined {
+    const firstLine = stdout.split('\n', 1)[0]?.trim();
+    if (firstLine === undefined || !firstLine.startsWith('/')) {
+        return undefined;
+    }
+    return firstLine;
 }
 
 /** Whether a version token clears the floor. `undefined` when the token has no
