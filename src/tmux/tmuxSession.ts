@@ -127,11 +127,19 @@ export function buildAttachOrCreateArgv(
     if (shell !== undefined) {
         create.push(shell);
     }
+    // `set-option`'s `-t` is target-WINDOW syntax (unlike `set-window-option`'s,
+    // which accepts a bare `=<name>` exact-match session target fine): confirmed
+    // against a real tmux 3.4 server that a bare `=<name>` there is NOT resolved
+    // as "exact-match session, default window" and fails with "no such session"
+    // — `status`/`history-limit` silently never applied (status bar stayed
+    // visible: a hard Invisible-UX violation this repo's unit tests, which fake
+    // tmux entirely, could not catch). `=<name>:` (trailing colon = exact session,
+    // empty/default window) is the form `set-option` actually accepts.
     return [
         ...create,
         ';', 'set-window-option', '-t', `=${name}`, 'remain-on-exit', 'off',
-        ';', 'set-option', '-t', `=${name}`, 'status', 'off',
-        ';', 'set-option', '-t', `=${name}`, 'history-limit', String(historyLimit),
+        ';', 'set-option', '-t', `=${name}:`, 'status', 'off',
+        ';', 'set-option', '-t', `=${name}:`, 'history-limit', String(historyLimit),
     ];
 }
 
