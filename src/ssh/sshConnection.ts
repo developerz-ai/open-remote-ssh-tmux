@@ -284,6 +284,14 @@ export default class SSHConnection extends EventEmitter {
                                         }
                                         return callback(null, stream);
                                     });
+                            }).catch((err) => {
+                                // connect() failed before we could hand off to forwardOut. The
+                                // socks library owns the client socket here (we never got a
+                                // handle on it), so routing the failure through its callback is
+                                // what tears the pending SOCKS handshake down instead of leaving
+                                // it hanging — and, without this, an unhandled rejection.
+                                this.emit(SSHConstants.CHANNEL.TUNNEL, SSHConstants.STATUS.DISCONNECT, { SSHTunnelConfig: SSHTunnelConfig, err: err });
+                                callback(err);
                             });
                         }
                     }).on('proxyError', (err: unknown) => {
@@ -321,6 +329,12 @@ export default class SSHConnection extends EventEmitter {
                                         socket.pipe(stream);
                                     });
                                 }
+                            }).catch((err) => {
+                                // connect() failed before we forwarded this already-accepted
+                                // socket anywhere — nothing else owns it, so it would otherwise
+                                // leak open (and this would be an unhandled rejection). Destroy it.
+                                this.emit(SSHConstants.CHANNEL.TUNNEL, SSHConstants.STATUS.DISCONNECT, { SSHTunnelConfig: SSHTunnelConfig, err: err });
+                                socket.destroy();
                             });
                         });
                 }

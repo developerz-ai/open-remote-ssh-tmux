@@ -586,132 +586,157 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
         let keyboardRetryCount = PASSWORD_RETRY_COUNT;
         identityKeys = identityKeys.slice();
         return async (methodsLeft: string[] | null, _partialSuccess: boolean | null, callback: (nextAuth: ssh2.AuthHandlerResult) => void) => {
-            if (methodsLeft === null) {
-                this.logger.info(`Trying no-auth authentication`);
+            // ssh2 invokes this handler without awaiting it (it's a plain
+            // callback-style API), so a throw/rejection anywhere below (e.g. the
+            // identity file is deleted between the fileExists check and readFile,
+            // or showInputBox rejects) would otherwise be an unhandled rejection
+            // AND leave `callback` never called — ssh2 stalls until `readyTimeout`
+            // instead of failing fast. This guarantees `callback(false)` ("try the
+            // next auth method") always fires.
+            try {
+                if (methodsLeft === null) {
+                    this.logger.info(`Trying no-auth authentication`);
 
-                return callback({
-                    type: 'none',
-                    username: sshUser,
-                });
-            }
-            if (methodsLeft.includes('publickey') && identityKeys.length && preferredAuthentications.includes('publickey')) {
-                const identityKey = identityKeys.shift()!;
-
-                this.logger.info(identityKey.parsedKey
-                    ? `Trying publickey authentication: ${identityKey.filename} ${identityKey.parsedKey.type} SHA256:${identityKey.fingerprint}`
-                    : `Trying publickey authentication: ${identityKey.filename} (encrypted, passphrase required)`);
-
-                if (identityKey.agentSupport) {
                     return callback({
-                        type: 'agent',
+                        type: 'none',
                         username: sshUser,
-                        agent: new class extends ssh2.OpenSSHAgent {
-                            // Only return the current key
-                            override getIdentities(callback: (err: Error | undefined, publicKeys?: ParsedKey[]) => void): void {
-                                // Invariant: agentSupport is only ever set alongside a resolved parsedKey (see identityFiles.ts).
-                                callback(undefined, [identityKey.parsedKey!]);
-                            }
-                        }(this.sshAgentSock!)
                     });
                 }
-                if (identityKey.isPrivate && identityKey.parsedKey) {
+                if (methodsLeft.includes('publickey') && identityKeys.length && preferredAuthentications.includes('publickey')) {
+                    const identityKey = identityKeys.shift()!;
+
+                    this.logger.info(identityKey.parsedKey
+                        ? `Trying publickey authentication: ${identityKey.filename} ${identityKey.parsedKey.type} SHA256:${identityKey.fingerprint}`
+                        : `Trying publickey authentication: ${identityKey.filename} (encrypted, passphrase required)`);
+
+                    if (identityKey.agentSupport) {
+                        return callback({
+                            type: 'agent',
+                            username: sshUser,
+                            agent: new class extends ssh2.OpenSSHAgent {
+                                // Only return the current key
+                                override getIdentities(callback: (err: Error | undefined, publicKeys?: ParsedKey[]) => void): void {
+                                    // Invariant: agentSupport is only ever set alongside a resolved parsedKey (see identityFiles.ts).
+                                    callback(undefined, [identityKey.parsedKey!]);
+                                }
+                            }(this.sshAgentSock!)
+                        });
+                    }
+                    if (identityKey.isPrivate && identityKey.parsedKey) {
+                        return callback({
+                            type: 'publickey',
+                            username: sshUser,
+                            key: identityKey.parsedKey
+                        });
+                    }
+                    if (!await fileExists(identityKey.filename)) {
+                        // Try next identity file
+                        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                        return callback(null as any);
+                    }
+
+                    const keyBuffer = await fs.promises.readFile(identityKey.filename);
+                    let result = ssh2.utils.parseKey(keyBuffer); // First try without passphrase
+                    if (result instanceof Error && result.message === 'Encrypted private OpenSSH key detected, but no passphrase given') {
+                        let passphraseRetryCount = PASSPHRASE_RETRY_COUNT;
+                        while (result instanceof Error && passphraseRetryCount > 0) {
+                            const passphrase = await vscode.window.showInputBox({
+                                title: `Enter passphrase for ${identityKey.filename}`,
+                                password: true,
+                                ignoreFocusOut: true
+                            });
+                            if (!passphrase) {
+                                break;
+                            }
+                            result = ssh2.utils.parseKey(keyBuffer, passphrase);
+                            passphraseRetryCount--;
+                        }
+                    }
+                    if (!result || result instanceof Error) {
+                        // Try next identity file
+                        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                        return callback(null as any);
+                    }
+
+                    const key = Array.isArray(result) ? result[0] : result;
                     return callback({
                         type: 'publickey',
                         username: sshUser,
-                        key: identityKey.parsedKey
+                        key
                     });
                 }
-                if (!await fileExists(identityKey.filename)) {
-                    // Try next identity file
-                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                    return callback(null as any);
-                }
-
-                const keyBuffer = await fs.promises.readFile(identityKey.filename);
-                let result = ssh2.utils.parseKey(keyBuffer); // First try without passphrase
-                if (result instanceof Error && result.message === 'Encrypted private OpenSSH key detected, but no passphrase given') {
-                    let passphraseRetryCount = PASSPHRASE_RETRY_COUNT;
-                    while (result instanceof Error && passphraseRetryCount > 0) {
-                        const passphrase = await vscode.window.showInputBox({
-                            title: `Enter passphrase for ${identityKey.filename}`,
-                            password: true,
-                            ignoreFocusOut: true
-                        });
-                        if (!passphrase) {
-                            break;
-                        }
-                        result = ssh2.utils.parseKey(keyBuffer, passphrase);
-                        passphraseRetryCount--;
+                if (methodsLeft.includes('password') && passwordRetryCount > 0 && preferredAuthentications.includes('password')) {
+                    if (passwordRetryCount === PASSWORD_RETRY_COUNT) {
+                        this.logger.info(`Trying password authentication`);
                     }
-                }
-                if (!result || result instanceof Error) {
-                    // Try next identity file
-                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                    return callback(null as any);
-                }
 
-                const key = Array.isArray(result) ? result[0] : result;
-                return callback({
-                    type: 'publickey',
-                    username: sshUser,
-                    key
-                });
-            }
-            if (methodsLeft.includes('password') && passwordRetryCount > 0 && preferredAuthentications.includes('password')) {
-                if (passwordRetryCount === PASSWORD_RETRY_COUNT) {
-                    this.logger.info(`Trying password authentication`);
+                    const password = await vscode.window.showInputBox({
+                        title: `Enter password for ${sshUser}@${sshHostName}`,
+                        password: true,
+                        ignoreFocusOut: true
+                    });
+                    passwordRetryCount--;
+
+                    return callback(password
+                        ? {
+                            type: 'password',
+                            username: sshUser,
+                            password
+                        }
+                        : false);
                 }
+                if (methodsLeft.includes('keyboard-interactive') && keyboardRetryCount > 0 && preferredAuthentications.includes('keyboard-interactive')) {
+                    if (keyboardRetryCount === PASSWORD_RETRY_COUNT) {
+                        this.logger.info(`Trying keyboard-interactive authentication`);
+                    }
 
-                const password = await vscode.window.showInputBox({
-                    title: `Enter password for ${sshUser}@${sshHostName}`,
-                    password: true,
-                    ignoreFocusOut: true
-                });
-                passwordRetryCount--;
-
-                return callback(password
-                    ? {
-                        type: 'password',
+                    return callback({
+                        type: 'keyboard-interactive',
                         username: sshUser,
-                        password
-                    }
-                    : false);
-            }
-            if (methodsLeft.includes('keyboard-interactive') && keyboardRetryCount > 0 && preferredAuthentications.includes('keyboard-interactive')) {
-                if (keyboardRetryCount === PASSWORD_RETRY_COUNT) {
-                    this.logger.info(`Trying keyboard-interactive authentication`);
+                        prompt: async (_name, _instructions, _instructionsLang, prompts, finish) => {
+                            // Same fire-and-forget hazard as the outer handler: ssh2 calls
+                            // `prompt` without awaiting it, so a throw here (e.g.
+                            // showInputBox rejecting) would otherwise leave `finish` never
+                            // called and this keyboard-interactive attempt stalled until
+                            // `readyTimeout`. Treat a failure like a user cancel — finish
+                            // with a full-length padded response array (never a short one,
+                            // which would desync the protocol) and mark retries exhausted.
+                            try {
+                                const responses: string[] = [];
+                                let cancelled = false;
+                                for (const prompt of prompts) {
+                                    const response = await vscode.window.showInputBox({
+                                        title: `(${sshUser}@${sshHostName}) ${prompt.prompt}`,
+                                        password: !prompt.echo,
+                                        ignoreFocusOut: true
+                                    });
+                                    if (response === undefined) {
+                                        cancelled = true;
+                                        break;
+                                    }
+                                    responses.push(response);
+                                }
+                                const { finishWith, retriesExhausted } = buildKeyboardInteractiveFinish(prompts.length, responses, cancelled);
+                                if (retriesExhausted) {
+                                    keyboardRetryCount = 0;
+                                } else {
+                                    keyboardRetryCount--;
+                                }
+                                finish(finishWith);
+                            } catch (err) {
+                                this.logger.error(`Keyboard-interactive prompt failed`, err);
+                                keyboardRetryCount = 0;
+                                finish(buildKeyboardInteractiveFinish(prompts.length, [], true).finishWith);
+                            }
+                        }
+                    });
                 }
 
-                return callback({
-                    type: 'keyboard-interactive',
-                    username: sshUser,
-                    prompt: async (_name, _instructions, _instructionsLang, prompts, finish) => {
-                        const responses: string[] = [];
-                        let cancelled = false;
-                        for (const prompt of prompts) {
-                            const response = await vscode.window.showInputBox({
-                                title: `(${sshUser}@${sshHostName}) ${prompt.prompt}`,
-                                password: !prompt.echo,
-                                ignoreFocusOut: true
-                            });
-                            if (response === undefined) {
-                                cancelled = true;
-                                break;
-                            }
-                            responses.push(response);
-                        }
-                        const { finishWith, retriesExhausted } = buildKeyboardInteractiveFinish(prompts.length, responses, cancelled);
-                        if (retriesExhausted) {
-                            keyboardRetryCount = 0;
-                        } else {
-                            keyboardRetryCount--;
-                        }
-                        finish(finishWith);
-                    }
-                });
+                callback(false);
+            } catch (err) {
+                this.logger.error(`SSH auth handler failed`, err);
+                callback(false);
             }
-
-            callback(false);
         };
     }
 
