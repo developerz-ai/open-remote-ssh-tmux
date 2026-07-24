@@ -132,11 +132,23 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
      */
     async initialize(): Promise<void> {
         const remote = await this.refreshRemote();
+        const remoteBySlot = new Map(remote.map(s => [s.slot, s]));
 
         let restored = 0;
         let pruned = 0;
         for (const slot of [...this.mapping.keys()].sort((a, b) => a - b)) {
             const session = this.mapping.get(slot)!;
+            // No-steal / no-mirror: if another client already holds this slot's
+            // session (we aren't attached yet, so `attached` means "elsewhere"),
+            // re-attaching would share the tmux view and mirror keystrokes on
+            // hand-off (close PC → open laptop). Existence alone can't tell the two
+            // apart, so consult the `attached` flag from the `list-sessions` snapshot
+            // above. Leave it strictly untouched and keep the mapping — a later
+            // reconnect re-attaches it once the other client detaches.
+            if (remoteBySlot.get(slot)?.attached) {
+                this.log.trace(`tmux terminal: slot ${slot} attached elsewhere — not re-attaching (no mirror)`);
+                continue;
+            }
             if (await this.sessionExists(session)) {
                 this.reopen(slot);
                 restored++;

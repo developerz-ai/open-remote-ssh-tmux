@@ -186,6 +186,24 @@ describe('restore mapping (per client, on reload)', () => {
         expect(provider.mappedSlots()).toEqual([0]);          // slot 2 pruned
         expect(state.get(SLOT_MAPPING_STATE_KEY)).toEqual({ '0': name(0) });
     });
+
+    it('does not re-attach a mapped slot another client is attached to (no mirror on hand-off)', async () => {
+        // Hand-off race: this client mapped slot 0 last time; now the *other* client
+        // (e.g. the PC) is attached to that very session. Existence alone is true, so
+        // the naive restore re-opens it — and two clients on one tmux session share
+        // the view and mirror keystrokes. The loop must skip on the snapshot's
+        // `attached`, yet keep the mapping so a later reconnect can re-attach once the
+        // other client detaches.
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const exec = fakeExec({ list: [row(name(0), true)], existing: [name(0)] });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ state, exec, opened });
+
+        await provider.initialize();
+
+        expect(opened).toEqual([]);                  // slot 0 not re-attached (no mirror)
+        expect(provider.mappedSlots()).toEqual([0]); // mapping kept — still ours
+    });
 });
 
 describe('adoption (hand-off / reconciliation)', () => {
