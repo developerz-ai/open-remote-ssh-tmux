@@ -154,3 +154,64 @@ describe('reap — failure handling (never breaks the connect)', () => {
         expect(log.trace).toHaveBeenCalled();
     });
 });
+
+describe('killWorkspaceSessions — force-kill this workspace (manual escape hatch)', () => {
+    const OTHER_WS = '/home/user/other';
+    /** An owned session name for a slot in a DIFFERENT workspace on the same host. */
+    const otherWs = (slot: number): string => sessionName(HOST, OTHER_WS, slot);
+
+    it('kills EVERY session of this workspace — attached or with live windows too — and nothing else', async () => {
+        const exec = fakeExec({
+            list: [
+                row(ours(0), false, 0),     // ours, empty detached  -> kill
+                row(ours(1), true, 2),      // ours, attached + live -> kill (force ignores state)
+                row(otherWs(0), false, 0),  // sibling workspace     -> keep (different hash)
+                row('main', false, 3),      // foreign               -> keep (not ours)
+            ],
+        });
+        const { reaper, log } = makeReaper({ exec });
+
+        const killed = await reaper.killWorkspaceSessions(HOST, WS);
+
+        expect(killCommands(exec)).toEqual([buildKillSession(ours(0)), buildKillSession(ours(1))]);
+        expect(killed).toBe(2);
+        expect(log.info).toHaveBeenCalledTimes(1);
+    });
+
+    it('kills a young session (no startup grace on an explicit force)', async () => {
+        const exec = fakeExec({ list: [row(ours(0), false, 0, NOW)] });
+        const { reaper } = makeReaper({ exec, now: NOW });
+
+        expect(await reaper.killWorkspaceSessions(HOST, WS)).toBe(1);
+        expect(killCommands(exec)).toEqual([buildKillSession(ours(0))]);
+    });
+
+    it('returns 0 and logs nothing when this workspace has no sessions', async () => {
+        const exec = fakeExec({ list: [row(otherWs(0), false, 0), row('main', true, 1)] });
+        const { reaper, log } = makeReaper({ exec });
+
+        expect(await reaper.killWorkspaceSessions(HOST, WS)).toBe(0);
+        expect(killCommands(exec)).toEqual([]);
+        expect(log.info).not.toHaveBeenCalled();
+    });
+
+    it('returns 0 without throwing when list-sessions fails', async () => {
+        const exec = fakeExec({ throwOnList: true });
+        const { reaper, log } = makeReaper({ exec });
+
+        await expect(reaper.killWorkspaceSessions(HOST, WS)).resolves.toBe(0);
+        expect(killCommands(exec)).toEqual([]);
+        expect(log.trace).toHaveBeenCalled();
+    });
+
+    it('keeps killing the rest when one kill fails, and never throws', async () => {
+        const exec = fakeExec({
+            list: [row(ours(0), false, 0), row(ours(1), false, 0)],
+            throwKillFor: ours(0),
+        });
+        const { reaper } = makeReaper({ exec });
+
+        await expect(reaper.killWorkspaceSessions(HOST, WS)).resolves.toBe(1);
+        expect(killCommands(exec)).toEqual([buildKillSession(ours(0)), buildKillSession(ours(1))]);
+    });
+});

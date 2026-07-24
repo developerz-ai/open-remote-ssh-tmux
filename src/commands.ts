@@ -63,3 +63,67 @@ export async function openSSHConfigFile() {
     }
     vscode.commands.executeCommand('vscode.open', vscode.Uri.file(sshConfigPath));
 }
+
+/** Confirm button label for the kill command's modal. Exported so the handler test
+ * can seed the simulated dialog choice without duplicating the literal. */
+export const KILL_SESSIONS_CONFIRM_LABEL = 'Kill Sessions';
+
+/**
+ * The kill command's id — single source of truth shared by `extension.ts`'s
+ * `registerCommand` call and `package.json`'s `contributes.commands` entry.
+ * Exported so a drift-guard test can assert the manifest and the registration stay
+ * in lockstep (see `test/package-manifest.test.ts`).
+ */
+export const KILL_WORKSPACE_SESSIONS_COMMAND_ID = 'openremotessh.tmux.killWorkspaceSessions';
+
+/**
+ * The reaper capability the kill command needs, declared here as a narrow local
+ * interface (ISP) so this module depends on a behaviour, not on the tmux layer's
+ * types: force-kill every persistent session of one (host, workspace), returning the
+ * count. `SessionReaper` satisfies it structurally.
+ */
+export interface WorkspaceSessionKiller {
+    killWorkspaceSessions(hostKey: string, workspaceKey: string): Promise<number>;
+}
+
+/**
+ * What the kill command operates on: the workspace-scoped killer and the
+ * (host, workspace) identity to target. The wiring (`extension.ts`) resolves this
+ * lazily from the live SSH connection + open workspace, and yields `undefined` when
+ * there is no remote connection — so the command is a safe no-op off a remote.
+ */
+export interface WorkspaceKillTarget {
+    readonly reaper: WorkspaceSessionKiller;
+    readonly hostKey: string;
+    readonly workspaceKey: string;
+}
+
+/**
+ * Manual zombie escape hatch behind "Remote-SSH: Kill Persistent Terminal Sessions
+ * (this workspace)" (docs/idea/tmux-approach.md). Confirms with a modal — this
+ * terminates any process still running in those sessions — then delegates the
+ * force-kill to the reaper. Deliberately thin: it owns no tmux/session logic and
+ * builds no command lines (the reaper does, via module 02). `resolveTarget` is
+ * injected so the SSH-connection/workspace plumbing stays in `extension.ts` and this
+ * handler is unit-testable.
+ */
+export async function killWorkspaceSessions(resolveTarget: () => WorkspaceKillTarget | undefined): Promise<void> {
+    const target = resolveTarget();
+    if (!target) {
+        // Off a remote (or before resolve completes) there is nothing to kill.
+        vscode.window.showInformationMessage('Remote-SSH: Not connected to a remote — no persistent terminal sessions to kill.');
+        return;
+    }
+
+    const choice = await vscode.window.showWarningMessage(
+        'Kill all persistent terminal sessions for this workspace? Any process still running in them will be terminated.',
+        { modal: true },
+        KILL_SESSIONS_CONFIRM_LABEL,
+    );
+    if (choice !== KILL_SESSIONS_CONFIRM_LABEL) {
+        return; // cancelled — leave every session untouched
+    }
+
+    const killed = await target.reaper.killWorkspaceSessions(target.hostKey, target.workspaceKey);
+    vscode.window.showInformationMessage(`Remote-SSH: Killed ${killed} persistent terminal session(s) for this workspace.`);
+}

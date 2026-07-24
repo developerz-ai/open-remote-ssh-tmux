@@ -2,6 +2,7 @@ import {
     buildKillSession,
     buildListSessions,
     parseListSessions,
+    sessionSlot,
     shouldReap,
     TmuxSession,
 } from './tmuxSession';
@@ -65,8 +66,11 @@ export interface SessionReaperDeps {
 export const DEFAULT_REAP_GRACE_SECONDS = 10;
 
 /**
- * Kills the empty, detached sessions this extension owns. One public operation,
- * `reap()`, run at connect and on manual refresh.
+ * Kills the sessions this extension owns. Two public operations:
+ *   * `reap()` — connect-time housekeeping: only empty, detached, past-grace sessions.
+ *   * `killWorkspaceSessions()` — the manual escape hatch: force-kill THIS workspace's
+ *     sessions regardless of state (the "Kill Persistent Terminal Sessions" command).
+ * Both share the same list -> filter -> kill spine and the same never-throw contract.
  */
 export class SessionReaper {
     private readonly exec: RemoteExec;
@@ -109,6 +113,39 @@ export class SessionReaper {
             this.log.info(`tmux reaper: reaped ${reaped} empty session(s)`);
         }
         return reaped;
+    }
+
+    /**
+     * Force-kill EVERY session of one (host, workspace) — the manual escape hatch
+     * behind the "Kill Persistent Terminal Sessions (this workspace)" command
+     * (docs/idea/tmux-approach.md). Unlike `reap()`, it ignores attached/live/grace
+     * state: the user explicitly asked to nuke this workspace's terminals, so a
+     * session with a live window or a client still attached is killed too. Scope is
+     * held tight by `sessionSlot` (02) — only names that decode to a slot of THIS
+     * (host, workspace) qualify, so a sibling workspace on the same host or a foreign
+     * session is never touched. Same fail-safe contract as `reap()`: a failed list
+     * yields 0, a failed kill is traced and skipped, and it never throws (a command
+     * must not surface an unhandled rejection). Returns the number killed.
+     */
+    async killWorkspaceSessions(hostKey: string, workspaceKey: string): Promise<number> {
+        const sessions = await this.listSessions();
+        if (sessions === undefined) {
+            return 0; // list probe failed — already traced; never throw from a command
+        }
+
+        const doomed = sessions.filter(session => sessionSlot(session.name, hostKey, workspaceKey) !== undefined);
+
+        let killed = 0;
+        for (const session of doomed) {
+            if (await this.kill(session.name)) {
+                killed++;
+            }
+        }
+
+        if (killed > 0) {
+            this.log.info(`tmux: killed ${killed} persistent session(s) for this workspace`);
+        }
+        return killed;
     }
 
     /** Snapshot the remote's sessions, or `undefined` if the probe itself failed

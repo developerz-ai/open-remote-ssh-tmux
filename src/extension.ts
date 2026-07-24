@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import Log from './common/logger';
 import { RemoteSSHResolver, REMOTE_SSH_AUTHORITY } from './authResolver';
-import { openSSHConfigFile, promptOpenRemoteSSHWindow } from './commands';
+import { KILL_WORKSPACE_SESSIONS_COMMAND_ID, killWorkspaceSessions, openSSHConfigFile, promptOpenRemoteSSHWindow, type WorkspaceKillTarget } from './commands';
 import { HostTreeDataProvider } from './hostTreeView';
 import { getRemoteWorkspaceLocationData, RemoteLocationHistory } from './remoteLocationHistory';
 import { TmuxTerminalProvider, type OpenTerminal } from './tmux/terminalProvider';
@@ -37,6 +37,7 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(vscode.commands.registerCommand('openremotessh.openEmptyWindowInCurrentWindow', () => promptOpenRemoteSSHWindow(true)));
     context.subscriptions.push(vscode.commands.registerCommand('openremotessh.openConfigFile', () => openSSHConfigFile()));
     context.subscriptions.push(vscode.commands.registerCommand('openremotessh.showLog', () => logger.show()));
+    context.subscriptions.push(vscode.commands.registerCommand(KILL_WORKSPACE_SESSIONS_COMMAND_ID, () => killWorkspaceSessions(() => resolveKillTarget(remoteSSHResolver, logger))));
 }
 
 /**
@@ -70,20 +71,15 @@ function wireTmuxTerminalLayer(
             return;
         }
 
-        // Extract session context from the current workspace and resolved authority.
-        // hostKey: the remote hostname (e.g., "example.com")
-        // workspaceKey: the remote workspace path
-        const workspaceFolders = vscode.workspace.workspaceFolders;
-        const workspaceKey = workspaceFolders?.[0]?.uri.path || '/home/user';
-        const cwd = workspaceKey;
-
-        // Extract hostname from the remote authority (e.g., "ssh-remote+example.com" → "example.com").
-        const authority = vscode.env.remoteName; // e.g., "example.com" (without the "ssh-remote+" prefix)
-        if (!authority) {
-            // Not on a remote; shouldn't happen since this is called from resolve callback.
+        // Session identity (host + workspace) — shared with the kill command via
+        // currentTmuxSessionContext() so both name this workspace's sessions identically.
+        const sessionContext = currentTmuxSessionContext();
+        if (!sessionContext) {
+            // Not on a remote; shouldn't happen since this is called from the resolve callback.
             return;
         }
-        const hostKey = authority;
+        const { hostKey, workspaceKey } = sessionContext;
+        const cwd = workspaceKey;
 
         // Construct the terminal provider with injected dependencies.
         // exec is deferred — it's fetched from the SSH connection when needed.
@@ -148,6 +144,42 @@ function wireTmuxTerminalLayer(
         // Wiring failure must never break the connection; log and continue.
         logger.trace(`Tmux wiring failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+}
+
+/**
+ * The (host, workspace) identity tmux session names are keyed to, derived from the
+ * resolved remote authority (`vscode.env.remoteName`) and the open workspace folder.
+ * `undefined` when not on a remote. Shared by the terminal-layer wiring and the kill
+ * command so both name this workspace's sessions identically.
+ */
+function currentTmuxSessionContext(): { hostKey: string; workspaceKey: string } | undefined {
+    const authority = vscode.env.remoteName; // e.g. "example.com" (without the "ssh-remote+" prefix)
+    if (!authority) {
+        return undefined;
+    }
+    const workspaceKey = vscode.workspace.workspaceFolders?.[0]?.uri.path || '/home/user';
+    return { hostKey: authority, workspaceKey };
+}
+
+/**
+ * Build the kill command's target from live resolver state: the current SSH
+ * connection's `exec` wrapped in a fresh {@link SessionReaper}, plus the
+ * (host, workspace) identity. Returns `undefined` when there is no connection or we
+ * are not on a remote, so the command no-ops safely instead of throwing. Wiring
+ * only — the reaper owns all tmux/session logic.
+ */
+function resolveKillTarget(resolver: RemoteSSHResolver, logger: Log): WorkspaceKillTarget | undefined {
+    const sshConnection = resolver.getSSHConnection();
+    const context = currentTmuxSessionContext();
+    if (!sshConnection || !context) {
+        return undefined;
+    }
+    const reaper = new SessionReaper({
+        exec: async (command: string) => sshConnection.exec(command),
+        now: () => Math.floor(Date.now() / 1000),
+        log: logger,
+    });
+    return { reaper, hostKey: context.hostKey, workspaceKey: context.workspaceKey };
 }
 
 export function deactivate() {

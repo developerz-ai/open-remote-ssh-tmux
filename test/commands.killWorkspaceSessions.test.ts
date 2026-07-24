@@ -1,0 +1,53 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { KILL_SESSIONS_CONFIRM_LABEL, killWorkspaceSessions, type WorkspaceKillTarget } from '../src/commands';
+import { messageResponses, shownMessages } from './mocks/vscode';
+
+// The kill command is the manual zombie escape hatch (docs/idea/tmux-approach.md):
+// a modal confirm, then delegate the force-kill to the reaper. This handler is thin
+// — it owns no tmux/session logic — so these tests pin exactly the branching that is
+// its responsibility: confirm -> delegate, cancel -> nothing, no remote -> no-op.
+
+const HOST = 'example.com';
+const WS = '/home/user/proj';
+
+/** A target whose reaper records how it was invoked. */
+function fakeTarget() {
+    const kill = vi.fn(async () => 3);
+    const target: WorkspaceKillTarget = { reaper: { killWorkspaceSessions: kill }, hostKey: HOST, workspaceKey: WS };
+    return { target, kill };
+}
+
+beforeEach(() => {
+    messageResponses.warning = undefined;
+    shownMessages.warning.length = 0;
+    shownMessages.information.length = 0;
+});
+
+describe('killWorkspaceSessions command handler', () => {
+    it('force-kills this workspace, keyed to (host, workspace), after the user confirms', async () => {
+        const { target, kill } = fakeTarget();
+        messageResponses.warning = KILL_SESSIONS_CONFIRM_LABEL; // user clicks the confirm button
+
+        await killWorkspaceSessions(() => target);
+
+        expect(shownMessages.warning).toHaveLength(1); // a confirm dialog was shown
+        expect(kill).toHaveBeenCalledWith(HOST, WS);
+    });
+
+    it('does nothing when the user dismisses/cancels the confirm', async () => {
+        const { target, kill } = fakeTarget();
+        messageResponses.warning = undefined; // dialog dismissed
+
+        await killWorkspaceSessions(() => target);
+
+        expect(shownMessages.warning).toHaveLength(1);
+        expect(kill).not.toHaveBeenCalled();
+    });
+
+    it('no-ops without a confirm dialog when not connected to a remote', async () => {
+        await killWorkspaceSessions(() => undefined);
+
+        expect(shownMessages.warning).toHaveLength(0);
+        expect(shownMessages.information).toHaveLength(1); // told the user why nothing happened
+    });
+});

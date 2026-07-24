@@ -64,9 +64,28 @@ class MockOutputChannel {
     }
 }
 
+/**
+ * Seedable return value for `window.showWarningMessage` — a test sets this to the
+ * button label it wants the simulated user to click (or leaves it `undefined` to
+ * model dismiss/cancel). Mirrors the real API returning the chosen item.
+ */
+export const messageResponses: { warning: unknown } = { warning: undefined };
+
+/** Messages surfaced via the `window.show*Message` APIs, recorded (message + items)
+ * per call so a test can assert what — and whether — a dialog was shown. */
+export const shownMessages: { warning: unknown[][]; information: unknown[][] } = { warning: [], information: [] };
+
 export const window = {
     createOutputChannel(channelName: string): MockOutputChannel {
         return new MockOutputChannel(channelName);
+    },
+    showWarningMessage(message: string, ...items: unknown[]): Promise<unknown> {
+        shownMessages.warning.push([message, ...items]);
+        return Promise.resolve(messageResponses.warning);
+    },
+    showInformationMessage(message: string, ...items: unknown[]): Promise<unknown> {
+        shownMessages.information.push([message, ...items]);
+        return Promise.resolve(undefined);
     },
 };
 
