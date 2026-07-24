@@ -7,6 +7,7 @@ import * as stream from 'stream';
 import { Client, ClientChannel, ClientErrorExtensions, ExecOptions, ShellOptions, ConnectConfig } from 'ssh2';
 import { Server } from 'net';
 import { SocksConnectionInfo, createServer as createSocksServer } from 'simple-socks';
+import { escapeShellArg } from '../common/shellQuote';
 
 export interface SSHConnectConfig extends ConnectConfig {
     /** Optional Unique ID attached to ssh connection. */
@@ -56,6 +57,20 @@ const SSHConstants = {
     }
 };
 
+/**
+ * Renders `params` as a trailing ` word word ...` string, each word wrapped by
+ * `escapeShellArg`. `exec`/`execPartial` hand the resulting `cmd` string to
+ * ssh2's `exec()`, which runs it through the remote's shell — an unescaped
+ * param containing `;`, `$( )`, backticks, or a space would be additional
+ * shell syntax, not literal argument text (e.g. a hostile task/exec argument
+ * could run a second command). Quoting each param individually keeps it a
+ * single remote token regardless of content. Returns `''` (no-op) when there
+ * are no params.
+ */
+function joinShellQuoted(params?: Array<string>): string {
+    return Array.isArray(params) ? ' ' + params.map(escapeShellArg).join(' ') : '';
+}
+
 export default class SSHConnection extends EventEmitter {
     public config: SSHConnectConfig;
 
@@ -94,7 +109,7 @@ export default class SSHConnection extends EventEmitter {
      * Exec a command
      */
     exec(cmd: string, params?: Array<string>, options: ExecOptions = {}): Promise<{ stdout: string; stderr: string }> {
-        cmd += (Array.isArray(params) ? (' ' + params.join(' ')) : '');
+        cmd += joinShellQuoted(params);
         return this.connect().then(() => {
             return new Promise((resolve, reject) => {
                 this.sshConnection!.exec(cmd, options, (err, stream) => {
@@ -119,7 +134,7 @@ export default class SSHConnection extends EventEmitter {
      * Exec a command
      */
     execPartial(cmd: string, tester: (stdout: string, stderr: string) => boolean, params?: Array<string>, options: ExecOptions = {}): Promise<{ stdout: string; stderr: string }> {
-        cmd += (Array.isArray(params) ? (' ' + params.join(' ')) : '');
+        cmd += joinShellQuoted(params);
         return this.connect().then(() => {
             return new Promise((resolve, reject) => {
                 this.sshConnection!.exec(cmd, options, (err, stream) => {

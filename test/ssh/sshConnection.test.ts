@@ -25,8 +25,17 @@ const { fakeClients, Client } = vi.hoisted(() => {
         }
     }
 
+    // A fake `exec()` channel: just enough of ssh2's `ClientChannel` for
+    // `SSHConnection.exec`/`execPartial` to attach `'close'`/`'data'` handlers
+    // (on the stream and its `.stderr`) and for a test to drive them.
+    class FakeExecStream extends MiniEmitter {
+        stderr = new MiniEmitter();
+    }
+
     class FakeClient extends MiniEmitter {
         connectCalls = 0;
+        execCalls: string[] = [];
+        execStreams: FakeExecStream[] = [];
 
         connect(): this {
             this.connectCalls++;
@@ -36,6 +45,16 @@ const { fakeClients, Client } = vi.hoisted(() => {
         end(): void {
             // Real ssh2 tears the socket down and later emits 'close' itself;
             // tests drive 'error'/'close' explicitly to control timing.
+        }
+
+        exec(cmd: string, optionsOrCallback: unknown, maybeCallback?: unknown): this {
+            const callback = (typeof optionsOrCallback === 'function' ? optionsOrCallback : maybeCallback) as
+                (err: Error | undefined, stream: FakeExecStream) => void;
+            this.execCalls.push(cmd);
+            const stream = new FakeExecStream();
+            this.execStreams.push(stream);
+            callback(undefined, stream);
+            return this;
         }
     }
 
@@ -130,5 +149,57 @@ describe('close(): resets connect state so a later connect() reconnects for real
 
         fakeClients[1].emit('ready');
         await expect(second).resolves.toBe(conn);
+    });
+});
+
+// `exec`/`execPartial` joined `params` into the command line with a bare
+// space (`cmd += ' ' + params.join(' ')`) — a param containing `;`, `$( )`,
+// backticks, or a space was not a single argument on the remote, it was
+// additional shell syntax. E.g. `exec('echo', ['a; rm -rf /'])` ran `rm -rf /`
+// as a second command instead of printing the literal string. Every param
+// must be quoted (`escapeShellArg`, shared with `src/tmux/tmuxSession.ts` via
+// `src/common/shellQuote.ts`) so it lands as exactly one remote token.
+describe('exec()/execPartial(): shell-quote params so each lands as one remote token', () => {
+    async function connectedFakeClient() {
+        const conn = new SSHConnection({ host: 'h', username: 'u' });
+        const connectPromise = conn.connect();
+        fakeClients[0].emit('ready');
+        await connectPromise;
+        return { conn, client: fakeClients[0] };
+    }
+
+    it('quotes each exec() param individually', async () => {
+        const { conn, client } = await connectedFakeClient();
+
+        const result = conn.exec('echo', ['a; rm -rf /', '$(id)', '`id`', 'a b', 'a\'b']);
+        await vi.waitFor(() => expect(client.execStreams).toHaveLength(1));
+        client.execStreams[0].emit('close');
+        await result;
+
+        expect(client.execCalls).toEqual([
+            `echo 'a; rm -rf /' '$(id)' '\`id\`' 'a b' 'a'\\''b'`
+        ]);
+    });
+
+    it('quotes each execPartial() param individually', async () => {
+        const { conn, client } = await connectedFakeClient();
+
+        const result = conn.execPartial('echo', () => true, ['a; rm -rf /', '$(id)']);
+        await vi.waitFor(() => expect(client.execStreams).toHaveLength(1));
+        client.execStreams[0].emit('close');
+        await result;
+
+        expect(client.execCalls).toEqual([`echo 'a; rm -rf /' '$(id)'`]);
+    });
+
+    it('leaves a command with no params untouched', async () => {
+        const { conn, client } = await connectedFakeClient();
+
+        const result = conn.exec('uname -s');
+        await vi.waitFor(() => expect(client.execStreams).toHaveLength(1));
+        client.execStreams[0].emit('close');
+        await result;
+
+        expect(client.execCalls).toEqual(['uname -s']);
     });
 });
