@@ -1,4 +1,11 @@
 import { createHash } from 'crypto';
+import { escapeShellArg } from '../common/shellQuote';
+
+// Re-exported for existing callers/tests that import `escapeShellArg` from
+// this module — the implementation now lives in `common/shellQuote.ts` so
+// `src/ssh/sshConnection.ts` (a lower layer this module must not be imported
+// by) can share it without a tmux→ssh dependency inversion.
+export { escapeShellArg };
 
 // The session model — pure logic, the heart of the "no zombies" guarantee and
 // the ONLY place tmux command lines are built. No `vscode`/`ssh2`/`ssh` imports
@@ -93,15 +100,6 @@ export function sessionSlot(name: string, hostKey: string, workspaceKey: string)
     }
     const suffix = name.slice(prefix.length);
     return /^\d+$/.test(suffix) ? parseInt(suffix, 10) : undefined;
-}
-
-/**
- * POSIX single-quote escaping: wrap in `'…'` and rewrite every embedded `'` as
- * `'\''` (close-quote, escaped-quote, reopen-quote). The result is a single
- * shell word with `$`, backticks, `;`, spaces, and newlines all inert.
- */
-export function escapeShellArg(value: string): string {
-    return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 /** True iff the name matches the `code-<hash>-<slot>` namespace this extension owns. */

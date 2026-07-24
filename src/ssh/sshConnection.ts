@@ -7,11 +7,12 @@ import * as stream from 'stream';
 import { Client, ClientChannel, ClientErrorExtensions, ExecOptions, ShellOptions, ConnectConfig } from 'ssh2';
 import { Server } from 'net';
 import { SocksConnectionInfo, createServer as createSocksServer } from 'simple-socks';
+import { escapeShellArg } from '../common/shellQuote';
 
 export interface SSHConnectConfig extends ConnectConfig {
     /** Optional Unique ID attached to ssh connection. */
     uniqueId?: string;
-    /** Automatic retry to connect, after disconnect. Default true */
+    /** Automatic retry to connect, after disconnect. Default false */
     reconnect?: boolean;
     /** Number of reconnect retry, after disconnect. Default 10 */
     reconnectTries?: number;
@@ -56,6 +57,20 @@ const SSHConstants = {
     }
 };
 
+/**
+ * Renders `params` as a trailing ` word word ...` string, each word wrapped by
+ * `escapeShellArg`. `exec`/`execPartial` hand the resulting `cmd` string to
+ * ssh2's `exec()`, which runs it through the remote's shell — an unescaped
+ * param containing `;`, `$( )`, backticks, or a space would be additional
+ * shell syntax, not literal argument text (e.g. a hostile task/exec argument
+ * could run a second command). Quoting each param individually keeps it a
+ * single remote token regardless of content. Returns `''` (no-op) when there
+ * are no params.
+ */
+function joinShellQuoted(params?: Array<string>): string {
+    return Array.isArray(params) ? ' ' + params.map(escapeShellArg).join(' ') : '';
+}
+
 export default class SSHConnection extends EventEmitter {
     public config: SSHConnectConfig;
 
@@ -94,7 +109,7 @@ export default class SSHConnection extends EventEmitter {
      * Exec a command
      */
     exec(cmd: string, params?: Array<string>, options: ExecOptions = {}): Promise<{ stdout: string; stderr: string }> {
-        cmd += (Array.isArray(params) ? (' ' + params.join(' ')) : '');
+        cmd += joinShellQuoted(params);
         return this.connect().then(() => {
             return new Promise((resolve, reject) => {
                 this.sshConnection!.exec(cmd, options, (err, stream) => {
@@ -119,7 +134,7 @@ export default class SSHConnection extends EventEmitter {
      * Exec a command
      */
     execPartial(cmd: string, tester: (stdout: string, stderr: string) => boolean, params?: Array<string>, options: ExecOptions = {}): Promise<{ stdout: string; stderr: string }> {
-        cmd += (Array.isArray(params) ? (' ' + params.join(' ')) : '');
+        cmd += joinShellQuoted(params);
         return this.connect().then(() => {
             return new Promise((resolve, reject) => {
                 this.sshConnection!.exec(cmd, options, (err, stream) => {
@@ -188,6 +203,11 @@ export default class SSHConnection extends EventEmitter {
         return this.closeTunnel().then(() => {
             if (this.sshConnection) {
                 this.sshConnection.end();
+                // Without this, `__$connectPromise` still holds the settled (now
+                // stale/ended) promise and a later connect() would return it
+                // straight from cache instead of actually reconnecting.
+                this.sshConnection = null;
+                this.__$connectPromise = null;
                 this.emit(SSHConstants.CHANNEL.SSH, SSHConstants.STATUS.DISCONNECT);
             }
         });
@@ -198,11 +218,17 @@ export default class SSHConnection extends EventEmitter {
      */
     connect(c?: SSHConnectConfig): Promise<SSHConnection> {
         this.config = Object.assign(this.config, c);
-        ++this.__retries;
 
         if (this.__$connectPromise) {
             return this.__$connectPromise;
         }
+
+        // Only count real connection attempts. Every call that hits the cache
+        // above (shell()/exec()/tunnel handlers all call connect() whenever they
+        // need the connection) must not inflate `__retries` — the 'close'
+        // handler's `__retries <= reconnectTries` gate below would otherwise be
+        // exhausted before a single real (re)connect attempt failed.
+        ++this.__retries;
 
         this.__$connectPromise = new Promise((resolve, reject) => {
             this.emit(SSHConstants.CHANNEL.SSH, SSHConstants.STATUS.BEFORECONNECT);
@@ -221,12 +247,11 @@ export default class SSHConnection extends EventEmitter {
 
             //Start ssh server connection
             this.sshConnection = new Client();
-            this.sshConnection.on('ready', (err: Error & ClientErrorExtensions) => {
-                if (err) {
-                    this.emit(SSHConstants.CHANNEL.SSH, SSHConstants.STATUS.DISCONNECT, { err: err });
-                    this.__$connectPromise = null;
-                    return reject(err);
-                }
+            // ssh2's `Client` never passes an error to 'ready' — a connection
+            // failure only ever surfaces via 'error'/'close' below. The `err`
+            // parameter/branch here was dead code (this class's ssh2-promise
+            // origin predates the current ssh2 API).
+            this.sshConnection.on('ready', () => {
                 this.emit(SSHConstants.CHANNEL.SSH, SSHConstants.STATUS.CONNECT);
                 this.__retries = 0;
                 this.__err = null;
@@ -284,6 +309,14 @@ export default class SSHConnection extends EventEmitter {
                                         }
                                         return callback(null, stream);
                                     });
+                            }).catch((err) => {
+                                // connect() failed before we could hand off to forwardOut. The
+                                // socks library owns the client socket here (we never got a
+                                // handle on it), so routing the failure through its callback is
+                                // what tears the pending SOCKS handshake down instead of leaving
+                                // it hanging — and, without this, an unhandled rejection.
+                                this.emit(SSHConstants.CHANNEL.TUNNEL, SSHConstants.STATUS.DISCONNECT, { SSHTunnelConfig: SSHTunnelConfig, err: err });
+                                callback(err);
                             });
                         }
                     }).on('proxyError', (err: unknown) => {
@@ -299,6 +332,12 @@ export default class SSHConnection extends EventEmitter {
                                             this.emit(SSHConstants.CHANNEL.TUNNEL, SSHConstants.STATUS.DISCONNECT, { SSHTunnelConfig: SSHTunnelConfig, err: err });
                                             return;
                                         }
+                                        // An unhandled 'error' on either end of the pipe (e.g. ECONNRESET when the
+                                        // local client drops the socket) would otherwise be an uncaught exception
+                                        // that kills the extension host. Destroy the counterpart so the pipe tears
+                                        // down cleanly instead.
+                                        stream.on('error', () => socket.destroy());
+                                        socket.on('error', () => stream.destroy());
                                         stream.pipe(socket);
                                         socket.pipe(stream);
                                     });
@@ -308,10 +347,19 @@ export default class SSHConnection extends EventEmitter {
                                             this.emit(SSHConstants.CHANNEL.TUNNEL, SSHConstants.STATUS.DISCONNECT, { SSHTunnelConfig: SSHTunnelConfig, err: err });
                                             return;
                                         }
+                                        // Same rationale as the port-forward branch above.
+                                        stream.on('error', () => socket.destroy());
+                                        socket.on('error', () => stream.destroy());
                                         stream.pipe(socket);
                                         socket.pipe(stream);
                                     });
                                 }
+                            }).catch((err) => {
+                                // connect() failed before we forwarded this already-accepted
+                                // socket anywhere — nothing else owns it, so it would otherwise
+                                // leak open (and this would be an unhandled rejection). Destroy it.
+                                this.emit(SSHConstants.CHANNEL.TUNNEL, SSHConstants.STATUS.DISCONNECT, { SSHTunnelConfig: SSHTunnelConfig, err: err });
+                                socket.destroy();
                             });
                         });
                 }

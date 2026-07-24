@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { expandTokens, resolveHopPort, buildKeyboardInteractiveFinish } from '../src/authResolver';
+import { expandTokens, resolveHopPort, buildKeyboardInteractiveFinish, connectionsToClose } from '../src/authResolver';
+import type SSHConnection from '../src/ssh/sshConnection';
 
 // `expandTokens` replaces OpenSSH-style `%x` config tokens (HostName, ProxyCommand
 // args). The code it replaces used single-shot `String.replace(token, value)` calls
@@ -90,5 +91,43 @@ describe('buildKeyboardInteractiveFinish', () => {
             finishWith: ['a'],
             retriesExhausted: true,
         });
+    });
+});
+
+// `dispose()` closed only `proxyConnections[0]` when a ProxyJump chain was in
+// play, relying on ending that first hop to cascade — via the forwarded-stream
+// chain each later hop's `sock` was opened on — down through every subsequent
+// hop and the destination connection sitting on top of it. That's an implicit
+// side effect of the transport, not something `dispose()` should depend on: a
+// hop past the first, or the destination connection itself, could be left
+// unclosed. `connectionsToClose` is the pure list of everything `dispose()`
+// must close explicitly. See `src/authResolver.ts` `dispose()`.
+describe('connectionsToClose: dispose() must close the destination connection and every proxy hop', () => {
+    it('closes just the destination connection when there is no ProxyJump chain', () => {
+        const main = {} as SSHConnection;
+        expect(connectionsToClose(main, [])).toEqual([main]);
+    });
+
+    it('closes the destination connection plus the single hop (not only the hop)', () => {
+        const main = {} as SSHConnection;
+        const hop0 = {} as SSHConnection;
+        expect(connectionsToClose(main, [hop0])).toEqual([main, hop0]);
+    });
+
+    it('closes the destination connection plus every hop in a multi-hop chain', () => {
+        const main = {} as SSHConnection;
+        const hop0 = {} as SSHConnection;
+        const hop1 = {} as SSHConnection;
+        const hop2 = {} as SSHConnection;
+        expect(connectionsToClose(main, [hop0, hop1, hop2])).toEqual([main, hop0, hop1, hop2]);
+    });
+
+    it('omits the destination connection when resolve failed before it was created', () => {
+        const hop0 = {} as SSHConnection;
+        expect(connectionsToClose(undefined, [hop0])).toEqual([hop0]);
+    });
+
+    it('returns an empty list when nothing was ever connected', () => {
+        expect(connectionsToClose(undefined, [])).toEqual([]);
     });
 });
