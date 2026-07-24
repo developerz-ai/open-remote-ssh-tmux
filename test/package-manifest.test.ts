@@ -37,6 +37,21 @@ function collectTsFiles(dir: string): string[] {
     return files;
 }
 
+/** Recursively collect every `.md` file under `dir`. */
+function collectAllMarkdownFiles(dir: string): string[] {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    const files: string[] = [];
+    for (const entry of entries) {
+        const entryPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+            files.push(...collectAllMarkdownFiles(entryPath));
+        } else if (entry.isFile() && entry.name.endsWith('.md')) {
+            files.push(entryPath);
+        }
+    }
+    return files;
+}
+
 /**
  * Every `export const NAME = '<string literal>'` in `src/`, so a `registerCommand(NAME)`
  * call (an identifier, not an inline literal — e.g. the kill command, which shares its
@@ -106,6 +121,35 @@ describe('package.json manifest drift guard', () => {
             expect(reapOnConnect).toBeDefined();
             expect(reapOnConnect.type).toBe('boolean');
             expect(reapOnConnect.default).toBe(true);
+        });
+
+        it('every remote.SSH.tmux.* setting mentioned in docs/ exists in package.json', () => {
+            // Collect all `remote.SSH.tmux.*` setting names from docs/
+            const docsDir = path.resolve(repoRoot, 'docs');
+            const allMarkdownFiles = collectAllMarkdownFiles(docsDir);
+
+            const mentionedSettingsInDocs = new Set<string>();
+            const tmuxSettingRegex = /remote\.SSH\.tmux\.\w+/g;
+
+            for (const file of allMarkdownFiles) {
+                const contents = fs.readFileSync(file, 'utf8');
+                for (const match of contents.matchAll(tmuxSettingRegex)) {
+                    mentionedSettingsInDocs.add(match[0]);
+                }
+            }
+
+            // Verify each setting is present in package.json
+            const missingSettings: string[] = [];
+            for (const setting of mentionedSettingsInDocs) {
+                if (!properties[setting]) {
+                    missingSettings.push(setting);
+                }
+            }
+
+            expect(
+                missingSettings,
+                `These remote.SSH.tmux.* settings are mentioned in docs/ but missing from package.json configuration: ${missingSettings.join(', ')}`
+            ).toEqual([]);
         });
     });
 

@@ -29,8 +29,9 @@ If any step needs tribal knowledge, that's a DX bug — fix it in the repo.
 - **Unit TDD — no test, no merge.** Write the failing unit test *first*, then the
   code that passes it. Pure logic (session naming, attach-or-create, reap
   decisions, config parsing) is designed test-first; the test is the spec. The
-  agent's biggest edge is verifying its own work. Wiring up the runner is the
-  single largest current gap (see below).
+  agent's biggest edge is verifying its own work. The runner (vitest, `npm test`)
+  is wired up and this is how every tmux module in `src/tmux/*` got built — see
+  below for what's still outstanding.
 - **Type-safe, low undefined behaviour.** TS `strict`, no `any`; narrow `unknown`.
   Fail fast and loud — never swallow an error on the security-sensitive paths.
 - **Surgical diffs.** Every changed line traces to the task. Don't reformat
@@ -46,26 +47,30 @@ If any step needs tribal knowledge, that's a DX bug — fix it in the repo.
 | `CLAUDE.md` project brain | ✅ | keep ≤ 600 lines, current |
 | `docs/idea/` vision | ✅ | this set |
 | `/feature`, `/planx` commands | ✅ (`.claude/commands/`) | + `/verify` skill |
-| **Test suite** | ❌ none | **unit TDD** for pure modules (test-first) + integration for the tmux session lifecycle (naming, attach-or-create, reaping); **fast** (<10s unit) |
+| **Test suite** | ✅ vitest, `npm test` — 140+ tests over the pure modules | keep pace with new pure logic; add integration coverage once the session-manager tree view (see [`roadmap.md`](roadmap.md)) lands |
+| **tmux integration, test-first** | ✅ session naming, attach-or-create, reap decisions, bootstrap probe, multi-client provider — all unit-tested before/alongside implementation (`test/tmux/*`) | — |
 | **`bin/` DX scripts** | ❌ (npm scripts only) | `bin/setup`, `bin/dev`, `bin/check` one-liners |
 | **Hooks + permissions** | ❌ | broad allow + pre-commit lint/typecheck hook, so unlinted code physically can't land |
 | **CodeGraph index** | ❌ no `.codegraph/` | index `src/` for structural lookups |
 | **CI green gate** | partial | typecheck + lint + bundle + tests < 5 min |
 | **Marketplace publish** | manual (`vsce`) | scripted release of the `.vsix` |
+| **Empirical F5/EDH persistence proof** | ❌ not yet run in this environment (no VS Code desktop binary/display) | run the [`09-verify.md`](../plans/2026/07/24/101-v1-tmux-release/09-verify.md) matrix on a real Unix remote |
 
 ## Next steps to close the gaps
 
 In rough priority (each a `/planx` candidate):
 
-1. **Testing harness (TDD enabler)** — pick a fast unit runner, add unit tests for
-   the pure modules (`sshConfig`, `sshDestination`, `serverConfig`, `ports`,
-   `splitProxyCommand`), wire `bin/check`. Target: unit run < 10s so writing the
-   test first is frictionless. Unblocks unit TDD / "no test, no merge".
-2. **DX scripts + hooks + permissions** — `.claude/settings.json` with a
+1. **DX scripts + hooks + permissions** — `.claude/settings.json` with a
    pre-commit gate; `bin/setup|dev|check`.
-3. **CodeGraph index** — `codegraph init` so agents do structural lookups.
-4. **The tmux terminal integration** itself, built test-first — session naming,
-   attach-or-create, restore mapping, and reaping (see [`tmux-approach.md`](tmux-approach.md)).
+2. **CodeGraph index** — `codegraph init` so agents do structural lookups.
+3. **The empirical verification gate** — run
+   [`09-verify.md`](../plans/2026/07/24/101-v1-tmux-release/09-verify.md) on a
+   real Unix remote via the Extension Development Host: this is the one gap the
+   unit test suite structurally cannot close (it needs a live VS Code window and
+   a real SSH connection), and it's the actual acceptance bar for the
+   persistence-model north star.
+4. **Deferred features** — session-manager tree view, Claude Code first-class
+   attach, mosh-over-tmux — see [`roadmap.md`](roadmap.md) for why each waits.
 
 Reference the gold-standards docs when doing any of these — don't reinvent the
 conventions.
