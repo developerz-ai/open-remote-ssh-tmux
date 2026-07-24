@@ -112,10 +112,29 @@ function wireTmuxTerminalLayer(
                 logger.trace(`Failed to initialize tmux provider: ${err instanceof Error ? err.message : String(err)}`);
             });
 
-        // Register the terminal profile provider with VS Code.
-        // This makes the provider available for creating terminals on the remote.
+        // Register the terminal profile provider with VS Code. The id ("tmux") must
+        // match the contributed profile in package.json's contributes.terminal.profiles
+        // — registering without a matching contribution is a silent no-op (no entry in
+        // the profile picker, provider never invoked). See docs/idea/tmux-approach.md.
         const providerDisposable = vscode.window.registerTerminalProfileProvider('tmux', terminalProvider);
         context.subscriptions.push(providerDisposable);
+
+        // Free a terminal's slot when it actually closes — the counterpart to
+        // provideTerminalProfile()/reopen() allocating one. Without this a slot is
+        // never released within a live window: every "New Terminal" after a close
+        // mints a brand-new, ever-growing remote session instead of reattaching the
+        // one just detached (found live in the 09 acceptance matrix's churn row).
+        context.subscriptions.push(vscode.window.onDidOpenTerminal(t => terminalProvider.handleTerminalOpened(t)));
+        context.subscriptions.push(vscode.window.onDidCloseTerminal(t => terminalProvider.handleTerminalClosed(t)));
+
+        // Make it the default so a plain "New Terminal" already lands on tmux — the
+        // whole point of "invisible UX" (tmux-approach.md:33: "the default terminal on
+        // a resolved Unix host"). Contributed profiles have no manifest-level default
+        // flag (VS Code's terminal extension point only has id/title/icon), so this is
+        // the one settings write the terminal layer makes — scoped to this Workspace
+        // (never User/Global, never the remote's own ~/.tmux.conf) and only when unset,
+        // so a user who deliberately picked a different default is never overridden.
+        setDefaultTerminalProfileIfUnset(logger);
 
         // Construct the session reaper (housekeeping for empty/detached sessions).
         // Uses current time as the clock for age-based reap decisions.
@@ -144,6 +163,33 @@ function wireTmuxTerminalLayer(
         // Wiring failure must never break the connection; log and continue.
         logger.trace(`Tmux wiring failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+}
+
+/** Title of the contributed profile (`package.json` contributes.terminal.profiles) —
+ * the value `terminal.integrated.defaultProfile.linux` must reference to select it. */
+const TMUX_PROFILE_TITLE = 'Persistent Shell';
+
+/**
+ * Set `terminal.integrated.defaultProfile.linux` to the tmux-backed profile, scoped to
+ * this Workspace only, and only when nothing is set there yet — so "New Terminal"
+ * lands on tmux by default (tmux-approach.md's "default terminal on a resolved Unix
+ * host") without ever overriding a user's own deliberate choice, and without touching
+ * User/Global settings (those aren't remote-scoped and would leak into unrelated
+ * workspaces). Best-effort: a failure here must not break the (already-succeeded)
+ * connection, so it only logs.
+ */
+function setDefaultTerminalProfileIfUnset(logger: Log): void {
+    const terminalConfig = vscode.workspace.getConfiguration('terminal.integrated');
+    const inspected = terminalConfig.inspect<string>('defaultProfile.linux');
+    if (inspected?.workspaceValue !== undefined) {
+        return; // user (or a prior connect) already chose one — never override
+    }
+    terminalConfig
+        .update('defaultProfile.linux', TMUX_PROFILE_TITLE, vscode.ConfigurationTarget.Workspace)
+        .then(
+            undefined,
+            (err: unknown) => logger.trace(`Could not set default tmux terminal profile: ${err instanceof Error ? err.message : String(err)}`)
+        );
 }
 
 /**

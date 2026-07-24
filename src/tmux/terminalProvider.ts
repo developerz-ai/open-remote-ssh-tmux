@@ -15,8 +15,10 @@ import {
 // invariants hold:
 //
 //   * Invisible — profiles are plain `{shellPath:'tmux', shellArgs, cwd}`, the tab
-//     is titled after the workspace folder (never "tmux"); no tmux UI, no settings
-//     mutation (Route A, see docs/idea/tmux-approach.md).
+//     is titled after the workspace folder (never "tmux"); no tmux UI (Route A, see
+//     docs/idea/tmux-approach.md). The one settings write in the whole layer —
+//     `terminal.integrated.defaultProfile.linux`, Workspace-scoped, only when unset —
+//     lives in `extension.ts`'s `setDefaultTerminalProfileIfUnset`, not here.
 //   * No zombies / no stealing — a *new* terminal takes the lowest slot not open
 //     in this window and not currently attached by another client on the remote,
 //     so a second client (laptop while the PC is attached) lands on a fresh slot
@@ -190,6 +192,54 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
     releaseSlot(slot: number): void {
         this.openSlots.delete(slot);
         this.log.trace(`tmux terminal: slot ${slot} released (detached, session kept)`);
+    }
+
+    /** Live `vscode.Terminal` -> slot, so a later close can find and release the
+     * right slot. VS Code gives the provider no handle to the `Terminal` it
+     * eventually constructs from a returned `TerminalProfile` (nor from `reopen`'s
+     * `openTerminal` call, which returns `void`) — this is populated instead from
+     * `vscode.window.onDidOpenTerminal`, which fires for every terminal with the
+     * `creationOptions` this provider gave it. */
+    private readonly terminalSlots = new Map<vscode.Terminal, number>();
+
+    /**
+     * Wire from `vscode.window.onDidOpenTerminal`. Records the slot (parsed back
+     * out of the session name this provider baked into `shellArgs`) so the
+     * matching `handleTerminalClosed` can free it. No-op for terminals that
+     * aren't ours (no `shellArgs`, or a session name outside this workspace).
+     */
+    handleTerminalOpened(terminal: vscode.Terminal): void {
+        const slot = this.slotFromCreationOptions(terminal.creationOptions);
+        if (slot !== undefined) {
+            this.terminalSlots.set(terminal, slot);
+        }
+    }
+
+    /**
+     * Wire from `vscode.window.onDidCloseTerminal` — the fix for the real gap
+     * `releaseSlot` alone left open: nothing was ever calling it. Without this,
+     * closing and reopening a terminal in the same window session never freed a
+     * slot, so every "New Terminal" after a close minted a brand-new, ever-growing
+     * remote session instead of reattaching the one just detached.
+     */
+    handleTerminalClosed(terminal: vscode.Terminal): void {
+        const slot = this.terminalSlots.get(terminal);
+        if (slot !== undefined) {
+            this.terminalSlots.delete(terminal);
+            this.releaseSlot(slot);
+        }
+    }
+
+    /** The slot encoded in `options.shellArgs`' `-s <name>` (our `buildAttachOrCreateArgv`
+     * shape), resolved via `sessionSlot` so it also filters out anything that isn't
+     * one of this workspace's own sessions. `undefined` for anything else. */
+    private slotFromCreationOptions(options: vscode.Terminal['creationOptions']): number | undefined {
+        if (!options || !('shellArgs' in options) || !Array.isArray(options.shellArgs)) {
+            return undefined;
+        }
+        const flagIndex = options.shellArgs.indexOf('-s');
+        const name = flagIndex >= 0 ? options.shellArgs[flagIndex + 1] : undefined;
+        return typeof name === 'string' ? sessionSlot(name, this.ctx.hostKey, this.ctx.workspaceKey) : undefined;
     }
 
     /** Slots this client currently maps — observability for wiring and tests. */
