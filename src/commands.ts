@@ -7,15 +7,39 @@ import SSHDestination from './ssh/sshDestination';
 
 export async function promptOpenRemoteSSHWindow(reuseWindow: boolean) {
     const host = await vscode.window.showInputBox({
-        title: 'Enter [user@]hostname[:port]'
+        title: 'Enter [user@]hostname[:port]',
+        validateInput: validateSSHDestinationInput
     });
 
     if (!host) {
         return;
     }
 
-    const sshDest = new SSHDestination(host);
+    // Parse at the input boundary — `SSHDestination.parse` is the one place that
+    // understands `user@`, `:port`, and bracketed IPv6 (`[::1]:2222`). Passing the
+    // raw typed string straight to the constructor would stuff the whole thing
+    // into `hostname` unparsed.
+    const sshDest = SSHDestination.parse(host);
+    if (!sshDest.hostname) {
+        // `validateInput` should already have blocked this via the UI, but the
+        // input box only enforces it interactively — guard again so a malformed
+        // destination can never open a window with an empty authority.
+        vscode.window.showErrorMessage(`Remote-SSH: "${host}" is not a valid [user@]hostname[:port] destination.`);
+        return;
+    }
+
     openRemoteSSHWindow(sshDest.toEncodedString(), reuseWindow);
+}
+
+/** `validateInput` for the "Enter [user@]hostname[:port]" box — parses the current
+ * value the same way the command itself will and rejects anything that doesn't
+ * resolve to a usable hostname, so the user gets inline feedback instead of a
+ * window opened against an empty authority. */
+function validateSSHDestinationInput(value: string): string | undefined {
+    if (!value || !SSHDestination.parse(value).hostname) {
+        return 'Enter a valid [user@]hostname[:port] destination.';
+    }
+    return undefined;
 }
 
 export function openRemoteSSHWindow(host: string, reuseWindow: boolean) {
@@ -124,6 +148,14 @@ export async function killWorkspaceSessions(resolveTarget: () => WorkspaceKillTa
         return; // cancelled — leave every session untouched
     }
 
-    const killed = await target.reaper.killWorkspaceSessions(target.hostKey, target.workspaceKey);
-    vscode.window.showInformationMessage(`Remote-SSH: Killed ${killed} persistent terminal session(s) for this workspace.`);
+    // `WorkspaceSessionKiller` is a structural interface (ISP) — the concrete
+    // `SessionReaper` never rejects, but nothing here guarantees every current or
+    // future implementation upholds that. Guard the call so a rejection surfaces
+    // as one plain-language message instead of an unhandled promise rejection.
+    try {
+        const killed = await target.reaper.killWorkspaceSessions(target.hostKey, target.workspaceKey);
+        vscode.window.showInformationMessage(`Remote-SSH: Killed ${killed} persistent terminal session(s) for this workspace.`);
+    } catch {
+        vscode.window.showErrorMessage('Remote-SSH: Failed to kill persistent terminal sessions for this workspace.');
+    }
 }

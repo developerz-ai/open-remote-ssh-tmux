@@ -33,8 +33,8 @@ export default class Log {
     private now(): string {
         const now = new Date();
         return padLeft(now.getUTCHours() + '', 2, '0')
-            + ':' + padLeft(now.getMinutes() + '', 2, '0')
-            + ':' + padLeft(now.getUTCSeconds() + '', 2, '0') + '.' + now.getMilliseconds();
+            + ':' + padLeft(now.getUTCMinutes() + '', 2, '0')
+            + ':' + padLeft(now.getUTCSeconds() + '', 2, '0') + '.' + padLeft(now.getUTCMilliseconds() + '', 3, '0');
     }
 
     public show() {
