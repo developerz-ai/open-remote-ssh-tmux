@@ -2,7 +2,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { decideDefaultProfile, decideTmuxWiring, deriveTmuxSessionContext, idempotentResolveHandler, lazyExec, readTmuxSettings, reconcileDefaultTerminalProfile, TMUX_PROFILE_TITLE } from '../src/extension';
 import type { RemoteSSHResolver } from '../src/authResolver';
 import type Log from '../src/common/logger';
-import { ConfigurationTarget, configOverrides, inspectOverrides, updateCalls } from './mocks/vscode';
+import { ConfigurationTarget, configOverrides, inspectOverrides, TerminalProfile, updateCalls } from './mocks/vscode';
+import { FallbackTerminalProvider } from '../src/tmux/fallbackTerminalProvider';
 
 /** A no-op Log — the default-profile reconcile only calls `trace` on the (untaken) error path. */
 const noopLog = { trace: (): void => { /* no-op */ } } as unknown as Log;
@@ -275,15 +276,25 @@ describe('reconcileDefaultTerminalProfile: applies the decision to Workspace sco
     });
 });
 
-describe('fallback terminal profile provider', () => {
-    // When tmux is unavailable or disabled, the "Persistent Shell" profile should still be
-    // available (via a fallback plain-shell provider) so the user sees the profile in the
-    // terminal picker even if tmux is not working. This prevents "Profile not found" errors
-    // and provides a graceful degradation when the setting is 'off' or the remote lacks tmux.
-    it('is registered when tmux is unavailable', () => {
-        // Fallback provider test — placeholder for future implementation.
-        // When this module registers a registerTerminalProfileProvider for the fallback,
-        // it will provide a basic shell profile for "tmux" id when tmux is not available.
-        expect(true).toBe(true);
+// When tmux is unavailable or disabled, the "Persistent Shell" profile should still be
+// available (via a fallback plain-shell provider) so the user sees the profile in the
+// terminal picker even if tmux is not working. This prevents "Profile not found" errors
+// and provides graceful degradation when the setting is 'off' or the remote lacks tmux.
+// extension.ts registers this provider unconditionally (before the tmux-gated wiring),
+// and the real TmuxTerminalProvider overrides it for the same 'tmux' id once wired — see
+// the `registerTerminalProfileProvider('tmux', ...)` calls in wireTmuxTerminalLayer/activate.
+describe('FallbackTerminalProvider: graceful degradation when tmux is not wired', () => {
+    it('provides a plain vscode.TerminalProfile (no tmux shell/args) synchronously', () => {
+        const provider = new FallbackTerminalProvider();
+        const profile = provider.provideTerminalProfile();
+
+        expect(profile).toBeInstanceOf(TerminalProfile);
+        // No special shellPath/shellArgs/cwd — VS Code falls back to its own default shell.
+        expect((profile as InstanceType<typeof TerminalProfile>).options).toEqual({});
+    });
+
+    it('returns a fresh profile instance on every call (no shared/stale state)', () => {
+        const provider = new FallbackTerminalProvider();
+        expect(provider.provideTerminalProfile()).not.toBe(provider.provideTerminalProfile());
     });
 });
