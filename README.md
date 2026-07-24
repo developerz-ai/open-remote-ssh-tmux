@@ -30,6 +30,20 @@ same connect flow as open-remote-ssh. See
 [`docs/idea/persistence-model.md`](docs/idea/persistence-model.md) for the
 honest technical picture (below).
 
+## Install
+
+Releases ship as a `.vsix` on the
+[Releases page](https://github.com/developerz-ai/open-remote-ssh-tmux/releases)
+(not yet on Open VSX or the VS Code Marketplace).
+
+1. Download `open-remote-ssh-tmux-<version>.vsix` from the latest release.
+2. Optionally verify it against the published `.sha256`:
+   `sha256sum -c open-remote-ssh-tmux-<version>.vsix.sha256`
+3. In VS Code / VSCodium: Command Palette → `Extensions: Install from VSIX…`
+   → pick the downloaded file.
+4. VSCodium < 1.75 and VSCode-OSS also need the extension enabled in
+   `argv.json` — see [Activation](#activation) below.
+
 ## Requirements
 
 - **Remote host:** tmux **≥ 2.6** for tmux-backed persistent terminals on
@@ -63,6 +77,31 @@ was deliberately left out — see
 [`docs/idea/decision-mosh-vs-tmux.md`](docs/idea/decision-mosh-vs-tmux.md).
 The full breakdown of what survives today vs. what tmux fixes is in
 [`docs/idea/persistence-model.md`](docs/idea/persistence-model.md).
+
+### Known limitations in v1.0.0
+
+v1.0.0 was validated against a real rig — two isolated VSCodium clients driving
+two Docker remotes over real SSH, with every remote-side assertion read back
+over an independent connection. 19 of 21 acceptance rows pass, including every
+row covering the two hard invariants (invisible UX, no zombies) and the full
+multi-client hand-off model. Full results:
+[`results-2026-07-24.md`](docs/plans/2026/07/24/101-v1-tmux-release/results-2026-07-24.md).
+
+Two rows are **not** fully closed, and are listed here rather than glossed over:
+
+- **Windows remotes are untested end-to-end.** The platform gate is confirmed
+  to engage (a Windows remote takes the PowerShell install path and skips the
+  tmux probe entirely, so it should behave exactly like upstream
+  open-remote-ssh), but no real Windows SSH target was available to observe a
+  full connect + terminal parity.
+- **Long-lived TUI redraw after reattach was not visually confirmed.** That a
+  backgrounded process and its scrollback survive a full close/reopen *is*
+  verified, as is session adoption across machines — but the specific "a
+  redrawing full-screen TUI repaints correctly on reattach" observation is
+  still outstanding.
+
+Reports on either are welcome in
+[Issues](https://github.com/developerz-ai/open-remote-ssh-tmux/issues).
 
 ## SSH Host Requirements
 
