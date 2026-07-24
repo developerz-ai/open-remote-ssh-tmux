@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { SLOT_MAPPING_STATE_KEY, TmuxTerminalProvider } from '../../src/tmux/terminalProvider';
+import { SLOT_MAPPING_STATE_KEY, TOMBSTONE_STATE_KEY, TmuxTerminalProvider } from '../../src/tmux/terminalProvider';
 import { buildAttachOrCreateArgv, escapeShellArg, sessionName } from '../../src/tmux/tmuxSession';
 
 // The terminal provider is the user-facing heart of the fork: it decides which
@@ -83,6 +83,7 @@ function makeProvider(over: {
     state?: ReturnType<typeof fakeState>;
     opened?: LaunchOptions[];
     historyLimit?: number;
+    tmuxPath?: string;
 } = {}) {
     const opened = over.opened ?? [];
     const exec = over.exec ?? fakeExec();
@@ -94,6 +95,7 @@ function makeProvider(over: {
         openTerminal: (options: LaunchOptions): number => opened.push(options),
         log: { info: vi.fn(), trace: vi.fn() },
         historyLimit: over.historyLimit,
+        tmuxPath: over.tmuxPath,
     });
     return { provider, opened, exec, state };
 }
@@ -131,6 +133,154 @@ describe('slot allocation', () => {
         const exec = fakeExec({ list: [row(name(0), true), row(name(1), true)] });
         const { provider } = makeProvider({ exec });
         expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(2));
+    });
+});
+
+describe('no-steal TOCTOU (re-probe immediately before returning)', () => {
+    // The no-steal guard reads a `list-sessions` snapshot, but VS Code spawns the
+    // tmux process only *after* provideTerminalProfile returns — a window this code
+    // cannot observe. A single snapshot is therefore TOCTOU: another client can
+    // attach the chosen slot in between. The provider re-probes as the last remote
+    // read before committing to *shrink* (never close) that window, re-picking a
+    // slot taken since the first snapshot instead of stealing it.
+
+    it('skips a slot taken (attached elsewhere) between the first snapshot and returning', async () => {
+        // First `list-sessions`: empty → slot 0 looks free. Every later one: slot 0
+        // is now attached by another client. Without the re-probe the provider hands
+        // out slot 0 (a steal); with it, the fresher snapshot pushes it to slot 1.
+        let listCalls = 0;
+        const exec = vi.fn(async (command: string) => {
+            if (command.includes('list-sessions')) {
+                listCalls++;
+                return { stdout: listCalls === 1 ? '' : row(name(0), true), stderr: '' };
+            }
+            return { stdout: '', stderr: '' };
+        });
+        const { provider } = makeProvider({ exec });
+
+        expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(1));
+        expect(listCalls).toBeGreaterThanOrEqual(2); // re-probed before returning
+    });
+
+    it('keeps its chosen slot when the re-probe shows only an unrelated slot taken', async () => {
+        // A re-probe revealing another client on some *other* slot must not bump a
+        // new terminal off a slot that is still free.
+        let listCalls = 0;
+        const exec = vi.fn(async (command: string) => {
+            if (command.includes('list-sessions')) {
+                listCalls++;
+                return { stdout: listCalls === 1 ? '' : row(name(5), true), stderr: '' };
+            }
+            return { stdout: '', stderr: '' };
+        });
+        const { provider } = makeProvider({ exec });
+
+        expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(0));
+    });
+});
+
+describe('no-steal guard survives a transient probe failure (snapshot retention)', () => {
+    // `attachedRemoteSlots` IS the no-steal guard. A *transient* `list-sessions`
+    // failure (network blip mid-session) must not silently disarm it: the last known
+    // snapshot is retained, so a new terminal still skips the slot another client
+    // holds instead of stealing it. Clearing the set on every failed probe would open
+    // exactly the steal the guard exists to prevent. Retention errs safe — a slot the
+    // other client has since detached stays guarded only until the next *successful*
+    // probe re-syncs it (self-healing, worst case a higher slot number, never a steal).
+
+    it('retains the last attached-elsewhere snapshot when a later probe fails', async () => {
+        // First probe: slot 0 is attached by another client → seeds the guard. Every
+        // later probe throws. With the bug (clear-on-failure) the guard empties and the
+        // new terminal steals slot 0; with retention it still skips it → slot 1.
+        let listCalls = 0;
+        const exec = vi.fn(async (command: string) => {
+            if (command.includes('list-sessions')) {
+                listCalls++;
+                if (listCalls === 1) {
+                    return { stdout: row(name(0), true), stderr: '' };
+                }
+                throw new Error('connection reset'); // transient blip on every later probe
+            }
+            return { stdout: '', stderr: '' };
+        });
+        const { provider } = makeProvider({ exec });
+
+        await provider.initialize(); // seeds attachedRemoteSlots = {0} from the good snapshot
+        // The failing probes inside provideTerminalProfile must keep slot 0 guarded.
+        expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(1));
+    });
+});
+
+describe('init race (no duplicate/mirrored tab on a slot being restored or adopted)', () => {
+    // extension.ts kicks off initialize() fire-and-forget, then registers the
+    // profile provider. A "New Terminal" (or the auto-terminal VS Code opens on
+    // connect) could call provideTerminalProfile() *before* initialize() finished
+    // restoring/adopting — and allocateSlot, ignoring the persisted mapping and the
+    // pending restore, handed out slot 0 too. Two terminals on one tmux session →
+    // shared view, mirrored keystrokes. Two complementary guards close it: mapped
+    // slots are reserved synchronously (before initialize()'s first await), and
+    // provideTerminalProfile awaits `initialized` so adoption (remote-discovered,
+    // not yet in the mapping) also completes first.
+
+    it('reserves a mapped survivor slot so a new terminal never collides with it', async () => {
+        // A survivor mapping from a previous window: slot 0 is spoken for. Even
+        // before initialize() runs, a brand-new terminal must skip it → slot 1.
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const { provider } = makeProvider({ state });
+        expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(1));
+    });
+
+    it('awaits initialize() so a terminal created mid-restore does not collide with an adopted orphan', async () => {
+        // Force the race a near-synchronous fake exec would hide: hold initialize()'s
+        // list-sessions probe open. There is a detached orphan on slot 0 that no client
+        // holds and this client has not mapped (hand-off) — initialize() will adopt it.
+        // Without the gate, provideTerminalProfile races ahead and allocates the very
+        // slot 0 that adoption is about to claim (mirrored tab). The gate must keep it
+        // pending until initialize() settles, then hand out slot 1.
+        let releaseList!: () => void;
+        const listGate = new Promise<void>(res => { releaseList = res; });
+        let firstList = true;
+        const exec = vi.fn(async (command: string) => {
+            if (command.includes('list-sessions')) {
+                if (firstList) {
+                    firstList = false;
+                    await listGate; // only initialize()'s probe blocks
+                }
+                return { stdout: row(name(0), false), stderr: '' };
+            }
+            return { stdout: '', stderr: '' };
+        });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ exec, opened });
+
+        const initP = provider.initialize(); // fire-and-forget, exactly like extension.ts
+        let profile: { options: unknown } | undefined;
+        const profileP = provider.provideTerminalProfile().then(p => { profile = p; });
+
+        // Drain every pending microtask; without the gate, allocation would have run.
+        await new Promise<void>(res => setTimeout(res, 0));
+        expect(profile).toBeUndefined(); // still gated on initialize()
+
+        releaseList();
+        await initP;
+        await profileP;
+
+        expect(targetSession(optionsOf(profile!))).toBe(name(1)); // new terminal took slot 1
+        expect(opened.map(targetSession)).toEqual([name(0)]);     // orphan adopted once, on slot 0
+    });
+
+    it('drains reservations after initialize so a closed-then-reopened slot is reusable', async () => {
+        // Reservation must be a connect-time guard, not permanent: once initialize()
+        // has resolved every survivor into an open terminal, closing one and opening a
+        // new terminal must reuse that slot (same client re-attaching its own session).
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const exec = fakeExec({ list: [row(name(0), false)], existing: [name(0)] });
+        const { provider } = makeProvider({ state, exec });
+
+        await provider.initialize(); // restores slot 0 into an open terminal
+        provider.releaseSlot(0);     // user closes it (detach, mapping kept)
+
+        expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(0));
     });
 });
 
@@ -186,6 +336,24 @@ describe('restore mapping (per client, on reload)', () => {
         expect(provider.mappedSlots()).toEqual([0]);          // slot 2 pruned
         expect(state.get(SLOT_MAPPING_STATE_KEY)).toEqual({ '0': name(0) });
     });
+
+    it('does not re-attach a mapped slot another client is attached to (no mirror on hand-off)', async () => {
+        // Hand-off race: this client mapped slot 0 last time; now the *other* client
+        // (e.g. the PC) is attached to that very session. Existence alone is true, so
+        // the naive restore re-opens it — and two clients on one tmux session share
+        // the view and mirror keystrokes. The loop must skip on the snapshot's
+        // `attached`, yet keep the mapping so a later reconnect can re-attach once the
+        // other client detaches.
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const exec = fakeExec({ list: [row(name(0), true)], existing: [name(0)] });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ state, exec, opened });
+
+        await provider.initialize();
+
+        expect(opened).toEqual([]);                  // slot 0 not re-attached (no mirror)
+        expect(provider.mappedSlots()).toEqual([0]); // mapping kept — still ours
+    });
 });
 
 describe('adoption (hand-off / reconciliation)', () => {
@@ -219,6 +387,101 @@ describe('adoption (hand-off / reconciliation)', () => {
     });
 });
 
+describe('tombstone (a user-closed terminal stays closed across reloads)', () => {
+    // A terminal the user explicitly closes must not come back on the next reload.
+    // The old provider kept the mapping (restore re-attached it) *and* left the
+    // still-live detached session on the remote (adoption re-adopted it) — so a
+    // closed terminal resurrected on every reconnect. The fix persists a per-slot
+    // tombstone on explicit close; restore *and* adoption skip tombstoned slots; and
+    // opening a NEW terminal on that slot clears the tombstone. The session is never
+    // killed (close = detach), so a deliberate reopen -A-attaches it again.
+
+    /** Flush pending microtasks/timers (the close handler persists fire-and-forget). */
+    const flush = (): Promise<void> => new Promise<void>(res => setTimeout(res, 0));
+    /** The persisted user-closed slots, as a plain array, for assertions. */
+    const tombstonesIn = (state: ReturnType<typeof fakeState>): number[] =>
+        (state.get(TOMBSTONE_STATE_KEY) as number[] | undefined) ?? [];
+
+    it('persists a tombstone for the slot on explicit close (mapping + session kept)', async () => {
+        const { provider, state } = makeProvider();
+        const profile = await provider.provideTerminalProfile(); // slot 0
+        const term = { creationOptions: optionsOf(profile) } as unknown as import('vscode').Terminal;
+        provider.handleTerminalOpened(term);
+
+        provider.handleTerminalClosed(term);
+        await flush();
+
+        expect(tombstonesIn(state)).toContain(0);                 // slot 0 tombstoned
+        expect(provider.mappedSlots()).toEqual([0]);              // mapping kept (never killed)
+        expect(state.get(SLOT_MAPPING_STATE_KEY)).toEqual({ '0': name(0) });
+    });
+
+    it('does not restore a tombstoned mapped slot on reload', async () => {
+        // Reload = same client, same workspaceState: slot 0 is mapped AND tombstoned,
+        // its detached session still alive on the remote. Restore must skip it.
+        const state = fakeState({
+            [SLOT_MAPPING_STATE_KEY]: { '0': name(0) },
+            [TOMBSTONE_STATE_KEY]: [0],
+        });
+        const exec = fakeExec({ list: [row(name(0), false)], existing: [name(0)] });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ state, exec, opened });
+
+        await provider.initialize();
+
+        expect(opened).toEqual([]);                  // not re-attached (stays closed)
+        expect(provider.mappedSlots()).toEqual([0]); // mapping kept — session never killed
+    });
+
+    it('does not adopt a tombstoned slot on reload (even when unmapped)', async () => {
+        // The other half of the resurrection bug: a detached-live session on a
+        // tombstoned slot the client no longer maps must not be re-adopted.
+        const state = fakeState({ [TOMBSTONE_STATE_KEY]: [1] });
+        const exec = fakeExec({ list: [row(name(1), false)] }); // detached, live, unmapped
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ state, exec, opened });
+
+        await provider.initialize();
+
+        expect(opened).toEqual([]);
+        expect(provider.mappedSlots()).toEqual([]);
+    });
+
+    it('clears (and persists) the tombstone when a new terminal allocates that slot', async () => {
+        // Opening a NEW terminal on a tombstoned slot is a deliberate reopen: lift the
+        // tombstone so a later reload restores it normally again.
+        const state = fakeState({ [TOMBSTONE_STATE_KEY]: [0] });
+        const { provider } = makeProvider({ state });
+
+        expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(0));
+        expect(tombstonesIn(state)).not.toContain(0);
+    });
+
+    it('a reopened (un-tombstoned) slot restores again on the next reload', async () => {
+        // End-to-end: close (tombstone) -> reopen (clear) -> reload restores. If the
+        // clear failed to persist, the reload below would skip slot 0 and open nothing.
+        const state = fakeState();
+        const first = makeProvider({ state, exec: fakeExec({ existing: [name(0)] }) });
+        const profile = await first.provider.provideTerminalProfile(); // slot 0
+        const term = { creationOptions: optionsOf(profile) } as unknown as import('vscode').Terminal;
+        first.provider.handleTerminalOpened(term);
+        first.provider.handleTerminalClosed(term);            // tombstone slot 0
+        await flush();
+        await first.provider.provideTerminalProfile();        // reopen slot 0 -> clears tombstone
+        expect(tombstonesIn(state)).not.toContain(0);
+
+        const opened: LaunchOptions[] = [];
+        const reload = makeProvider({
+            state,
+            exec: fakeExec({ list: [row(name(0), false)], existing: [name(0)] }),
+            opened,
+        });
+        await reload.provider.initialize();
+
+        expect(opened.map(targetSession)).toEqual([name(0)]); // restored again
+    });
+});
+
 describe('profile options (invisible + argv, no injection surface)', () => {
     it('returns tmux shellPath, the 02 argv builder output, cwd, and isTransient', async () => {
         const { provider } = makeProvider({ historyLimit: 50000 });
@@ -229,6 +492,37 @@ describe('profile options (invisible + argv, no injection surface)', () => {
         );
         expect(options.cwd).toBe(CWD);
         expect(options.isTransient).toBe(true);
+    });
+
+    it('falls back to a bare `tmux` on PATH when the probe resolved no path', async () => {
+        const { provider } = makeProvider(); // no tmuxPath
+        const options = optionsOf(await provider.provideTerminalProfile());
+        expect(options.shellPath).toBe('tmux');
+    });
+
+    it('launches tmux by the probe-resolved absolute path (nix / ~/.local/bin, not on the non-login PATH)', async () => {
+        // VS Code spawns shellPath directly, not through a login shell, so a bare
+        // `tmux` misses installs off the default PATH (nix profile, ~/.local/bin).
+        // The bootstrap probe already resolved the absolute path via `command -v`;
+        // the provider must launch that path.
+        const tmuxPath = '/home/user/.nix-profile/bin/tmux';
+        const { provider } = makeProvider({ tmuxPath });
+        const options = optionsOf(await provider.provideTerminalProfile());
+        expect(options.shellPath).toBe(tmuxPath);
+    });
+
+    it('uses the resolved tmux path for restored/adopted terminals too (reopen path)', async () => {
+        // buildOptions backs both provideTerminalProfile *and* reopen; a restored
+        // survivor must launch by the same absolute path, not a bare `tmux`.
+        const tmuxPath = '/home/user/.local/bin/tmux';
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const exec = fakeExec({ list: [row(name(0), false)], existing: [name(0)] });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ state, exec, opened, tmuxPath });
+
+        await provider.initialize();
+
+        expect(opened[0]?.shellPath).toBe(tmuxPath);
     });
 
     it('defaults the history limit through to the 02 builder when unset', async () => {

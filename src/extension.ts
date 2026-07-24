@@ -103,6 +103,10 @@ function wireTmuxTerminalLayer(
             state: context.workspaceState,
             openTerminal,
             log: logger,
+            // Launch tmux by the absolute path the probe resolved (`command -v tmux`),
+            // so nix / `~/.local/bin` installs off the non-login PATH still work —
+            // undefined falls back to a bare `tmux` on PATH.
+            tmuxPath: capability.path,
             // historyLimit: read from settings if available (PR5)
         });
 
