@@ -79,6 +79,14 @@ export interface TmuxTerminalDeps {
     /** Scrollback lines for new sessions (`remote.SSH.tmux.historyLimit`, 05).
      * Undefined → the session model's default (50000). */
     readonly historyLimit?: number;
+    /** Absolute path to the remote tmux binary, as resolved by the bootstrap probe
+     * (`command -v tmux`, see `tmuxBootstrap.ts`'s `TmuxCapability.path`). Used as
+     * the launched terminal's `shellPath` so VS Code invokes tmux by absolute path.
+     * VS Code spawns `shellPath` directly, not through a login shell, so a bare
+     * `tmux` misses installs off the default PATH (nix profile, `~/.local/bin`) and
+     * fails with a tmux-naming spawn error. Undefined → fall back to a bare `tmux`
+     * on PATH (probe printed no path line, or an exotic build). */
+    readonly tmuxPath?: string;
 }
 
 /** workspaceState key holding the client-local `slot → sessionName` mapping.
@@ -93,7 +101,8 @@ export const SLOT_MAPPING_STATE_KEY = 'tmux.slotSessions.v1';
  * Cleared when the user opens a new terminal on that slot. */
 export const TOMBSTONE_STATE_KEY = 'tmux.tombstonedSlots.v1';
 
-/** The remote shell binary a tmux-backed terminal launches. */
+/** Fallback `shellPath` when the probe resolved no absolute tmux path — a bare
+ * `tmux` on PATH (see {@link TmuxTerminalDeps.tmuxPath} for why a path is preferred). */
 const TMUX_BIN = 'tmux';
 
 /** stderr markers that mean "that session/server is not there" (no exit code is
@@ -115,6 +124,9 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
     private readonly openTerminal: OpenTerminal;
     private readonly log: TmuxLog;
     private readonly historyLimit?: number;
+    /** Resolved `shellPath` for every launched terminal — the probe's absolute tmux
+     * path when known, else a bare `tmux` on PATH ({@link TMUX_BIN}). */
+    private readonly tmuxPath: string;
 
     /** Persisted client-local mapping of slot → session name (survives reloads). */
     private readonly mapping: Map<number, string>;
@@ -145,6 +157,7 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         this.openTerminal = deps.openTerminal;
         this.log = deps.log;
         this.historyLimit = deps.historyLimit;
+        this.tmuxPath = deps.tmuxPath ?? TMUX_BIN;
         this.mapping = readMapping(deps.state);
         this.reservedSlots = new Set(this.mapping.keys());
         this.tombstones = readTombstones(deps.state);
@@ -377,7 +390,8 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         return {
             // Invisible UX: title the tab after the workspace folder, never "tmux".
             name: folderName(this.ctx.cwd),
-            shellPath: TMUX_BIN,
+            // Absolute path from the probe (or a bare `tmux` fallback) — see tmuxPath.
+            shellPath: this.tmuxPath,
             shellArgs: buildAttachOrCreateArgv(name, this.ctx.cwd, undefined, { historyLimit: this.historyLimit }),
             cwd: this.ctx.cwd,
             // tmux owns persistence — opt this terminal out of VS Code's own revive

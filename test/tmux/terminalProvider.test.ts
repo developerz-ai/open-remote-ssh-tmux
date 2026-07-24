@@ -83,6 +83,7 @@ function makeProvider(over: {
     state?: ReturnType<typeof fakeState>;
     opened?: LaunchOptions[];
     historyLimit?: number;
+    tmuxPath?: string;
 } = {}) {
     const opened = over.opened ?? [];
     const exec = over.exec ?? fakeExec();
@@ -94,6 +95,7 @@ function makeProvider(over: {
         openTerminal: (options: LaunchOptions): number => opened.push(options),
         log: { info: vi.fn(), trace: vi.fn() },
         historyLimit: over.historyLimit,
+        tmuxPath: over.tmuxPath,
     });
     return { provider, opened, exec, state };
 }
@@ -490,6 +492,37 @@ describe('profile options (invisible + argv, no injection surface)', () => {
         );
         expect(options.cwd).toBe(CWD);
         expect(options.isTransient).toBe(true);
+    });
+
+    it('falls back to a bare `tmux` on PATH when the probe resolved no path', async () => {
+        const { provider } = makeProvider(); // no tmuxPath
+        const options = optionsOf(await provider.provideTerminalProfile());
+        expect(options.shellPath).toBe('tmux');
+    });
+
+    it('launches tmux by the probe-resolved absolute path (nix / ~/.local/bin, not on the non-login PATH)', async () => {
+        // VS Code spawns shellPath directly, not through a login shell, so a bare
+        // `tmux` misses installs off the default PATH (nix profile, ~/.local/bin).
+        // The bootstrap probe already resolved the absolute path via `command -v`;
+        // the provider must launch that path.
+        const tmuxPath = '/home/user/.nix-profile/bin/tmux';
+        const { provider } = makeProvider({ tmuxPath });
+        const options = optionsOf(await provider.provideTerminalProfile());
+        expect(options.shellPath).toBe(tmuxPath);
+    });
+
+    it('uses the resolved tmux path for restored/adopted terminals too (reopen path)', async () => {
+        // buildOptions backs both provideTerminalProfile *and* reopen; a restored
+        // survivor must launch by the same absolute path, not a bare `tmux`.
+        const tmuxPath = '/home/user/.local/bin/tmux';
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const exec = fakeExec({ list: [row(name(0), false)], existing: [name(0)] });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ state, exec, opened, tmuxPath });
+
+        await provider.initialize();
+
+        expect(opened[0]?.shellPath).toBe(tmuxPath);
     });
 
     it('defaults the history limit through to the 02 builder when unset', async () => {
