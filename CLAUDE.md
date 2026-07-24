@@ -56,7 +56,7 @@ responsibility. Preserve that; each file below owns exactly one concern.
 |------|----------------------|
 | `src/extension.ts` | Activation wiring only — construct collaborators, register with VS Code, push disposables. No logic. |
 | `src/authResolver.ts` | Resolve the remote authority: auth handshake → ensure server → produce the connection VS Code connects to. Upstream's core; **we leave it alone** (terminals-only scope). |
-| `src/tmux/*` *(new)* | **The fork's addition.** tmux session lifecycle (deterministic naming, attach-or-create, restore mapping, reaping) + VS Code terminal-profile wiring. The heart of open-remote-ssh-tmux. |
+| `src/tmux/*` *(new)* | **The fork's addition.** `tmuxSession.ts` (pure session-naming/attach-or-create/reap-decision logic, the only place tmux command lines are built), `tmuxBootstrap.ts` (capability probe), `terminalProvider.ts` (VS Code `TerminalProfileProvider` wiring, multi-client slot allocation), `sessionReaper.ts` (connect-time cleanup of dead/empty sessions). The heart of open-remote-ssh-tmux. |
 | `src/serverSetup.ts` | Install / locate the VS Code server on the remote (script templating, path resolution, release fetch). |
 | `src/serverConfig.ts` | Compute the wanted server version/quality/commit + validation policy. |
 | `src/fetchRelease.ts` | Fetch release metadata (network I/O, no policy). |
@@ -111,7 +111,9 @@ steer. Conventions inherit from [`../gold-standards-in-ai/`](../gold-standards-i
 diffs). **Unit TDD is the workflow: write the failing unit test first, then the
 code to pass it — no test, no merge.** See
 [`docs/idea/ai-first.md`](docs/idea/ai-first.md) for what's already set up vs. the
-gaps to close (biggest gap: **no test suite yet**). For AI-first conventions
+gaps to close (test suite is wired up — vitest, `npm test`; biggest remaining gap:
+the empirical F5/EDH persistence proof, see `docs/idea/roadmap.md` and
+`docs/plans/2026/07/24/101-v1-tmux-release/09-verify.md`). For AI-first conventions
 (DX scripts, hooks/permissions, testing) mirror the patterns in
 [`../gold-standards-in-ai/`](../gold-standards-in-ai/docs/writing-for-agents/README.md)
 and [`../ai-task-master/`](../ai-task-master/CLAUDE.md).
@@ -144,15 +146,17 @@ npm run package        # produce the .vsix
 ```
 
 **Unit TDD** is the workflow: write the failing unit test first, then the code to
-pass it. There is **no test suite wired up yet** (first task — see
-[`docs/idea/ai-first.md`](docs/idea/ai-first.md)); once it exists, the pure logic
-(session naming, attach-or-create, reap decisions, `sshConfig`, `sshDestination`,
+pass it. The test suite is wired up — **vitest, `npm test`** (see
+[`docs/idea/ai-first.md`](docs/idea/ai-first.md)) — and the pure logic (session
+naming, attach-or-create, reap decisions, `sshConfig`, `sshDestination`,
 `serverConfig`, `ports`, `splitProxyCommand`) is unit-tested first. "Verify" then
 means: failing-test-first → code → `tsc` clean, `eslint` clean, unit tests green,
 and — for anything touching the resolver or the tmux terminal layer — `F5`
 (Extension Development Host) and a real connect proving terminals persist and
 re-attach (disconnect → reconnect → same session; re-open workspace → no
-duplicate/zombie session).
+duplicate/zombie session). That empirical F5/EDH proof is still the standing
+outstanding gate — see
+[`docs/plans/2026/07/24/101-v1-tmux-release/09-verify.md`](docs/plans/2026/07/24/101-v1-tmux-release/09-verify.md).
 
 ## Git / PR discipline
 

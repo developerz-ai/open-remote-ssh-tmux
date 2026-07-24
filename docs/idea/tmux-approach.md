@@ -24,21 +24,27 @@ Because the tmux server is a separate process, sessions and the processes inside
 them survive vscode-server restarts, window closes, disconnects, and are
 re-attachable from **any** machine — that's the machine hand-off.
 
-## Candidate mechanisms (to evaluate)
+## Candidate mechanisms (evaluated)
 
-1. **tmux-backed terminal profile.** Register a `TerminalProfileProvider` (VS
+1. **tmux-backed terminal profile — shipped.** A `TerminalProfileProvider` (VS
    Code `contributes.terminal.profiles` + `window.registerTerminalProfileProvider`)
-   that launches `tmux new-session -A -s <name>` (attach-or-create) instead of a
-   bare shell. New integrated terminals are tmux clients; reconnecting re-attaches
-   the same session. Likely the default terminal on a resolved host.
-2. **Session manager UI.** A tree view (mirror the existing `sshHosts` view in
-   `src/hostTreeView.ts`) listing tmux sessions on the connected host — run
-   `tmux list-sessions` over the existing connection — with commands to
-   attach / create / rename / kill, each opening a VS Code terminal on
-   `tmux attach -t <name>`.
-3. **Bootstrap.** Detect `tmux` on the remote (like `serverSetup` handles the
-   vscode-server); if missing, guide install. Ship a sane default tmux config
-   (mouse on, large history, sensible status) without clobbering the user's.
+   launches `tmux new-session -A -s <name>` (attach-or-create) instead of a bare
+   shell. New integrated terminals are tmux clients; reconnecting re-attaches
+   the same session. It is the default terminal on a resolved Unix host.
+   Implemented in `src/tmux/terminalProvider.ts` + `src/tmux/tmuxSession.ts`.
+2. **Session manager UI — deferred.** A tree view (mirror the existing
+   `sshHosts` view in `src/hostTreeView.ts`) listing tmux sessions on the
+   connected host — run `tmux list-sessions` over the existing connection —
+   with commands to attach / create / rename / kill, each opening a VS Code
+   terminal on `tmux attach -t <name>`. Not needed for the terminals-only
+   scope of this release (attach-or-create + reap already give "no zombies"
+   without a UI); see [`roadmap.md`](roadmap.md).
+3. **Bootstrap — shipped.** Detect `tmux` on the remote (like `serverSetup`
+   handles the vscode-server); degrade (feature off, logged) if missing or too
+   old. Per-session config (`set-option`, not `~/.tmux.conf`) applies scrollback
+   and hides the status bar without touching the user's own config. Implemented
+   in `src/tmux/tmuxBootstrap.ts` (probe) + the per-session options in
+   `buildAttachOrCreate` (`src/tmux/tmuxSession.ts`).
 
 ## Spike decision: terminal profile provider spawns on the remote (2026-07-24)
 
@@ -144,19 +150,51 @@ strategy:
 The invariant: **one live session per (host, workspace, terminal-slot); zero
 sessions with no purpose.**
 
-## Open questions for `/planx`
+## Resolved questions (2026-07-24)
 
-- **Naming / discovery** of sessions per host+workspace (one "main" per folder?
-  user-named? a `vscode-<workspaceHash>` scheme?).
-- **Resize / reflow.** tmux status bar, mouse mode, and tmux's own scrollback vs
-  VS Code's — get the UX clean, not doubled.
+All the open questions below are now shipped decisions, implemented in
+`src/tmux/*` and covered by unit tests. Kept here (rather than deleted) as the
+record of *why*, per the "write it down" house rule.
+
 - ~~**Terminal profile vs. wrapper vs. shell-init** as the injection point~~ —
   resolved: terminal profile provider (Route A), confirmed to spawn on the
-  remote regardless of `extensionKind` — see "Spike decision" above.
-- **Claude Code specifically** — a first-class "attach to my long task" command,
-  or just a well-known session name?
-- **Windows remotes** — tmux is Unix-only; degrade gracefully (feature off, or
-  document WSL).
+  remote regardless of `extensionKind` — see "Spike decision" above. **Shipped**
+  in `src/tmux/terminalProvider.ts`.
+- **Naming / discovery.** Resolved as `code-<sha1_12(host + ' ' + workspacePath)>-<slot>`
+  — one deterministic namespace per (host, workspace), with a numeric `slot` for
+  multiple terminals in the same workspace (terminal 0, 1, 2, …). No user-facing
+  name; the `code-` prefix is also the exact namespace the reaper is allowed to
+  touch, so a user's own `main` session is never at risk. **Shipped** in
+  `sessionName` / `sessionSlot` (`src/tmux/tmuxSession.ts`).
+- **Resize / reflow.** Resolved narrowly, not left open: each session sets
+  `status off` (no tmux status bar — VS Code's own tab is the chrome) and a
+  configurable `history-limit` (default 50000) for scrollback; tmux's automatic
+  window resize-to-client behaviour is relied on as-is (a single VS Code
+  terminal is always the sole client resizing the window in the common case).
+  Multi-client concurrent-resize contention is accepted, undocumented tmux
+  behaviour, not solved by this fork — see the multi-client rules in
+  [`persistence-model.md`](persistence-model.md). **Shipped** (the two
+  `set-option`s) in `buildAttachOrCreate(Argv)`.
+- **Claude Code specifically.** Resolved as *not* a first-class "attach to my
+  long task" command — a well-known, deterministic session name is enough:
+  `code-<hash>-0` (slot 0, the first terminal opened in a workspace) is where a
+  first Claude Code run naturally lands, and it is findable with
+  `tmux attach -t code-<hash>-0` from any client that knows the host+workspace
+  hash. A dedicated "attach to my Claude Code task" command/UI (naming the
+  session by intent rather than slot order) is deferred — see
+  [`roadmap.md`](roadmap.md).
+- **Windows remotes.** Resolved as: tmux is Unix-only, so the feature is off by
+  default there — no terminal-profile registration, no reaper, no bootstrap
+  probe attempted; the base (non-tmux) shell profile is untouched so the
+  connect never breaks. **Shipped** via the platform gate in
+  `probeTmux` (`src/tmux/tmuxBootstrap.ts`), which short-circuits to
+  `{available: false, reason: 'windows'}`.
+
+## Deferred (not in this release)
+
+See [`roadmap.md`](roadmap.md) for the full list and rationale: a session-manager
+tree view (candidate mechanism 2, above), a first-class "attach to my Claude Code
+task" command, and mosh-over-tmux for seamless roaming.
 
 ## What this is NOT
 

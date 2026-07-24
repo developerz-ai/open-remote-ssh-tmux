@@ -38,13 +38,13 @@ spawn a duplicate. Sessions whose processes have all exited get reaped;
 long-lived intentional ones (the Claude Code task) are kept. The user should
 never find a graveyard of orphaned sessions. See [`tmux-approach.md`](tmux-approach.md).
 
-## 4. Keep the SSH transport; add, don't rip out
+## 6. Keep the SSH transport; add, don't rip out
 
 We are open-remote-ssh + tmux, not a transport rewrite. Everything upstream does
 (SSH auth, server install, host tree, config) stays. tmux is an *additive* layer.
 This keeps the fork small and mergeable.
 
-## 5. Honesty over completeness
+## 7. Honesty over completeness
 
 tmux gives persistence + hand-off, not seamless roaming
 ([`decision-mosh-vs-tmux.md`](decision-mosh-vs-tmux.md)). When the tool can't do
@@ -52,20 +52,20 @@ something (seamless reconnect, Windows remotes), **say so and degrade
 gracefully** — never fake it. A truthful "reconnect and re-attach" beats a vague
 "it just stays connected."
 
-## 6. Security is not traded for persistence
+## 8. Security is not traded for persistence
 
 This extension handles keys, credentials, and runs remote commands. Adding tmux
 must never weaken host-key verification, leak secrets to logs, or open
 shell-injection paths in the commands/scripts we send to the remote.
 
-## 7. Stay a clean fork
+## 9. Stay a clean fork
 
 We track upstream `jeanp413/open-remote-ssh`. tmux changes stay isolated and
 well-labelled, and the tmux integration lives in its own module(s) (not bolted
 onto the SSH classes) so upstream fixes keep merging — which is also just good
 SRP (see `CLAUDE.md`).
 
-## 8. Keep it small
+## 10. Keep it small
 
 The codebase is ~2.3k LOC and readable. Prefer deleting to abstracting;
 introduce an abstraction only when there's a second real consumer. One
