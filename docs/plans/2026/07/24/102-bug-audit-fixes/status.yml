@@ -1,0 +1,36 @@
+plan: 102-bug-audit-fixes
+title: Full-codebase bug audit — fixes
+status: not_started
+created_by: sebi
+worked_by: ""
+owner: sebi
+percent: 0
+current_focus: ""
+slices:
+  - file: 01-tmux-invariants.md
+    status: not_started
+    percent: 0
+  - file: 02-wiring-and-settings.md
+    status: not_started
+    percent: 0
+  - file: 03-hostkey-verification.md
+    status: not_started
+    percent: 0
+  - file: 04-ssh-robustness.md
+    status: not_started
+    percent: 0
+  - file: 05-server-install.md
+    status: not_started
+    percent: 0
+  - file: 06-ui-and-common.md
+    status: not_started
+    percent: 0
+  - file: 07-missing-tests.md
+    status: not_started
+    percent: 0
+  - file: 08-verify.md
+    status: not_started
+    percent: 0
+evidence: []
+notes: "Findings pre-verified by 5 parallel audit agents (ssh core, server setup, tmux layer, UI/wiring, test coverage) on 2026-07-24; line refs are pre-fix."
+last_updated: 2026-07-24
