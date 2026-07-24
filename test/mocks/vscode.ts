@@ -73,7 +73,7 @@ export const messageResponses: { warning: unknown } = { warning: undefined };
 
 /** Messages surfaced via the `window.show*Message` APIs, recorded (message + items)
  * per call so a test can assert what — and whether — a dialog was shown. */
-export const shownMessages: { warning: unknown[][]; information: unknown[][] } = { warning: [], information: [] };
+export const shownMessages: { warning: unknown[][]; information: unknown[][]; error: unknown[][] } = { warning: [], information: [], error: [] };
 
 export const window = {
     createOutputChannel(channelName: string): MockOutputChannel {
@@ -85,6 +85,10 @@ export const window = {
     },
     showInformationMessage(message: string, ...items: unknown[]): Promise<unknown> {
         shownMessages.information.push([message, ...items]);
+        return Promise.resolve(undefined);
+    },
+    showErrorMessage(message: string, ...items: unknown[]): Promise<unknown> {
+        shownMessages.error.push([message, ...items]);
         return Promise.resolve(undefined);
     },
 };

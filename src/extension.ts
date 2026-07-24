@@ -60,20 +60,27 @@ function wireTmuxTerminalLayer(
     logger: Log
 ): TmuxTerminalLayer | undefined {
     try {
-        // PR3 gate: tmux must be available on the remote.
+        // Read the three remote.SSH.tmux.* settings once, up front. `enabled` is read
+        // BEFORE the capability probe so an explicit `'on'` ("require tmux") can surface
+        // a user-visible error when the remote can't provide tmux, instead of silently
+        // skipping like `'auto'` does — see decideTmuxWiring.
+        const settings = readTmuxSettings();
+
+        // PR3 + PR5 gate combined: decide whether to wire from (enabled setting ×
+        // tmux availability). `'off'` → skip; unavailable under `'on'` → user error;
+        // unavailable under `'auto'` → silent skip; available (and not `'off'`) → wire.
         const capability = resolver.getTmuxCapability();
-        if (!capability?.available) {
-            // Capability not probed or not available; skip tmux wiring.
-            // Base SSH functionality remains unaffected.
+        const decision = decideTmuxWiring(settings.enabled, capability?.available === true);
+        if (decision === 'require-error') {
+            // The one path that reaches the user: they required tmux but it isn't there.
+            // Best-effort notification; the failed connection is already succeeded.
+            void vscode.window.showErrorMessage(TMUX_REQUIRED_UNAVAILABLE_MESSAGE);
             return;
         }
-
-        // PR5 gate: check if tmux is enabled in settings (graceful fallback to 'auto').
-        // The setting may not exist yet if PR5 hasn't completed; default to enabled.
-        const remoteSSHConfig = vscode.workspace.getConfiguration('remote.SSH');
-        const tmuxSetting = remoteSSHConfig.get<string>('tmux.enabled', 'auto');
-        if (tmuxSetting === 'off') {
-            // Feature is explicitly disabled; skip wiring.
+        if (decision !== 'wire' || !capability?.available) {
+            // `'skip'` (disabled, or unavailable under `'auto'`). The `!capability?.available`
+            // clause is redundant given `decision === 'wire'` implies availability — it is
+            // there only to re-narrow `capability` to non-undefined for the compiler below.
             return;
         }
 
@@ -108,7 +115,9 @@ function wireTmuxTerminalLayer(
             // so nix / `~/.local/bin` installs off the non-login PATH still work —
             // undefined falls back to a bare `tmux` on PATH.
             tmuxPath: capability.path,
-            // historyLimit: read from settings if available (PR5)
+            // Scrollback lines for new sessions (remote.SSH.tmux.historyLimit); the
+            // provider caps its `new-session` history buffer to this.
+            historyLimit: settings.historyLimit,
         });
 
         // Initialize the provider (restore + adopt sessions from previous clients).
@@ -149,11 +158,20 @@ function wireTmuxTerminalLayer(
             log: logger,
         });
 
+        // Run the reaper only when remote.SSH.tmux.reapOnConnect is set (default true) —
+        // the setting's contract is "clean up empty/dead sessions when connecting". Gates
+        // both the initial connect reap here and the reconnect refresh below. `label`
+        // (not `context`) avoids shadowing the ExtensionContext parameter.
+        const reapIfEnabled = (label: string): void => {
+            if (!settings.reapOnConnect) {
+                return;
+            }
+            reaper.reap()
+                .catch((err) => logger.trace(`${label}: ${err instanceof Error ? err.message : String(err)}`));
+        };
+
         // Run reaper immediately on connect (cleanup leftover sessions).
-        reaper.reap()
-            .catch((err) => {
-                logger.trace(`Session reaper failed: ${err instanceof Error ? err.message : String(err)}`);
-            });
+        reapIfEnabled('Session reaper failed');
 
         // Create a disposable for the reaper (so it can be cleaned up, though
         // it has no resources to free — reaper is stateless).
@@ -174,8 +192,7 @@ function wireTmuxTerminalLayer(
             refresh: () => {
                 terminalProvider.initialize()
                     .catch((err) => logger.trace(`Tmux provider refresh failed: ${err instanceof Error ? err.message : String(err)}`));
-                reaper.reap()
-                    .catch((err) => logger.trace(`Tmux reaper refresh failed: ${err instanceof Error ? err.message : String(err)}`));
+                reapIfEnabled('Tmux reaper refresh failed');
             },
         };
     } catch (err) {
@@ -231,6 +248,66 @@ export function lazyExec(resolver: RemoteSSHResolver): RemoteExec {
         return connection.exec(command);
     };
 }
+
+/**
+ * The three `remote.SSH.tmux.*` settings the terminal layer honours, read together from
+ * the `remote.SSH` configuration section. Values and defaults mirror package.json's
+ * `contributes.configuration`, so an unset key behaves exactly as documented there.
+ */
+export interface TmuxSettings {
+    /** `remote.SSH.tmux.enabled`: `'auto'` (default) | `'off'` | `'on'`. */
+    readonly enabled: string;
+    /** `remote.SSH.tmux.historyLimit`: scrollback lines for new sessions (default 50000). */
+    readonly historyLimit: number;
+    /** `remote.SSH.tmux.reapOnConnect`: reap empty/dead sessions on (re)connect (default true). */
+    readonly reapOnConnect: boolean;
+}
+
+/**
+ * Read the three `remote.SSH.tmux.*` settings. The single read seam for the terminal
+ * layer's settings — keeps the section path, key names, and defaults in one place (and
+ * unit-testable) instead of scattered inline. Defaults match package.json, so a missing
+ * value resolves to the documented default.
+ */
+export function readTmuxSettings(): TmuxSettings {
+    const config = vscode.workspace.getConfiguration('remote.SSH');
+    return {
+        enabled: config.get<string>('tmux.enabled', 'auto'),
+        historyLimit: config.get<number>('tmux.historyLimit', 50000),
+        reapOnConnect: config.get<boolean>('tmux.reapOnConnect', true),
+    };
+}
+
+/** What {@link decideTmuxWiring} resolves the (enabled × availability) matrix to:
+ * `'wire'` (register the tmux layer), `'skip'` (do nothing; base SSH unaffected), or
+ * `'require-error'` (user required tmux via `'on'` but it is unavailable → notify). */
+export type TmuxWiringDecision = 'wire' | 'skip' | 'require-error';
+
+/**
+ * The pure enablement rule for the tmux terminal layer, from `remote.SSH.tmux.enabled`
+ * and whether the remote can provide tmux:
+ *  - `'off'` → always `'skip'` (feature disabled);
+ *  - available → `'wire'`;
+ *  - unavailable + `'on'` → `'require-error'` (the "fail if unavailable" contract);
+ *  - unavailable otherwise (`'auto'` / unknown) → `'skip'` (silent graceful degrade).
+ * Pure + exported so the matrix is unit-tested without the VS Code terminal surface.
+ */
+export function decideTmuxWiring(enabled: string, tmuxAvailable: boolean): TmuxWiringDecision {
+    if (enabled === 'off') {
+        return 'skip';
+    }
+    if (tmuxAvailable) {
+        return 'wire';
+    }
+    return enabled === 'on' ? 'require-error' : 'skip';
+}
+
+/** User-facing error shown when `remote.SSH.tmux.enabled` is `'on'` (tmux required) but the
+ * remote can't provide tmux — the one enablement path that surfaces to the user instead of
+ * silently degrading (`'auto'`). Generic wording: names only the setting and the tmux
+ * requirement, no internals. */
+export const TMUX_REQUIRED_UNAVAILABLE_MESSAGE =
+    'remote.SSH.tmux.enabled is set to "on" (persistent terminals required), but tmux is not available on this remote. Install tmux, or set the setting to "auto" or "off".';
 
 /** Title of the contributed profile (`package.json` contributes.terminal.profiles) —
  * the value `terminal.integrated.defaultProfile.linux` must reference to select it. */

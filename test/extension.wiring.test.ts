@@ -1,6 +1,7 @@
-import { describe, expect, it, vi } from 'vitest';
-import { idempotentResolveHandler, lazyExec } from '../src/extension';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { decideTmuxWiring, idempotentResolveHandler, lazyExec, readTmuxSettings } from '../src/extension';
 import type { RemoteSSHResolver } from '../src/authResolver';
+import { configOverrides } from './mocks/vscode';
 
 // extension.ts is activation wiring only; these tests pin the two behaviours the
 // reconnect-safety fix (headline #3, "post-reconnect terminals fail") introduces:
@@ -79,5 +80,54 @@ describe('idempotentResolveHandler: wire once, refresh on reconnect', () => {
 
         expect(wire).toHaveBeenCalledTimes(2);
         expect(refresh).toHaveBeenCalledTimes(1);
+    });
+});
+
+// The three settings (`historyLimit`, `reapOnConnect`, `enabled`) were declared in
+// package.json but never read — `wireTmuxTerminalLayer` hard-coded their effects.
+// `readTmuxSettings` is the single read seam (pins section, key names, and the
+// package.json defaults) and `decideTmuxWiring` is the pure enablement rule that
+// makes `enabled:'on'` ("require tmux") observably different from `'auto'`.
+describe('readTmuxSettings: the three remote.SSH.tmux.* settings are read', () => {
+    beforeEach(() => configOverrides.clear());
+
+    it('falls back to the package.json defaults when nothing is configured', () => {
+        const settings = readTmuxSettings();
+        expect(settings.enabled).toBe('auto');
+        expect(settings.historyLimit).toBe(50000);
+        expect(settings.reapOnConnect).toBe(true);
+    });
+
+    it('reads seeded values from the remote.SSH configuration section', () => {
+        configOverrides.set('remote.SSH.tmux.enabled', 'on');
+        configOverrides.set('remote.SSH.tmux.historyLimit', 1000);
+        configOverrides.set('remote.SSH.tmux.reapOnConnect', false);
+
+        const settings = readTmuxSettings();
+        expect(settings.enabled).toBe('on');
+        expect(settings.historyLimit).toBe(1000);
+        expect(settings.reapOnConnect).toBe(false);
+    });
+});
+
+describe('decideTmuxWiring: enabled setting × tmux availability', () => {
+    it('off → skip, whether or not tmux is available', () => {
+        expect(decideTmuxWiring('off', true)).toBe('skip');
+        expect(decideTmuxWiring('off', false)).toBe('skip');
+    });
+
+    it('auto → wire when available, skip silently when not', () => {
+        expect(decideTmuxWiring('auto', true)).toBe('wire');
+        expect(decideTmuxWiring('auto', false)).toBe('skip');
+    });
+
+    it('on → wire when available, require-error when not (the "fail if unavailable" contract)', () => {
+        expect(decideTmuxWiring('on', true)).toBe('wire');
+        expect(decideTmuxWiring('on', false)).toBe('require-error');
+    });
+
+    it('an unknown value degrades to auto behaviour', () => {
+        expect(decideTmuxWiring('weird', true)).toBe('wire');
+        expect(decideTmuxWiring('weird', false)).toBe('skip');
     });
 });
