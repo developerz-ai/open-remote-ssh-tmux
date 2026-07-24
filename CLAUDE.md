@@ -111,9 +111,9 @@ steer. Conventions inherit from [`../gold-standards-in-ai/`](../gold-standards-i
 diffs). **Unit TDD is the workflow: write the failing unit test first, then the
 code to pass it — no test, no merge.** See
 [`docs/idea/ai-first.md`](docs/idea/ai-first.md) for what's already set up vs. the
-gaps to close (test suite is wired up — vitest, `npm test`; biggest remaining gap:
-the empirical F5/EDH persistence proof, see `docs/idea/roadmap.md` and
-`docs/plans/2026/07/24/101-v1-tmux-release/09-verify.md`). For AI-first conventions
+gaps to close (test suite is wired up — vitest, `npm test`; the empirical F5/EDH
+persistence proof is now done — 19/21 acceptance rows PASS, see
+`docs/plans/2026/07/24/101-v1-tmux-release/results-2026-07-24.md`). For AI-first conventions
 (DX scripts, hooks/permissions, testing) mirror the patterns in
 [`../gold-standards-in-ai/`](../gold-standards-in-ai/docs/writing-for-agents/README.md)
 and [`../ai-task-master/`](../ai-task-master/CLAUDE.md).
@@ -154,9 +154,16 @@ means: failing-test-first → code → `tsc` clean, `eslint` clean, unit tests g
 and — for anything touching the resolver or the tmux terminal layer — `F5`
 (Extension Development Host) and a real connect proving terminals persist and
 re-attach (disconnect → reconnect → same session; re-open workspace → no
-duplicate/zombie session). That empirical F5/EDH proof is still the standing
-outstanding gate — see
-[`docs/plans/2026/07/24/101-v1-tmux-release/09-verify.md`](docs/plans/2026/07/24/101-v1-tmux-release/09-verify.md).
+duplicate/zombie session). That empirical F5/EDH proof was run against a real
+tmux rig for v1.0.0 — 19/21 rows PASS, results in
+[`results-2026-07-24.md`](docs/plans/2026/07/24/101-v1-tmux-release/results-2026-07-24.md),
+matrix definition in
+[`09-verify.md`](docs/plans/2026/07/24/101-v1-tmux-release/09-verify.md). Two rows
+remain open and are documented as known limitations: **row 13** (Windows remote —
+needs a real Windows SSH target; the platform gate is confirmed to engage) and
+**row 18** (Claude Code TUI redraw after reattach — the underlying mechanism is
+covered by rows 2/20/21). Re-run the zombie rows (6-9) for any change to the tmux
+terminal layer.
 
 ## Git / PR discipline
 
