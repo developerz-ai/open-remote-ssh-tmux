@@ -103,6 +103,48 @@ describe('SSHConfiguration.loadFromFS', () => {
         const config = await SSHConfiguration.loadFromFS();
         expect(config.getAllConfiguredHosts()).toEqual([]);
     });
+
+    // A self-including or mutually-including config previously recursed forever
+    // (each Include re-parsed and re-expanded the same file endlessly), hanging
+    // the resolver. Both must terminate and still yield the directives that were
+    // reachable before the cycle was cut off.
+    it('terminates and still resolves when a config includes itself', async () => {
+        tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ssh-config-test-'));
+        const configPath = path.join(tmpDir, 'config');
+        await fs.promises.writeFile(configPath, `Include ${configPath}\nHost foo\n    HostName foo.example.com\n`);
+        configOverrides.set('remote.SSH.configFile', configPath);
+
+        const config = await SSHConfiguration.loadFromFS();
+        expect(config.getHostConfiguration('foo')['HostName']).toBe('foo.example.com');
+    });
+
+    it('terminates and still resolves when two configs mutually include each other', async () => {
+        tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ssh-config-test-'));
+        const configPath = path.join(tmpDir, 'config');
+        const otherPath = path.join(tmpDir, 'other.conf');
+        await fs.promises.writeFile(configPath, `Include ${otherPath}\nHost foo\n    HostName foo.example.com\n`);
+        await fs.promises.writeFile(otherPath, `Include ${configPath}\nHost bar\n    HostName bar.example.com\n`);
+        configOverrides.set('remote.SSH.configFile', configPath);
+
+        const config = await SSHConfiguration.loadFromFS();
+        expect(config.getHostConfiguration('foo')['HostName']).toBe('foo.example.com');
+        expect(config.getHostConfiguration('bar')['HostName']).toBe('bar.example.com');
+    });
+
+    it('applies an Include directive nested inside a Host block', async () => {
+        tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ssh-config-test-'));
+        const includedPath = path.join(tmpDir, 'included.conf');
+        await fs.promises.writeFile(includedPath, 'HostName included.example.com\n    User included-user\n');
+        const configPath = path.join(tmpDir, 'config');
+        await fs.promises.writeFile(configPath, `Host foo\n    Include ${includedPath}\n    Port 2222\n`);
+        configOverrides.set('remote.SSH.configFile', configPath);
+
+        const config = await SSHConfiguration.loadFromFS();
+        const hostConfig = config.getHostConfiguration('foo');
+        expect(hostConfig['HostName']).toBe('included.example.com');
+        expect(hostConfig['User']).toBe('included-user');
+        expect(hostConfig['Port']).toBe('2222');
+    });
 });
 
 describe('SSHConfiguration#getAllConfiguredHosts', () => {
@@ -121,5 +163,15 @@ describe('SSHConfiguration#getAllConfiguredHosts', () => {
     it('deduplicates a Host name that appears in more than one section', () => {
         const config = new SSHConfiguration(SSHConfig.parse('Host foo\n    User a\n\nHost foo\n    Port 22\n'));
         expect(config.getAllConfiguredHosts()).toEqual(['foo']);
+    });
+
+    it('lists every name in a multi-value "Host dev staging" line, not just the first', () => {
+        const config = new SSHConfiguration(SSHConfig.parse('Host dev staging\n    User shared\n'));
+        expect(config.getAllConfiguredHosts()).toEqual(['dev', 'staging']);
+    });
+
+    it('filters pattern names out of a multi-value Host line while keeping concrete ones', () => {
+        const config = new SSHConfiguration(SSHConfig.parse('Host dev *.internal !excluded\n    User shared\n'));
+        expect(config.getAllConfiguredHosts()).toEqual(['dev']);
     });
 });
