@@ -319,6 +319,20 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
 
                     const child = cp.spawn(proxyCommand, proxyArgs, options);
                     proxyStream = stream.Duplex.from({ readable: child.stdout, writable: child.stdin });
+                    // A bad ProxyCommand binary (e.g. ENOENT) emits 'error' on the child process
+                    // asynchronously, after this synchronous setup has returned — left unhandled
+                    // that's an uncaught exception instead of the resolver's error dialog. Destroy
+                    // the sock so ssh2's Client (which already listens for 'error' on `sock`, see
+                    // node_modules/ssh2/lib/client.js) surfaces it through the normal
+                    // connect()-rejects-into-catch path below. The stream listener is a defensive
+                    // backstop against Duplex.from itself emitting 'error'.
+                    child.on('error', (err) => {
+                        this.logger.error(`ProxyCommand '${proxyCommand}' failed to start`, err);
+                        proxyStream?.destroy(err);
+                    });
+                    proxyStream.on('error', (err) => {
+                        this.logger.trace(`ProxyCommand stream error: ${err instanceof Error ? err.message : String(err)}`);
+                    });
                     this.proxyCommandProcess = child;
                 }
 
@@ -473,6 +487,11 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                     .on('connection', async (socket: net.Socket) => {
                         try {
                             const socksConn = await SocksClient.createConnection(socksOptions);
+                            // An unhandled 'error' on either end of the pipe (e.g. ECONNRESET) would
+                            // otherwise be an uncaught exception that kills the extension host.
+                            // Destroy the counterpart so the pipe tears down cleanly instead.
+                            socket.on('error', () => socksConn.socket.destroy());
+                            socksConn.socket.on('error', () => socket.destroy());
                             socket.pipe(socksConn.socket);
                             socksConn.socket.pipe(socket);
                         } catch (error) {

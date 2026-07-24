@@ -299,6 +299,12 @@ export default class SSHConnection extends EventEmitter {
                                             this.emit(SSHConstants.CHANNEL.TUNNEL, SSHConstants.STATUS.DISCONNECT, { SSHTunnelConfig: SSHTunnelConfig, err: err });
                                             return;
                                         }
+                                        // An unhandled 'error' on either end of the pipe (e.g. ECONNRESET when the
+                                        // local client drops the socket) would otherwise be an uncaught exception
+                                        // that kills the extension host. Destroy the counterpart so the pipe tears
+                                        // down cleanly instead.
+                                        stream.on('error', () => socket.destroy());
+                                        socket.on('error', () => stream.destroy());
                                         stream.pipe(socket);
                                         socket.pipe(stream);
                                     });
@@ -308,6 +314,9 @@ export default class SSHConnection extends EventEmitter {
                                             this.emit(SSHConstants.CHANNEL.TUNNEL, SSHConstants.STATUS.DISCONNECT, { SSHTunnelConfig: SSHTunnelConfig, err: err });
                                             return;
                                         }
+                                        // Same rationale as the port-forward branch above.
+                                        stream.on('error', () => socket.destroy());
+                                        socket.on('error', () => stream.destroy());
                                         stream.pipe(socket);
                                         socket.pipe(stream);
                                     });
