@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
     buildAttachOrCreate,
+    buildAttachOrCreateArgv,
     buildHasSession,
     buildKillSession,
     buildListSessions,
@@ -8,6 +9,7 @@ import {
     isOurSession,
     parseListSessions,
     sessionName,
+    sessionSlot,
     shouldReap,
 } from '../../src/tmux/tmuxSession';
 
@@ -147,6 +149,68 @@ describe('buildAttachOrCreate', () => {
             + ` \\; set-option -t ${ESC} status off`
             + ` \\; set-option -t ${ESC} history-limit 50000`,
         );
+    });
+});
+
+describe('buildAttachOrCreateArgv', () => {
+    // The argv form is what a VS Code terminal profile's `shellArgs` carries
+    // (shellPath 'tmux'). The pty host hands it to execve directly — NO shell —
+    // so there is no quoting and no injection surface; the tmux command separator
+    // is a bare `;` element (the shell form writes `\;` only to survive the shell).
+    const NAME = `code-${HASH_PROJ}-0`;
+
+    it('emits attach-or-create argv with per-session hardening/cosmetics', () => {
+        expect(buildAttachOrCreateArgv(NAME, '/home/user/proj')).toEqual([
+            'new-session', '-A', '-s', NAME, '-c', '/home/user/proj',
+            ';', 'set-window-option', '-t', NAME, 'remain-on-exit', 'off',
+            ';', 'set-option', '-t', NAME, 'status', 'off',
+            ';', 'set-option', '-t', NAME, 'history-limit', '50000',
+        ]);
+    });
+
+    it('carries -A and never destroy-unattached', () => {
+        const argv = buildAttachOrCreateArgv(NAME, '/home/user/proj');
+        expect(argv).toContain('-A');
+        expect(argv).not.toContain('destroy-unattached');
+    });
+
+    it('appends the shell command as its own argv element when given', () => {
+        expect(buildAttachOrCreateArgv(NAME, '/home/user/proj', '/bin/zsh').slice(0, 7)).toEqual([
+            'new-session', '-A', '-s', NAME, '-c', '/home/user/proj', '/bin/zsh',
+        ]);
+    });
+
+    it('honours a caller-supplied history limit', () => {
+        expect(buildAttachOrCreateArgv(NAME, '/home/user/proj', undefined, { historyLimit: 100000 }))
+            .toContain('100000');
+    });
+
+    it('needs no escaping — a hostile cwd is one inert argv element (no shell)', () => {
+        const hostile = `/tmp/pwn'; rm -rf $HOME'`;
+        const argv = buildAttachOrCreateArgv(NAME, hostile);
+        // Passed verbatim: no quotes added, no separators split. execve, not a shell.
+        expect(argv[argv.indexOf('-c') + 1]).toBe(hostile);
+    });
+});
+
+describe('sessionSlot', () => {
+    it('extracts the slot from one of THIS (host, workspace)\'s session names', () => {
+        expect(sessionSlot(sessionName('example.com', '/home/user/proj', 0), 'example.com', '/home/user/proj'))
+            .toBe(0);
+        expect(sessionSlot(sessionName('example.com', '/home/user/proj', 12), 'example.com', '/home/user/proj'))
+            .toBe(12);
+    });
+
+    it('rejects another workspace or host (hash mismatch), not a bare code- prefix', () => {
+        // Right shape, wrong workspace/host → not ours-this-workspace.
+        expect(sessionSlot(`code-${HASH_OTHER_WS}-0`, 'example.com', '/home/user/proj')).toBeUndefined();
+        expect(sessionSlot(`code-${HASH_OTHER_HOST}-0`, 'example.com', '/home/user/proj')).toBeUndefined();
+    });
+
+    it('rejects foreign and malformed names', () => {
+        for (const name of ['main', 'code', `code-${HASH_PROJ}`, `code-${HASH_PROJ}-x`, `code-${HASH_PROJ}-`]) {
+            expect(sessionSlot(name, 'example.com', '/home/user/proj')).toBeUndefined();
+        }
     });
 });
 

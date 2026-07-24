@@ -61,8 +61,31 @@ export function sessionName(hostKey: string, workspaceKey: string, slot: number)
     if (!Number.isInteger(slot) || slot < 0) {
         throw new Error(`tmux session slot must be a non-negative integer, got: ${slot}`);
     }
-    const hash = createHash('sha1').update(`${hostKey} ${workspaceKey}`).digest('hex').slice(0, HASH_LENGTH);
-    return `${SESSION_PREFIX}${hash}-${slot}`;
+    return `${SESSION_PREFIX}${workspaceHash(hostKey, workspaceKey)}-${slot}`;
+}
+
+/** The sha1-12 of `host + ' ' + workspacePath` embedded in every session name for
+ * a (host, workspace). Shared by `sessionName` (build) and `sessionSlot` (parse)
+ * so the two can never drift. */
+function workspaceHash(hostKey: string, workspaceKey: string): string {
+    return createHash('sha1').update(`${hostKey} ${workspaceKey}`).digest('hex').slice(0, HASH_LENGTH);
+}
+
+/**
+ * The slot encoded in `name` iff it is one of THIS (host, workspace)'s sessions —
+ * i.e. `name === sessionName(hostKey, workspaceKey, slot)`. Returns `undefined`
+ * for anything else: a different workspace/host's session (hash mismatch), a
+ * foreign session, or a malformed suffix. This maps a remote `list-sessions` row
+ * back to a local slot by matching the full `code-<hash>-` prefix — never a bare
+ * `code-`, so a sibling workspace on the same host can't collide with our slots.
+ */
+export function sessionSlot(name: string, hostKey: string, workspaceKey: string): number | undefined {
+    const prefix = `${SESSION_PREFIX}${workspaceHash(hostKey, workspaceKey)}-`;
+    if (!name.startsWith(prefix)) {
+        return undefined;
+    }
+    const suffix = name.slice(prefix.length);
+    return /^\d+$/.test(suffix) ? parseInt(suffix, 10) : undefined;
 }
 
 /**
@@ -111,6 +134,34 @@ export function buildAttachOrCreate(
         `set-option -t ${target} status off`,
         `set-option -t ${target} history-limit ${historyLimit}`,
     ].join(' \\; ');
+}
+
+/**
+ * The argv form of `buildAttachOrCreate` — the array a VS Code terminal profile
+ * carries as `shellArgs` (with `shellPath: 'tmux'`). The pty host hands argv to
+ * `execve` **directly, with no intervening shell**, so — unlike the shell-string
+ * builder — elements are NOT escaped and there is no injection surface: a hostile
+ * workspace path is simply one inert argv element. The tmux command separator is a
+ * bare `;` element (the shell form writes `\;` only to stop the shell from eating
+ * the `;`). Same per-session hardening/cosmetics as the shell form, kept in lockstep.
+ */
+export function buildAttachOrCreateArgv(
+    name: string,
+    cwd: string,
+    shell?: string,
+    opts: AttachOrCreateOptions = {},
+): string[] {
+    const historyLimit = opts.historyLimit ?? DEFAULT_HISTORY_LIMIT;
+    const create = ['new-session', '-A', '-s', name, '-c', cwd];
+    if (shell !== undefined) {
+        create.push(shell);
+    }
+    return [
+        ...create,
+        ';', 'set-window-option', '-t', name, 'remain-on-exit', 'off',
+        ';', 'set-option', '-t', name, 'status', 'off',
+        ';', 'set-option', '-t', name, 'history-limit', String(historyLimit),
+    ];
 }
 
 /**

@@ -69,3 +69,12 @@ export const window = {
         return new MockOutputChannel(channelName);
     },
 };
+
+/**
+ * Stand-in for `vscode.TerminalProfile` — a value the terminal provider constructs
+ * (`new vscode.TerminalProfile(options)`), so it must exist at runtime. It only
+ * needs to carry the options through for assertions; the real class does the same.
+ */
+export class TerminalProfile {
+    public constructor(public readonly options: unknown) {}
+}
