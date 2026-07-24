@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import { KILL_WORKSPACE_SESSIONS_COMMAND_ID } from '../src/commands';
+import { TMUX_PROFILE_TITLE } from '../src/extension';
 
 // Drift guard: package.json's `contributes` is hand-authored and easy to let go
 // stale (settings renamed/typo'd, a command's id changed in one place but not the
@@ -93,6 +94,12 @@ function registeredCommandIds(): Set<string> {
     return ids;
 }
 
+/** Concatenation of every `src/*.ts` file's contents, for simple substring/regex drift
+ * guards that don't care which file a match lives in. */
+function allSrcContents(): string {
+    return collectTsFiles(srcDir).map(file => fs.readFileSync(file, 'utf8')).join('\n');
+}
+
 describe('package.json manifest drift guard', () => {
     const pkg = readPackageJson();
     const contributes = pkg.contributes as JsonObject;
@@ -151,6 +158,63 @@ describe('package.json manifest drift guard', () => {
                 `These remote.SSH.tmux.* settings are mentioned in docs/ but missing from package.json configuration: ${missingSettings.join(', ')}`
             ).toEqual([]);
         });
+
+        // Reverse of the guard above: catches a setting shipped in package.json that nobody
+        // documented (the forward guard at :126 only catches docs promising a setting that
+        // doesn't exist; this one catches a setting existing that docs never mention).
+        it('every remote.SSH.tmux.* setting in package.json is mentioned in docs/', () => {
+            const docsDir = path.resolve(repoRoot, 'docs');
+            const allMarkdownFiles = collectAllMarkdownFiles(docsDir);
+            const docsContents = allMarkdownFiles.map(file => fs.readFileSync(file, 'utf8')).join('\n');
+
+            const tmuxSettingKeys = Object.keys(properties).filter(key => key.startsWith('remote.SSH.tmux.'));
+            expect(tmuxSettingKeys.length).toBeGreaterThan(0);
+
+            const undocumented = tmuxSettingKeys.filter(key => !docsContents.includes(key));
+
+            expect(
+                undocumented,
+                `These remote.SSH.tmux.* settings exist in package.json but are never mentioned in docs/: ${undocumented.join(', ')}`
+            ).toEqual([]);
+        });
+
+        // Would have caught the two dead tmux settings shipped in 1.0.0: declared in
+        // package.json but never read by any `config.get(...)` call in src/, so changing
+        // them from the Settings UI silently did nothing.
+        it('every remote.SSH.tmux.* setting in package.json is read by a config.get(...) call in src/', () => {
+            const tmuxSettingKeys = Object.keys(properties).filter(key => key.startsWith('remote.SSH.tmux.'));
+            expect(tmuxSettingKeys.length).toBeGreaterThan(0);
+
+            const srcContents = allSrcContents();
+            const unread = tmuxSettingKeys.filter(key => {
+                // `getConfiguration('remote.SSH')` sections off the `remote.SSH.` prefix, so
+                // the read call only needs to reference the `tmux.*` suffix (e.g. `tmux.enabled`).
+                const suffix = key.replace(/^remote\.SSH\./, '');
+                const readCall = new RegExp(`\\.get(?:<[^>]*>)?\\(\\s*['"]${suffix.replace(/\./g, '\\.')}['"]`);
+                return !readCall.test(srcContents);
+            });
+
+            expect(
+                unread,
+                `These remote.SSH.tmux.* settings are declared in package.json but never read via config.get(...) in src/: ${unread.join(', ')}`
+            ).toEqual([]);
+        });
+
+        // Would have caught a declared enum value (e.g. a new `'on'`/`'off'`/`'auto'` state)
+        // that the handling code in extension.ts never actually branches on.
+        it('every declared remote.SSH.tmux.enabled enum value is handled in src/extension.ts', () => {
+            const enabled = properties['remote.SSH.tmux.enabled'];
+            const enumValues = enabled.enum as string[];
+            expect(enumValues.length).toBeGreaterThan(0);
+
+            const extensionSrc = fs.readFileSync(path.resolve(srcDir, 'extension.ts'), 'utf8');
+            const unhandled = enumValues.filter(value => !extensionSrc.includes(`'${value}'`));
+
+            expect(
+                unhandled,
+                `These remote.SSH.tmux.enabled enum values are declared but never referenced in src/extension.ts: ${unhandled.join(', ')}`
+            ).toEqual([]);
+        });
     });
 
     describe('activation events', () => {
@@ -158,6 +222,35 @@ describe('package.json manifest drift guard', () => {
             const activationEvents = pkg.activationEvents as string[] | undefined;
             expect(activationEvents, 'activationEvents is missing').toBeDefined();
             expect(activationEvents!.some(e => e === 'onTerminalProfile:tmux')).toBe(true);
+        });
+
+        // `engines.vscode` (^1.70.2) predates VS Code's implicit-activation-events cutoff
+        // (~1.74), so every command that can actually be invoked before the extension is
+        // otherwise activated needs its own `onCommand:<id>` entry — pins the 06 fix
+        // (`onCommand:openremotessh.tmux.killWorkspaceSessions` was missing, breaking
+        // palette invocation pre-1.74). Commands hidden from the palette via a
+        // `"when": "false"` `menus.commandPalette` entry are view-only (context
+        // menu/inline icon) — they can't be reached until the view is visible, which
+        // already activates the extension via `onView:sshHosts`, so they're exempt.
+        it('every palette-invokable command has a matching onCommand activation event', () => {
+            const activationEvents = pkg.activationEvents as string[] | undefined;
+            expect(activationEvents, 'activationEvents is missing').toBeDefined();
+
+            const menus = contributes.menus as JsonObject | undefined;
+            const commandPaletteEntries = (menus?.commandPalette ?? []) as Array<{ command: string; when?: string }>;
+            const paletteExempt = new Set(
+                commandPaletteEntries.filter(e => e.when === 'false').map(e => e.command)
+            );
+
+            const missing = commands
+                .map(c => c.command)
+                .filter(id => !paletteExempt.has(id))
+                .filter(id => !activationEvents!.includes(`onCommand:${id}`));
+
+            expect(
+                missing,
+                `These palette-invokable commands have no matching onCommand:<id> activation event: ${missing.join(', ')}`
+            ).toEqual([]);
         });
     });
 
@@ -189,6 +282,18 @@ describe('package.json manifest drift guard', () => {
             expect(match, 'no registerTerminalProfileProvider(...) call found in src/extension.ts').not.toBeNull();
             const registeredId = match![1];
             expect(profiles.some(p => p.id === registeredId)).toBe(true);
+        });
+
+        // The default-profile reconcile (extension.ts) selects/clears the tmux profile by
+        // its *title* (`terminal.integrated.defaultProfile.linux` is a title, not an id) —
+        // would have caught the contributed title silently diverging from
+        // TMUX_PROFILE_TITLE, which would break that reconcile without any type error.
+        it('the contributed profile title matches TMUX_PROFILE_TITLE in src/extension.ts', () => {
+            const terminal = contributes.terminal as JsonObject;
+            const profiles = terminal.profiles as Array<{ id: string; title: string }>;
+            const tmuxProfile = profiles.find(p => p.id === 'tmux');
+            expect(tmuxProfile, 'no contributed profile with id "tmux"').toBeDefined();
+            expect(tmuxProfile!.title).toBe(TMUX_PROFILE_TITLE);
         });
     });
 
