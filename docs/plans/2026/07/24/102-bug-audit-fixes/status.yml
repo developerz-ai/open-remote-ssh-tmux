@@ -1,36 +1,110 @@
 plan: 102-bug-audit-fixes
 title: Full-codebase bug audit — fixes
-status: not_started
+status: complete
 created_by: sebi
-worked_by: ""
+worked_by: claude-task-master (43 tasks, sessions 1-43)
 owner: sebi
-percent: 0
+percent: 100
 current_focus: ""
 slices:
   - file: 01-tmux-invariants.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
+    prs: [PR11, PR12, PR13]
   - file: 02-wiring-and-settings.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
+    prs: [PR14]
   - file: 03-hostkey-verification.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
+    prs: [PR14]
   - file: 04-ssh-robustness.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
+    prs: [PR14, PR15]
   - file: 05-server-install.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
+    prs: [PR16, PR17]
   - file: 06-ui-and-common.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
+    prs: [PR18]
   - file: 07-missing-tests.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
+    prs: [PR19]
   - file: 08-verify.md
-    status: not_started
-    percent: 0
-evidence: []
-notes: "Findings pre-verified by 5 parallel audit agents (ssh core, server setup, tmux layer, UI/wiring, test coverage) on 2026-07-24; line refs are pre-fix."
+    status: complete
+    percent: 100
+    prs: [see this task's commit on branch chore/verify-gates-edh-08]
+evidence:
+  - date: 2026-07-24
+    task: 43
+    summary: >
+      All 6 automated gates re-run clean on main + this branch:
+      `npm test` 377/377, `npm run compile:src` (tsc -b clean),
+      `npm run lint` (eslint exit 0, only the pre-existing unrelated
+      `allowTemplateLiterals` deprecation notice), `npm run bundle`
+      (webpack production, 643 KiB extension.js), `npm run package`
+      (.vsix builds, 215 KB), `bash -n src/scripts/server-setup.sh` (OK).
+    real_tmux_empirical_pass: >
+      Beyond the gates, drove the COMPILED src/tmux/tmuxSession.ts builders
+      against a real, local tmux 3.4 server (isolated `-L` socket, no VS
+      Code involved — this environment has no VS Code desktop
+      binary/display, see docs/idea/ai-first.md) to get genuine
+      tmux-protocol evidence for the matrix rows a live attach would
+      exercise. This is real signal a mocked-exec unit suite structurally
+      cannot produce.
+    bug_found_and_fixed: >
+      Found a real, previously-shipped bug this way: the two `set-option`
+      calls in buildAttachOrCreateArgv (`status off`, `history-limit N`)
+      used a bare `-t =<name>` exact-match target, which silently fails
+      against real tmux (`set-option`'s `-t` is target-WINDOW syntax; bare
+      `=<name>` is not resolved as "exact session, default window" the way
+      it is for has-session/kill-session/set-window-option). Effect: the
+      tmux status bar stayed VISIBLE on every real terminal (a hard
+      Invisible-UX violation) and historyLimit silently never applied —
+      invisible to every prior unit test because they fake exec and never
+      touch real tmux. Fixed with `=<name>:` (trailing colon). TDD
+      red->green (test/tmux/tmuxSession.test.ts updated first, confirmed
+      RED, then src/tmux/tmuxSession.ts fixed, confirmed GREEN, full suite
+      377/377). Re-verified post-fix against real tmux:
+      status off / history-limit 1000 / remain-on-exit off all confirmed
+      applied on a real session via one real interactive `-A` pty attach
+      running the exact unmodified production argv chain end-to-end.
+    other_real_tmux_checks_passed:
+      - "attach-or-create against a real server: session created, correctly named, survives a second -A call (no duplicate)"
+      - "real #{pane_dead} corpse detection: shouldReap correctly flags a real dead-pane session"
+      - "real #{session_attached} flips 0->1 on an actual client attach (no-mirror guard's underlying signal)"
+      - "exact-match -t =<name> on has-session/kill-session verified against a deliberately colliding neighbour session name (no misfire)"
+      - "command -v tmux resolved absolute path spawns correctly (non-login-PATH installs, row 15)"
+    edh_matrix_rows:
+      status: partial — see note
+      note: >
+        Rows fundamentally about real tmux/SSH session mechanics (3, 4, 5,
+        6, 7, 10, 15 in part) got genuine empirical evidence per above,
+        including one real, previously-hidden bug found and fixed. Rows
+        that are inherently about VS Code's OWN UI (1, 2, 8, 9, 11, 12, 13,
+        14 — consent/mismatch dialogs, the "Persistent Shell" profile
+        picker, palette command registration, tree-view rendering, Windows
+        remote) could NOT be run: this agent environment has no VS Code
+        desktop binary/display (confirmed via `ps aux` — only a headless
+        vscodium-server, no code/codium desktop process, no
+        @vscode/test-electron wired up), and building a from-scratch E2E
+        Electron+SSH-remote harness was judged out of scope for this task.
+        This is the SAME standing limitation docs/idea/ai-first.md already
+        documented before this task; it is NOT newly discharged and is not
+        being falsely claimed as closed — see the updated ai-first.md gap
+        table for detail. A human (or an environment with a VS Code desktop
+        binary + display) still needs to run F5 and walk the full matrix in
+        docs/plans/2026/07/24/102-bug-audit-fixes/08-verify.md.
+    doc_updates: >
+      docs/idea/ai-first.md gap table + "Next steps" updated with the above
+      (honest partial status, not full discharge). docs/idea/roadmap.md
+      checked — it does not reference the F5/EDH gap (that documentation
+      lives in ai-first.md, not roadmap.md) — left unchanged rather than
+      adding an unrelated edit.
+notes: "Findings pre-verified by 5 parallel audit agents (ssh core, server setup, tmux layer, UI/wiring, test coverage) on 2026-07-24; line refs were pre-fix. All 8 slices' tasks (1-43) complete across PRs #11-#19 plus this task's own real-tmux-verification fix. See docs/idea/ai-first.md for the current, honest F5/EDH empirical-proof status (partial: real-tmux mechanics verified with a real bug found+fixed; VS Code GUI rows still blocked on no desktop/display in this environment)."
 last_updated: 2026-07-24

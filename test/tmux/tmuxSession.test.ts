@@ -120,13 +120,18 @@ describe('buildAttachOrCreateArgv', () => {
     const NAME = `code-${HASH_PROJ}-0`;
 
     it('emits attach-or-create argv with per-session hardening/cosmetics', () => {
-        // `-s` names the NEW session (exact by construction); the set-option/-window
-        // targets use the exact-match `=` prefix, in lockstep with the shell form.
+        // `-s` names the NEW session (exact by construction); `set-window-option`'s
+        // `-t` is target-session and accepts bare `=<name>`. `set-option`'s `-t` is
+        // target-WINDOW syntax (confirmed against real tmux 3.4): a bare `=<name>`
+        // there is NOT recognised as exact-match-session-default-window and fails
+        // silently with "no such session" — status/history-limit never applied
+        // (status bar leaked, a hard Invisible-UX violation). The trailing `:`
+        // (`=<name>:`) is required to get exact-match session + default window.
         expect(buildAttachOrCreateArgv(NAME, '/home/user/proj')).toEqual([
             'new-session', '-A', '-s', NAME, '-c', '/home/user/proj',
             ';', 'set-window-option', '-t', `=${NAME}`, 'remain-on-exit', 'off',
-            ';', 'set-option', '-t', `=${NAME}`, 'status', 'off',
-            ';', 'set-option', '-t', `=${NAME}`, 'history-limit', '50000',
+            ';', 'set-option', '-t', `=${NAME}:`, 'status', 'off',
+            ';', 'set-option', '-t', `=${NAME}:`, 'history-limit', '50000',
         ]);
     });
 
