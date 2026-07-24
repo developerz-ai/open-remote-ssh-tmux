@@ -34,26 +34,51 @@ describe('SSHDestination.parse', () => {
         expect(dest.port).toBe(2222);
     });
 
-    it('parses a bare IPv6 address (no brackets) as the hostname, last ":" wins as port separator', () => {
-        // Current behaviour: the implementation uses lastIndexOf(':'), so an
-        // unbracketed IPv6 literal gets split on its final colon group rather
-        // than treated as a whole hostname. Documenting actual behaviour, not
-        // wished-for IPv6-bracket support (there is none in the source).
+    it('parses a bare IPv6 address (no brackets) as the whole hostname, no port', () => {
+        // Multiple colons => bare IPv6 literal, not a "host:port" split.
         const dest = SSHDestination.parse('::1');
-        expect(dest.hostname).toBe(':');
-        expect(dest.port).toBe(1);
+        expect(dest.hostname).toBe('::1');
+        expect(dest.port).toBeUndefined();
     });
 
-    it('parses user@ipv6 with a trailing :port the same way (last colon = port)', () => {
-        const dest = SSHDestination.parse('alice@2001:db8::1:22');
-        expect(dest.user).toBe('alice');
-        expect(dest.hostname).toBe('2001:db8::1');
-        expect(dest.port).toBe(22);
+    it('parses user@<bare IPv6> keeping the address whole, no port', () => {
+        const dest = SSHDestination.parse('user@::1');
+        expect(dest.user).toBe('user');
+        expect(dest.hostname).toBe('::1');
+        expect(dest.port).toBeUndefined();
     });
 
-    it('treats a non-numeric trailing segment after ":" as NaN port', () => {
-        const dest = SSHDestination.parse('example.com:abc');
-        expect(Number.isNaN(dest.port)).toBe(true);
+    it('parses a link-local bare IPv6 address whole', () => {
+        const dest = SSHDestination.parse('fe80::1');
+        expect(dest.hostname).toBe('fe80::1');
+        expect(dest.port).toBeUndefined();
+    });
+
+    it('parses a bracketed IPv6 address with a port', () => {
+        const dest = SSHDestination.parse('[::1]:2222');
+        expect(dest.hostname).toBe('::1');
+        expect(dest.port).toBe(2222);
+    });
+
+    it('parses a bracketed IPv6 address without a port', () => {
+        const dest = SSHDestination.parse('[::1]');
+        expect(dest.hostname).toBe('::1');
+        expect(dest.port).toBeUndefined();
+    });
+
+    it('parses user@[bracketed IPv6]:port', () => {
+        const dest = SSHDestination.parse('user@[::1]:2222');
+        expect(dest.user).toBe('user');
+        expect(dest.hostname).toBe('::1');
+        expect(dest.port).toBe(2222);
+    });
+
+    it('a non-numeric trailing segment after ":" is not treated as a port', () => {
+        // Previously produced a NaN port; now the whole string is kept as
+        // the hostname since "abc" isn't a valid port suffix.
+        const dest = SSHDestination.parse('host:abc');
+        expect(dest.hostname).toBe('host:abc');
+        expect(dest.port).toBeUndefined();
     });
 });
 
@@ -81,6 +106,16 @@ describe('SSHDestination#toString', () => {
     it('round-trips parse -> toString for a full destination', () => {
         const original = 'alice@example.com:2222';
         expect(SSHDestination.parse(original).toString()).toBe(original);
+    });
+
+    it('brackets an IPv6 hostname so parse -> toString round-trips', () => {
+        const original = 'alice@[::1]:2222';
+        const dest = SSHDestination.parse(original);
+        expect(dest.toString()).toBe(original);
+        // and re-parsing the rendered string yields the same components
+        const reparsed = SSHDestination.parse(dest.toString());
+        expect(reparsed.hostname).toBe('::1');
+        expect(reparsed.port).toBe(2222);
     });
 });
 
@@ -114,5 +149,17 @@ describe('SSHDestination.toEncodedString / parseEncoded', () => {
         expect(dest.hostname).toBe('MyHost.example.com');
         expect(dest.user).toBe('Alice');
         expect(dest.port).toBe(2222);
+    });
+
+    it('parseEncoded rejects a hex payload that decodes to non-object JSON, falling back to parse()', () => {
+        // '31' is valid hex for the single byte 0x31 ('1'); Buffer-decoding
+        // and JSON.parse'ing it yields the number 1, not a { hostName } shape.
+        // Previously this produced a SSHDestination with an undefined
+        // hostname; it must now fall back to treating '31' as a plain
+        // destination string instead.
+        const dest = SSHDestination.parseEncoded('31');
+        expect(dest.hostname).toBe('31');
+        expect(dest.user).toBeUndefined();
+        expect(dest.port).toBeUndefined();
     });
 });

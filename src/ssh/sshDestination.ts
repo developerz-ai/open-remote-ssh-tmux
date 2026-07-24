@@ -13,21 +13,45 @@ export default class SSHDestination {
             user = dest.substring(0, atPos);
         }
 
-        let port: number | undefined;
-        const colonPos = dest.lastIndexOf(':');
-        if (colonPos !== -1) {
-            port = parseInt(dest.substring(colonPos + 1), 10);
+        const rest = dest.substring(atPos !== -1 ? atPos + 1 : 0);
+
+        // Bracketed literal, e.g. `[::1]` or `[::1]:2222` — the only
+        // unambiguous way to combine an IPv6 address (which itself contains
+        // colons) with a trailing port.
+        const bracketMatch = /^\[(.+)\](?::(\d+))?$/.exec(rest);
+        if (bracketMatch) {
+            const port = bracketMatch[2] !== undefined ? parseInt(bracketMatch[2], 10) : undefined;
+            return new SSHDestination(bracketMatch[1], user, port);
         }
 
-        const start = atPos !== -1 ? atPos + 1 : 0;
-        const end = colonPos !== -1 ? colonPos : dest.length;
-        const hostname = dest.substring(start, end);
+        // Unbracketed: only split on ":" when there is exactly one of them
+        // and the suffix is all digits. A bare IPv6 literal (`::1`,
+        // `fe80::1`) has more than one colon and must be kept whole instead
+        // of being mangled by a "last colon wins" split; a non-numeric
+        // suffix (`host:abc`) isn't a port either, so keep the whole string
+        // as the hostname rather than manufacturing a NaN port.
+        const colonPos = rest.indexOf(':');
+        const isSingleColon = colonPos !== -1 && rest.lastIndexOf(':') === colonPos;
+        if (isSingleColon) {
+            const suffix = rest.substring(colonPos + 1);
+            if (/^\d+$/.test(suffix)) {
+                return new SSHDestination(rest.substring(0, colonPos), user, parseInt(suffix, 10));
+            }
+        }
 
-        return new SSHDestination(hostname, user, port);
+        return new SSHDestination(rest, user, undefined);
     }
 
     toString(): string {
-        let result = this.hostname;
+        // Bracket an IPv6 hostname (contains ':') so re-parsing this string
+        // (e.g. via the encoded-authority round trip) can't misread it as
+        // `host:port` or mangle it on a bare "last colon" split.
+        let hostname = this.hostname;
+        if (hostname.includes(':')) {
+            hostname = `[${hostname}]`;
+        }
+
+        let result = hostname;
         if (this.user) {
             result = `${this.user}@` + result;
         }
@@ -41,8 +65,20 @@ export default class SSHDestination {
     // a remote session from the recently openend list the connection fails
     static parseEncoded(dest: string): SSHDestination {
         try {
-            const data = JSON.parse(Buffer.from(dest, 'hex').toString());
-            return new SSHDestination(data.hostName, data.user, data.port);
+            const data: unknown = JSON.parse(Buffer.from(dest, 'hex').toString());
+            // Hex-decoding an arbitrary string can "succeed" and still yield
+            // JSON that isn't the { hostName, user, port } shape we expect
+            // (e.g. the hex string '31' decodes to the JSON number `1`).
+            // Validate the shape instead of trusting it, otherwise we'd
+            // silently construct a destination with an undefined hostname.
+            if (
+                typeof data === 'object' &&
+                data !== null &&
+                typeof (data as { hostName?: unknown }).hostName === 'string'
+            ) {
+                const decoded = data as { hostName: string; user?: string; port?: number };
+                return new SSHDestination(decoded.hostName, decoded.user, decoded.port);
+            }
         } catch {
             // ignore
         }
