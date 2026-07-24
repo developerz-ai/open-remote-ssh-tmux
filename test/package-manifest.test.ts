@@ -122,4 +122,56 @@ describe('package.json manifest drift guard', () => {
 
         expect(missing, `command ids with no matching registerCommand(...) in src/: ${missing.join(', ')}`).toEqual([]);
     });
+
+    describe('fork identity', () => {
+        it('is named open-remote-ssh-tmux', () => {
+            expect(pkg.name).toBe('open-remote-ssh-tmux');
+        });
+
+        it('is published under the fork org, not upstream\'s jeanp413', () => {
+            expect(pkg.publisher).not.toBe('jeanp413');
+            expect(pkg.publisher).toBe('developerz-ai');
+        });
+
+        it('repository url points at the fork org, not upstream jeanp413/open-remote-ssh', () => {
+            const repository = pkg.repository as JsonObject;
+            expect(repository.url).toContain('developerz-ai/open-remote-ssh-tmux');
+            expect(repository.url).not.toContain('jeanp413/open-remote-ssh.git');
+        });
+    });
+});
+
+describe('README fork identity', () => {
+    const readme = fs.readFileSync(path.resolve(repoRoot, 'README.md'), 'utf8');
+
+    it('references the fork\'s own extension id', () => {
+        expect(readme).toContain('developerz-ai.open-remote-ssh-tmux');
+    });
+
+    it('does not tell users to allowlist upstream\'s jeanp413.open-remote-ssh id', () => {
+        expect(readme).not.toContain('jeanp413.open-remote-ssh"');
+        expect(readme).not.toContain('jeanp413.open-remote-ssh\'');
+    });
+});
+
+describe('CHANGELOG', () => {
+    it('has a first heading that parses as valid semver via get-changelog logic', () => {
+        const changelog = fs.readFileSync(path.resolve(repoRoot, 'CHANGELOG.md'), 'utf8');
+        const firstHeading = changelog.match(/^## (\d+\.\d+\.\d+)/m);
+        expect(firstHeading, 'CHANGELOG.md must start with a "## x.y.z" heading').not.toBeNull();
+
+        const version = firstHeading![1];
+        const versionRegex = new RegExp(`## ${version}([^#]|#(?!#))*(?=## |$)`, 's');
+        const match = changelog.match(versionRegex);
+        expect(match, `get-changelog regex found no section for ${version}`).not.toBeNull();
+
+        const notes = match![0].replace(/^## \d+\.\d+\.\d+\n/, '').trim();
+        expect(notes.length).toBeGreaterThan(0);
+    });
+
+    it('first heading is 1.0.0, the fork\'s rebrand release', () => {
+        const changelog = fs.readFileSync(path.resolve(repoRoot, 'CHANGELOG.md'), 'utf8');
+        const firstHeading = changelog.match(/^## (\d+\.\d+\.\d+)/m);
+        expect(firstHeading![1]).toBe('1.0.0');
+    });
 });
