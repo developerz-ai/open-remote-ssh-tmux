@@ -64,7 +64,27 @@ class MockWorkspaceConfiguration {
     }
 }
 
-export const workspace = {
+/**
+ * The subset of `vscode.Uri` the remote-location reader inspects (scheme /
+ * authority / path only). A test seeds these onto `workspace` to model the open
+ * workspace; production derives the remote host + path from them.
+ */
+export interface UriLike {
+    scheme: string;
+    authority: string;
+    path: string;
+}
+
+export const workspace: {
+    workspaceFile?: UriLike;
+    workspaceFolders?: { uri: UriLike }[];
+    getConfiguration(section?: string): MockWorkspaceConfiguration;
+} = {
+    // Undefined models "no workspace open"; a test overwrites these per case.
+    // (`workspaceFolders` is `undefined` with nothing open but an EMPTY ARRAY for
+    // an empty-folder workspace — the case that must not crash `activate()`.)
+    workspaceFile: undefined,
+    workspaceFolders: undefined,
     getConfiguration(section?: string): MockWorkspaceConfiguration {
         return new MockWorkspaceConfiguration(section);
     },
