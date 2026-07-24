@@ -176,6 +176,19 @@ export function buildKeyboardInteractiveFinish(promptCount: number, responses: s
     return { finishWith: padded, retriesExhausted: true };
 }
 
+/**
+ * Which SSHConnection instances `dispose()` must close. A ProxyJump chain
+ * connects hop[0] for real (TCP); each later hop, and the destination
+ * connection sitting on top of the chain, is layered on via a forwarded-out
+ * stream (`sock:` in the ssh2 config) — ending hop[0] tends to cascade down
+ * through those interrupted streams, but that's an implicit transport side
+ * effect, not something this resolver should rely on to close connections it
+ * created. Close every one of them explicitly instead of only hop[0].
+ */
+export function connectionsToClose(sshConnection: SSHConnection | undefined, proxyConnections: SSHConnection[]): SSHConnection[] {
+    return [sshConnection, ...proxyConnections].filter((connection): connection is SSHConnection => connection !== undefined);
+}
+
 export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode.Disposable {
 
     private proxyConnections: SSHConnection[] = [];
@@ -742,11 +755,10 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
 
     dispose() {
         disposeAll(this.tunnels);
-        // If there's proxy connections then just close the parent connection
-        if (this.proxyConnections.length) {
-            this.proxyConnections[0].close();
-        } else {
-            this.sshConnection?.close();
+        for (const connection of connectionsToClose(this.sshConnection, this.proxyConnections)) {
+            connection.close().catch((err) => {
+                this.logger.trace(`Error closing SSH connection during dispose: ${err instanceof Error ? err.message : String(err)}`);
+            });
         }
         this.proxyCommandProcess?.kill();
         this.labelFormatterDisposable?.dispose();

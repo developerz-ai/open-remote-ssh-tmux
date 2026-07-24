@@ -11,7 +11,7 @@ import { SocksConnectionInfo, createServer as createSocksServer } from 'simple-s
 export interface SSHConnectConfig extends ConnectConfig {
     /** Optional Unique ID attached to ssh connection. */
     uniqueId?: string;
-    /** Automatic retry to connect, after disconnect. Default true */
+    /** Automatic retry to connect, after disconnect. Default false */
     reconnect?: boolean;
     /** Number of reconnect retry, after disconnect. Default 10 */
     reconnectTries?: number;
@@ -188,6 +188,11 @@ export default class SSHConnection extends EventEmitter {
         return this.closeTunnel().then(() => {
             if (this.sshConnection) {
                 this.sshConnection.end();
+                // Without this, `__$connectPromise` still holds the settled (now
+                // stale/ended) promise and a later connect() would return it
+                // straight from cache instead of actually reconnecting.
+                this.sshConnection = null;
+                this.__$connectPromise = null;
                 this.emit(SSHConstants.CHANNEL.SSH, SSHConstants.STATUS.DISCONNECT);
             }
         });
@@ -198,11 +203,17 @@ export default class SSHConnection extends EventEmitter {
      */
     connect(c?: SSHConnectConfig): Promise<SSHConnection> {
         this.config = Object.assign(this.config, c);
-        ++this.__retries;
 
         if (this.__$connectPromise) {
             return this.__$connectPromise;
         }
+
+        // Only count real connection attempts. Every call that hits the cache
+        // above (shell()/exec()/tunnel handlers all call connect() whenever they
+        // need the connection) must not inflate `__retries` — the 'close'
+        // handler's `__retries <= reconnectTries` gate below would otherwise be
+        // exhausted before a single real (re)connect attempt failed.
+        ++this.__retries;
 
         this.__$connectPromise = new Promise((resolve, reject) => {
             this.emit(SSHConstants.CHANNEL.SSH, SSHConstants.STATUS.BEFORECONNECT);
@@ -221,12 +232,11 @@ export default class SSHConnection extends EventEmitter {
 
             //Start ssh server connection
             this.sshConnection = new Client();
-            this.sshConnection.on('ready', (err: Error & ClientErrorExtensions) => {
-                if (err) {
-                    this.emit(SSHConstants.CHANNEL.SSH, SSHConstants.STATUS.DISCONNECT, { err: err });
-                    this.__$connectPromise = null;
-                    return reject(err);
-                }
+            // ssh2's `Client` never passes an error to 'ready' — a connection
+            // failure only ever surfaces via 'error'/'close' below. The `err`
+            // parameter/branch here was dead code (this class's ssh2-promise
+            // origin predates the current ssh2 API).
+            this.sshConnection.on('ready', () => {
                 this.emit(SSHConstants.CHANNEL.SSH, SSHConstants.STATUS.CONNECT);
                 this.__retries = 0;
                 this.__err = null;
