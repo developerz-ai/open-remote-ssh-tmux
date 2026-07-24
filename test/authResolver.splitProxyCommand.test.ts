@@ -48,4 +48,37 @@ describe('splitProxyCommand', () => {
         expect(result).toEqual(input);
         expect(result).not.toBe(input); // .slice() copy, not the same reference
     });
+
+    it('splits on tabs the same as spaces', () => {
+        expect(splitProxyCommand('ssh\t-W\t%h:%p\tbastion')).toEqual(['ssh', '-W', '%h:%p', 'bastion']);
+    });
+
+    it('collapses mixed runs of tabs and spaces between tokens', () => {
+        expect(splitProxyCommand('ssh \t -W\t\t%h:%p')).toEqual(['ssh', '-W', '%h:%p']);
+    });
+
+    it('an unterminated quote absorbs the rest of the input as one token, including embedded whitespace', () => {
+        // No closing '"': `quoted` never flips back off, so the remainder — tabs,
+        // spaces and all — is folded into a single trailing token instead of being
+        // split on whitespace. Matches OpenSSH's own tokenizer, which likewise
+        // treats an unterminated quote as extending to end-of-string rather than
+        // erroring.
+        expect(splitProxyCommand('ssh "bastion one two')).toEqual(['ssh', 'bastion one two']);
+    });
+
+    it('an unterminated quote opened mid-token still yields a single joined token', () => {
+        expect(splitProxyCommand('foo"bar baz')).toEqual(['foobar baz']);
+    });
+
+    it('a trailing lone backslash (nothing left to escape) is kept as a literal backslash', () => {
+        // The escape branch only fires when there's a next character to consume
+        // (`i + 1 < value.length`); a backslash as the very last byte falls through
+        // to the default case and is appended to the current token as-is, rather
+        // than being silently dropped or throwing.
+        expect(splitProxyCommand('ssh bastion\\')).toEqual(['ssh', 'bastion\\']);
+    });
+
+    it('a trailing lone backslash as the entire input yields a single-backslash token', () => {
+        expect(splitProxyCommand('\\')).toEqual(['\\']);
+    });
 });

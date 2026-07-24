@@ -38,8 +38,63 @@ describe('getVSCodeServerConfig', () => {
     });
 
     it('derives version from vscode.version, stripping the -insider suffix', async () => {
-        const config = await getVSCodeServerConfig(logger);
+        // The shared mock's `version` export is a plain '1.70.2' with no '-insider'
+        // suffix, so asserting config.version === '1.70.2' against it passes whether
+        // or not `.replace('-insider', '')` actually runs — it's a false green. Force
+        // a genuine '-insider' input by remocking 'vscode' for this test only, and
+        // `vi.resetModules()` so `serverConfig` (and the 'vscode' it imports) are
+        // reloaded fresh rather than reusing the module-level product.json cache or
+        // the already-imported mock instance from the top of this file.
+        vi.resetModules();
+        vi.doMock('vscode', async () => {
+            const actual = await vi.importActual<typeof import('./mocks/vscode')>('./mocks/vscode');
+            return { ...actual, version: '1.70.2-insider' };
+        });
+
+        const freshVscode = await import('vscode') as typeof import('./mocks/vscode');
+        freshVscode.env.appRoot = appRoot;
+        const { getVSCodeServerConfig: freshGetConfig } = await import('../src/serverConfig');
+
+        const config = await freshGetConfig(logger);
         expect(config.version).toBe('1.70.2');
+
+        vi.doUnmock('vscode');
+    });
+
+    it('reaches the "force" serverValidation branch and the missing-serverDownloadUrlTemplate branch on a genuinely fresh module (not the cached product.json)', async () => {
+        // `getVSCodeServerConfig` caches `product.json` in a module-level variable
+        // after the first read (see file-level note above). Every test in this file
+        // shares the same beforeEach fixture, so a naive test that sets a different
+        // config override still reads the *first* test's cached product.json —
+        // it never actually proves the fresh-read path handles a differently-shaped
+        // product.json (e.g. no serverDownloadUrlTemplate field at all). Force a real
+        // fresh read via vi.resetModules() + a dedicated appRoot/product.json.
+        vi.resetModules();
+
+        const freshAppRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'server-config-test-fresh-'));
+        try {
+            await fs.promises.writeFile(path.join(freshAppRoot, 'product.json'), JSON.stringify({
+                commit: 'def456',
+                quality: 'insider',
+                // release intentionally omitted -> exercises the `|| ''` fallback too.
+                serverApplicationName: 'code-server-oss',
+                serverDataFolderName: '.vscode-server-oss',
+                // serverDownloadUrlTemplate intentionally omitted.
+            }));
+
+            const freshVscode = await import('vscode') as typeof import('./mocks/vscode');
+            freshVscode.env.appRoot = freshAppRoot;
+            freshVscode.configOverrides.set('remote.SSH.serverValidation', 'force');
+
+            const { getVSCodeServerConfig: freshGetConfig } = await import('../src/serverConfig');
+            const config = await freshGetConfig(logger);
+
+            expect(config.serverValidation).toBe('force');
+            expect(config.release).toBe('');
+            expect(config.serverDownloadUrlTemplate).toBeUndefined();
+        } finally {
+            await fs.promises.rm(freshAppRoot, { recursive: true, force: true });
+        }
     });
 
     it('reads commit/quality/release straight from product.json', async () => {
