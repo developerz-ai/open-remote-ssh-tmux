@@ -506,7 +506,6 @@
 	],
 	"api": "none",
 	"enabledApiProposals": [
-		"contribTerminalProfiles",
 		"contribViewsRemote",
 		"resolvers"
 	],
