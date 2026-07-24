@@ -43,9 +43,13 @@ print_install_results_and_exit() {
   exit 0
 }
 
-LOCKFILE="$TMP_DIR/server_install.lock"
+# Per-user lock (inside $SERVER_DATA_DIR, not the world-writable $TMP_DIR) so
+# another local user can't block/DoS this install by pre-creating a shared
+# lock file path they own.
+LOCKFILE="$SERVER_DATA_DIR/.server_install.lock"
 
 if command -v flock >/dev/null 2>&1; then
+  mkdir -p -- "$SERVER_DATA_DIR"
   exec {FD}<>"$LOCKFILE"
   # wait 30s to acquire lock, otherwise fail
   flock -x -w 30 $FD || print_install_results_and_exit 1
@@ -124,8 +128,8 @@ if [[ -z $OS_RELEASE_ID ]]; then
 fi
 
 # Create installation folder
-if [[ ! -d $SERVER_DIR ]]; then
-  mkdir -p $SERVER_DIR
+if [[ ! -d "$SERVER_DIR" ]]; then
+  mkdir -p -- "$SERVER_DIR"
   if (( $? > 0 )); then
     echo "Error creating server install directory"
     print_install_results_and_exit 1
@@ -140,7 +144,7 @@ fi
 SERVER_DOWNLOAD_URL="$(echo "%%SERVER_DOWNLOAD_URL_TEMPLATE%%" | sed "s/\${quality}/$DISTRO_QUALITY/g" | sed "s/\${version}/$DISTRO_VERSION/g" | sed "s/\${commit}/$DISTRO_COMMIT/g" | sed "s/\${os}/$PLATFORM/g" | sed "s/\${arch}/$SERVER_ARCH/g" | sed "s/\${release}/$DISTRO_VSCODIUM_RELEASE/g")"
 
 # Check if server script is already installed
-if [[ ! -f $SERVER_SCRIPT ]]; then
+if [[ ! -f "$SERVER_SCRIPT" ]]; then
   case "$PLATFORM" in
     darwin | linux | alpine | freebsd )
       ;;
@@ -150,14 +154,14 @@ if [[ ! -f $SERVER_SCRIPT ]]; then
       ;;
   esac
 
-  pushd $SERVER_DIR > /dev/null
+  pushd "$SERVER_DIR" >/dev/null || print_install_results_and_exit 1
 
   if command -v wget >/dev/null 2>&1; then
-    wget --tries=3 --timeout=10 --continue --no-verbose -O vscode-server.tar.gz $SERVER_DOWNLOAD_URL
+    wget --tries=3 --timeout=10 --continue --no-verbose -O vscode-server.tar.gz -- "$SERVER_DOWNLOAD_URL"
   elif command -v curl >/dev/null 2>&1; then
-    curl --retry 3 --connect-timeout 10 --location --show-error --silent --output vscode-server.tar.gz $SERVER_DOWNLOAD_URL
+    curl --fail --retry 3 --connect-timeout 10 --location --show-error --silent --output vscode-server.tar.gz -- "$SERVER_DOWNLOAD_URL"
   elif command -v fetch >/dev/null 2>&1; then
-    fetch --retry --timeout=10 --quiet --output=vscode-server.tar.gz $SERVER_DOWNLOAD_URL
+    fetch --retry --timeout=10 --quiet --output=vscode-server.tar.gz -- "$SERVER_DOWNLOAD_URL"
   else
     echo "Error no tool to download server binary"
     print_install_results_and_exit 1
@@ -165,26 +169,26 @@ if [[ ! -f $SERVER_SCRIPT ]]; then
 
   if (( $? > 0 )); then
     echo "Error downloading server from $SERVER_DOWNLOAD_URL"
-    rm -rf vscode-server.tar.gz
+    rm -f -- vscode-server.tar.gz
     print_install_results_and_exit 1
   fi
 
   tar -xf vscode-server.tar.gz --strip-components 1
   if (( $? > 0 )); then
     echo "Error while extracting server contents"
-    rm -rf vscode-server.tar.gz
+    rm -f -- vscode-server.tar.gz
     print_install_results_and_exit 1
   fi
 
-  if [[ ! -f $SERVER_SCRIPT ]]; then
-    rm -rf $SERVER_DIR/*
+  if [[ ! -f "$SERVER_SCRIPT" ]]; then
+    rm -rf -- "${SERVER_DIR:?}"/*
     echo "Error server contents are corrupted"
     print_install_results_and_exit 1
   fi
 
-  rm -f vscode-server.tar.gz
+  rm -f -- vscode-server.tar.gz
 
-  popd > /dev/null
+  popd >/dev/null || true
 else
   echo "Server script already installed in $SERVER_SCRIPT"
 fi
@@ -193,49 +197,71 @@ fi
 if %%MODIFY_PRODUCT_JSON%%; then
   if command -v sed >/dev/null 2>&1; then
     echo "Will modify product.json on remote to match the commit value"
-    sed -i -E 's/"commit": "[0-9a-f]+",/"commit": "'"$DISTRO_COMMIT"'",/' "$SERVER_DIR/product.json";
+    # `sed -i -E` is GNU-only: BSD/macOS sed treats the arg after `-i` as a
+    # mandatory backup-suffix, so `-E` is swallowed as the suffix and the
+    # regex flag is lost (or the whole invocation errors out) — this made
+    # `serverValidation: 'force'` silently no-op on macOS remotes. Portable
+    # form: write to a temp file, then `mv` it into place.
+    PRODUCT_JSON="$SERVER_DIR/product.json"
+    PRODUCT_JSON_TMP="$PRODUCT_JSON.tmp"
+    if sed -E 's/"commit": "[0-9a-f]+",/"commit": "'"$DISTRO_COMMIT"'",/' "$PRODUCT_JSON" > "$PRODUCT_JSON_TMP"; then
+      mv -- "$PRODUCT_JSON_TMP" "$PRODUCT_JSON"
+    else
+      echo "Error modifying product.json"
+      rm -f -- "$PRODUCT_JSON_TMP"
+    fi
   else
     echo "Cannot find the 'sed' command, make sure it is installed to modify product.json with the matching commit."
   fi
 fi
 
 # Try to find if server is already running
-if [[ -f $SERVER_PIDFILE ]]; then
-  SERVER_PID="$(cat $SERVER_PIDFILE)"
-  SERVER_RUNNING_PROCESS="$(ps -o pid,args -p $SERVER_PID | grep $SERVER_SCRIPT)"
+if [[ -f "$SERVER_PIDFILE" ]]; then
+  SERVER_PID="$(cat "$SERVER_PIDFILE")"
+  if [[ $SERVER_PID =~ ^[0-9]+$ ]]; then
+    SERVER_RUNNING_PROCESS="$(ps -o pid,args -p "$SERVER_PID" | grep "$SERVER_SCRIPT")"
+  else
+    # Garbage/empty pid file: `ps -p` on a non-numeric argument is undefined
+    # across ps implementations and must not be trusted to mean "not
+    # running" — that false negative would spawn a duplicate server and
+    # delete the token file out from under the still-live instance. Fall
+    # back to the full-scan the else-branch below already uses.
+    echo "Warning: pid file contains invalid data, falling back to full process scan"
+    SERVER_RUNNING_PROCESS="$(ps -o pid,args -A | grep "$SERVER_SCRIPT" | grep -v grep)"
+  fi
 else
-  SERVER_RUNNING_PROCESS="$(ps -o pid,args -A | grep $SERVER_SCRIPT | grep -v grep)"
+  SERVER_RUNNING_PROCESS="$(ps -o pid,args -A | grep "$SERVER_SCRIPT" | grep -v grep)"
 fi
 
 if [[ -z $SERVER_RUNNING_PROCESS ]]; then
-  if [[ -f $SERVER_LOGFILE ]]; then
-    rm $SERVER_LOGFILE
+  if [[ -f "$SERVER_LOGFILE" ]]; then
+    rm -- "$SERVER_LOGFILE"
   fi
-  if [[ -f $SERVER_TOKENFILE ]]; then
-    rm $SERVER_TOKENFILE
+  if [[ -f "$SERVER_TOKENFILE" ]]; then
+    rm -- "$SERVER_TOKENFILE"
   fi
 
-  touch $SERVER_TOKENFILE
-  chmod 600 $SERVER_TOKENFILE
+  touch -- "$SERVER_TOKENFILE"
+  chmod 600 -- "$SERVER_TOKENFILE"
   SERVER_CONNECTION_TOKEN="%%SERVER_CONNECTION_TOKEN%%"
-  echo $SERVER_CONNECTION_TOKEN > $SERVER_TOKENFILE
+  echo "$SERVER_CONNECTION_TOKEN" > "$SERVER_TOKENFILE"
 
-  $SERVER_SCRIPT --start-server --host=127.0.0.1 $SERVER_LISTEN_FLAG $SERVER_DATA_DIR_FLAG $SERVER_VALIDATION_FLAG $SERVER_INITIAL_EXTENSIONS --connection-token-file $SERVER_TOKENFILE --telemetry-level off --enable-remote-auto-shutdown --accept-server-license-terms &> $SERVER_LOGFILE &
-  echo $! > $SERVER_PIDFILE
+  "$SERVER_SCRIPT" --start-server --host=127.0.0.1 $SERVER_LISTEN_FLAG $SERVER_DATA_DIR_FLAG $SERVER_VALIDATION_FLAG $SERVER_INITIAL_EXTENSIONS --connection-token-file "$SERVER_TOKENFILE" --telemetry-level off --enable-remote-auto-shutdown --accept-server-license-terms &> "$SERVER_LOGFILE" &
+  echo $! > "$SERVER_PIDFILE"
 else
   echo "Server script is already running $SERVER_SCRIPT"
 fi
 
-if [[ -f $SERVER_TOKENFILE ]]; then
-  SERVER_CONNECTION_TOKEN="$(cat $SERVER_TOKENFILE)"
+if [[ -f "$SERVER_TOKENFILE" ]]; then
+  SERVER_CONNECTION_TOKEN="$(cat "$SERVER_TOKENFILE")"
 else
   echo "Error server token file not found $SERVER_TOKENFILE"
   print_install_results_and_exit 1
 fi
 
-if [[ -f $SERVER_LOGFILE ]]; then
+if [[ -f "$SERVER_LOGFILE" ]]; then
   for i in {1..35}; do
-    LISTENING_ON="$(cat $SERVER_LOGFILE | grep -E 'Extension host agent listening on .+' | sed 's/Extension host agent listening on //')"
+    LISTENING_ON="$(cat "$SERVER_LOGFILE" | grep -E 'Extension host agent listening on .+' | sed 's/Extension host agent listening on //')"
     if [[ -n $LISTENING_ON ]]; then
       break
     fi
