@@ -159,7 +159,7 @@ export async function installCodeServer(
 
     const scriptId = crypto.randomBytes(12).toString('hex');
 
-    const vscodeServerConfig = await getVSCodeServerConfig();
+    const vscodeServerConfig = await getVSCodeServerConfig(logger);
 
     // Get the version and release
     const serverDownloadUrlTemplateFinal = serverDownloadUrlTemplate || vscodeServerConfig.serverDownloadUrlTemplate || DEFAULT_DOWNLOAD_URL_TEMPLATE;
