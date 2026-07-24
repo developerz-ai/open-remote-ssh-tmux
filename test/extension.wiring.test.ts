@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { decideDefaultProfile, decideTmuxWiring, idempotentResolveHandler, lazyExec, readTmuxSettings, reconcileDefaultTerminalProfile, TMUX_PROFILE_TITLE } from '../src/extension';
+import { decideDefaultProfile, decideTmuxWiring, deriveTmuxSessionContext, idempotentResolveHandler, lazyExec, readTmuxSettings, reconcileDefaultTerminalProfile, TMUX_PROFILE_TITLE } from '../src/extension';
 import type { RemoteSSHResolver } from '../src/authResolver';
 import type Log from '../src/common/logger';
 import { ConfigurationTarget, configOverrides, inspectOverrides, updateCalls } from './mocks/vscode';
@@ -175,6 +175,63 @@ describe('decideDefaultProfile: workspace default-profile write vs. user scopes'
 
     it('not wiring + a global value (not ours to clean) → none', () => {
         expect(decideDefaultProfile({ globalValue: TMUX_PROFILE_TITLE }, false)).toBe('none');
+    });
+});
+
+// `currentTmuxSessionContext` keyed the session hash off `vscode.env.remoteName`, which is
+// the remote *type* ('ssh-remote') and identical for every SSH host — so tmuxSession.ts's
+// host+workspace identity collapsed to workspace-only, and the cwd fell back to a fabricated
+// literal `/home/user`. `deriveTmuxSessionContext` is the pure seam: it decodes the real host
+// from the `ssh-remote+<encoded-dest>` authority the resolver put on the workspace-folder URI
+// (SSHDestination.parseEncoded, exactly as getRemoteWorkspaceLocationData does), and keys the
+// cwd to the real folder path — no fabrication.
+describe('deriveTmuxSessionContext: (host, workspace) parsed from the resolved authority', () => {
+    /** Build the `ssh-remote+<hex-json>` authority VS Code carries for a resolved host. */
+    function remoteFolder(hostName: string, path: string, user = 'me', port = 22) {
+        const encoded = Buffer.from(JSON.stringify({ hostName, user, port })).toString('hex');
+        return { scheme: 'vscode-remote', authority: `ssh-remote+${encoded}`, path };
+    }
+
+    it('parses the real hostname from the authority, never the literal "ssh-remote" type', () => {
+        const ctx = deriveTmuxSessionContext(remoteFolder('prod.example.com', '/home/deploy/app'));
+        expect(ctx).toEqual({ hostKey: 'prod.example.com', workspaceKey: '/home/deploy/app' });
+        expect(ctx?.hostKey).not.toBe('ssh-remote'); // the bug this fixes
+    });
+
+    it('decodes an \\x-escaped (uppercase-preserving) authority form too', () => {
+        // SSHDestination.toEncodedString() escapes uppercase as \xHH (M=0x4d, H=0x48);
+        // parseEncoded reverses it, so we must not naively read the authority verbatim.
+        const ctx = deriveTmuxSessionContext({ scheme: 'vscode-remote', authority: 'ssh-remote+\\x4dy\\x48ost', path: '/w' });
+        expect(ctx?.hostKey).toBe('MyHost');
+    });
+
+    it('keys workspaceKey to the folder path (the tmux -c cwd), never a fabricated /home/user', () => {
+        const ctx = deriveTmuxSessionContext(remoteFolder('h', '/srv/project'));
+        expect(ctx?.workspaceKey).toBe('/srv/project');
+    });
+
+    it('gives two hosts sharing a workspace path distinct identities (host is part of the key)', () => {
+        const a = deriveTmuxSessionContext(remoteFolder('host-a', '/home/me/app'));
+        const b = deriveTmuxSessionContext(remoteFolder('host-b', '/home/me/app'));
+        expect(a?.hostKey).toBe('host-a');
+        expect(b?.hostKey).toBe('host-b');
+        expect(a?.hostKey).not.toBe(b?.hostKey);
+    });
+
+    it('returns undefined with no workspace folder (empty window — nothing to key, nothing fabricated)', () => {
+        expect(deriveTmuxSessionContext(undefined)).toBeUndefined();
+    });
+
+    it('returns undefined for a non-remote (local) folder', () => {
+        expect(deriveTmuxSessionContext({ scheme: 'file', authority: '', path: '/local' })).toBeUndefined();
+    });
+
+    it('returns undefined for a different remote type (not ssh-remote, e.g. WSL)', () => {
+        expect(deriveTmuxSessionContext({ scheme: 'vscode-remote', authority: 'wsl+Ubuntu', path: '/w' })).toBeUndefined();
+    });
+
+    it('returns undefined for an empty/undecodable host (ssh-remote+ with nothing after)', () => {
+        expect(deriveTmuxSessionContext({ scheme: 'vscode-remote', authority: 'ssh-remote+', path: '/w' })).toBeUndefined();
     });
 });
 

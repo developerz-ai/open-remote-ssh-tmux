@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import Log from './common/logger';
 import { RemoteSSHResolver, REMOTE_SSH_AUTHORITY } from './authResolver';
+import SSHDestination from './ssh/sshDestination';
 import { KILL_WORKSPACE_SESSIONS_COMMAND_ID, killWorkspaceSessions, openSSHConfigFile, promptOpenRemoteSSHWindow, type WorkspaceKillTarget } from './commands';
 import { HostTreeDataProvider } from './hostTreeView';
 import { getRemoteWorkspaceLocationData, RemoteLocationHistory } from './remoteLocationHistory';
@@ -93,8 +94,10 @@ function wireTmuxTerminalLayer(
         // currentTmuxSessionContext() so both name this workspace's sessions identically.
         const sessionContext = currentTmuxSessionContext();
         if (!sessionContext) {
-            // Not on a remote; shouldn't happen since this is called from the resolve callback.
-            // Still reconcile the default toward cleanup — we are not wiring the layer here.
+            // No resolved remote SSH workspace folder to key sessions to (an empty remote
+            // window, or a non-ssh-remote folder) — there is no stable host+workspace
+            // identity, so wire nothing rather than fabricate one. Still reconcile the
+            // default toward cleanup, since we are not wiring the layer here.
             reconcileDefaultTerminalProfile(logger, false);
             return;
         }
@@ -390,27 +393,62 @@ export function reconcileDefaultTerminalProfile(logger: Log, wiring: boolean): v
         );
 }
 
+/** The minimal slice of a `vscode.Uri` {@link deriveTmuxSessionContext} reads — the
+ * workspace folder's scheme, resolved authority, and remote path. `vscode.Uri` is
+ * structurally assignable, so the wrapper passes one straight through. */
+export interface RemoteFolderUri {
+    readonly scheme: string;
+    readonly authority: string;
+    readonly path: string;
+}
+
 /**
- * The (host, workspace) identity tmux session names are keyed to, derived from the
- * resolved remote authority (`vscode.env.remoteName`) and the open workspace folder.
- * `undefined` when not on a remote. Shared by the terminal-layer wiring and the kill
- * command so both name this workspace's sessions identically.
+ * The (host, workspace) identity tmux session names are keyed to, parsed from a
+ * resolved remote workspace-folder URI. Pure + exported so the parse is unit-tested
+ * without the VS Code workspace surface.
+ *
+ * The host is decoded from the `ssh-remote+<encoded-dest>` authority the resolver put
+ * on the folder URI (`SSHDestination.parseEncoded`, exactly as
+ * `getRemoteWorkspaceLocationData` does) — NOT from `vscode.env.remoteName`, which is
+ * the remote *type* (always `'ssh-remote'`) and identical for every SSH host: keying
+ * the session hash on it collapses `tmuxSession.ts`'s host+workspace identity to
+ * workspace-only. `workspaceKey` is the real remote folder path, which the caller also
+ * uses as the `tmux new-session -c` cwd — so there is no fabricated `/home/user`
+ * fallback: a non-remote / non-`ssh-remote` folder, or an empty window with no folder,
+ * yields `undefined` (wire nothing) rather than a made-up path.
  */
-function currentTmuxSessionContext(): { hostKey: string; workspaceKey: string } | undefined {
-    const authority = vscode.env.remoteName; // e.g. "example.com" (without the "ssh-remote+" prefix)
-    if (!authority) {
+export function deriveTmuxSessionContext(folder: RemoteFolderUri | undefined): { hostKey: string; workspaceKey: string } | undefined {
+    if (!folder || folder.scheme !== 'vscode-remote') {
         return undefined;
     }
-    const workspaceKey = vscode.workspace.workspaceFolders?.[0]?.uri.path || '/home/user';
-    return { hostKey: authority, workspaceKey };
+    const prefix = `${REMOTE_SSH_AUTHORITY}+`;
+    if (!folder.authority.startsWith(prefix)) {
+        return undefined; // a different remote type (WSL, dev container, …) — not ours
+    }
+    const hostKey = SSHDestination.parseEncoded(folder.authority.slice(prefix.length)).hostname;
+    if (!hostKey) {
+        return undefined; // undecodable/empty host — can't form a stable identity
+    }
+    return { hostKey, workspaceKey: folder.path };
+}
+
+/**
+ * Live (host, workspace) identity for the current window — the vscode-reading wrapper
+ * over {@link deriveTmuxSessionContext}, using the first workspace folder's URI.
+ * `undefined` when there is no resolved remote SSH workspace folder (a local window, an
+ * empty remote window, or a non-`ssh-remote` folder). Shared by the terminal-layer
+ * wiring and the kill command so both name this workspace's sessions identically.
+ */
+function currentTmuxSessionContext(): { hostKey: string; workspaceKey: string } | undefined {
+    return deriveTmuxSessionContext(vscode.workspace.workspaceFolders?.[0]?.uri);
 }
 
 /**
  * Build the kill command's target from live resolver state: the current SSH
  * connection's `exec` wrapped in a fresh {@link SessionReaper}, plus the
- * (host, workspace) identity. Returns `undefined` when there is no connection or we
- * are not on a remote, so the command no-ops safely instead of throwing. Wiring
- * only — the reaper owns all tmux/session logic.
+ * (host, workspace) identity. Returns `undefined` when there is no connection or no
+ * resolved remote SSH workspace folder, so the command no-ops safely instead of
+ * throwing. Wiring only — the reaper owns all tmux/session logic.
  */
 function resolveKillTarget(resolver: RemoteSSHResolver, logger: Log): WorkspaceKillTarget | undefined {
     const sshConnection = resolver.getSSHConnection();
