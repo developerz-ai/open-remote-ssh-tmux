@@ -1,8 +1,71 @@
-# Open Remote - SSH
+# Open Remote - SSH (tmux)
+
+A VS Code / VSCodium extension that connects to a remote dev machine over
+SSH — **identical to [open-remote-ssh](https://github.com/jeanp413/open-remote-ssh)
+in look and feel** — with one under-the-hood upgrade: **remote terminals are
+backed by [tmux](https://github.com/tmux/tmux)**, so they persist and can be
+re-attached from any machine.
 
 ![Open Remote SSH](https://raw.githubusercontent.com/jeanp413/open-remote-ssh/master/docs/images/open-remote-ssh.gif)
 
+## Why
+
+You work across a PC, a laptop, and a VPS that's the actual dev environment.
+Close the PC, open the laptop, and land back in the **same terminals** — same
+scrollback, same running processes (a long `Claude Code` task, a build, a
+migration) — regardless of which client connected last or whether the network
+dropped in between.
+
+With stock open-remote-ssh, a remote terminal's lifetime is coupled to the
+client/session that opened it: closing the window, switching machines, or a
+vscode-server restart can take a running task down with it. This fork moves
+that lifetime into a **tmux server on the remote** — a process no client
+owns — so terminals and the work inside them outlive any one connection.
+
+**Scope is terminals only.** Editing, file changes, saving, extensions, and
+port forwarding already reconnect fine (the vscode-server persists) — this
+fork doesn't touch that path. It's invisible: no tmux commands, no tmux UI,
+same connect flow as open-remote-ssh. See
+[`docs/idea/why.md`](docs/idea/why.md) for the full motivation and
+[`docs/idea/persistence-model.md`](docs/idea/persistence-model.md) for the
+honest technical picture (below).
+
+## Requirements
+
+- **Remote host:** tmux **≥ 2.6** for tmux-backed persistent terminals on
+  Unix-like remotes (Linux, macOS). Detected automatically on connect — if
+  tmux is missing or too old, the extension logs why and falls back to plain
+  (non-persistent) terminals; the base SSH connection is never blocked.
+- **Windows remotes:** tmux is Unix-only. Windows remotes get stock,
+  non-persistent terminals — same as upstream open-remote-ssh — and nothing
+  else about the connection changes.
+- Everything in upstream's [SSH Host Requirements](#ssh-host-requirements)
+  and [Requirements](#activation) below still applies (this fork changes
+  terminals only, not the SSH/server-install path).
+
+## Settings
+
+| Setting | Default | Description |
+|---|---|---|
+| `remote.SSH.tmux.enabled` | `auto` | `auto` enables tmux-backed terminals on Unix-like remotes and disables on Windows; `on` requires tmux (fails if unavailable); `off` disables the feature entirely. |
+| `remote.SSH.tmux.reapOnConnect` | `true` | Automatically clean up empty/dead tmux sessions when connecting to a remote. Keeps hand-off deterministic — no zombie session graveyard. |
+| `remote.SSH.tmux.historyLimit` | `50000` | Maximum scrollback lines retained per tmux terminal. |
+
+All other settings (`remote.SSH.*` for SSH config, server install, agent
+forwarding, etc.) are unchanged from upstream open-remote-ssh.
+
+## Honesty: what this does and doesn't fix
+
+tmux moves terminal lifetime off the client — it does **not** make the network
+connection itself seamless. A dropped connection still needs a reconnect (fast,
+but not invisible); that's the piece a transport like mosh would solve, and it
+was deliberately left out — see
+[`docs/idea/decision-mosh-vs-tmux.md`](docs/idea/decision-mosh-vs-tmux.md).
+The full breakdown of what survives today vs. what tmux fixes is in
+[`docs/idea/persistence-model.md`](docs/idea/persistence-model.md).
+
 ## SSH Host Requirements
+
 You can connect to a running SSH server on the following platforms.
 
 **Supported**:
@@ -16,11 +79,11 @@ You can connect to a running SSH server on the following platforms.
 - FreeBSD 13+ (Requires custom serverDownloadUrlTemplate setting)
 - DragonFlyBSD (Requires manual remote-extension-host installation)
 
-## Requirements
+## Activation
 
 **Configuration**
 
-You SSH server's configuration needs to have the following setting:
+Your SSH server's configuration needs to have the following setting:
 - `AllowTcpForwarding yes`
 
 **Activation**
@@ -29,13 +92,12 @@ You SSH server's configuration needs to have the following setting:
 
 Enable the extension in your `argv.json`
 
-
 ```json
 {
     ...
     "enable-proposed-api": [
         ...,
-        "jeanp413.open-remote-ssh",
+        "developerz-ai.open-remote-ssh-tmux",
     ]
     ...
 }
@@ -96,3 +158,13 @@ Before 1.99.0, the old scheme needs to be used:
 ```
 "remote.SSH.serverDownloadUrlTemplate": "https://github.com/VSCodium/vscodium/releases/download/${version}.${release}/vscodium-reh-${os}-${arch}-${version}.${release}.tar.gz",
 ```
+
+## Credit
+
+This extension is a fork of
+[jeanp413/open-remote-ssh](https://github.com/jeanp413/open-remote-ssh), which
+does all the heavy lifting of resolving the `ssh-remote` authority, installing
+the VS Code server, and running the remote session over SSH. This fork keeps
+that entirely intact and adds tmux-backed persistent terminals on top. All
+credit for the SSH/server-install foundation goes to the upstream project and
+its contributors.

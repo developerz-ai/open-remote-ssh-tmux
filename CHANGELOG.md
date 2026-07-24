@@ -1,3 +1,12 @@
+## 1.0.0
+- feat: fork as open-remote-ssh-tmux — tmux-backed persistent remote terminals that survive client disconnects, window closes, and machine hand-off (PC ↔ laptop ↔ VPS)
+- feat: deterministic tmux session naming keyed to host+workspace with attach-or-create semantics — re-opening a workspace re-attaches the same session, never a duplicate
+- feat: automatic reaping of empty/dead tmux sessions on connect (`remote.SSH.tmux.reapOnConnect`)
+- feat: `remote.SSH.tmux.enabled` setting (`auto` | `on` | `off`) with graceful fallback to plain terminals when tmux is unavailable or on Windows remotes
+- feat: `remote.SSH.tmux.historyLimit` setting for remote terminal scrollback
+- feat: command to kill all tmux sessions for the current workspace
+- build: rebrand to `open-remote-ssh-tmux` / `developerz-ai` publisher identity; SSH transport, `ssh-remote` authority, and command/config ids unchanged from upstream
+
 ## 0.2.0
 - feat: add compatibility with Code-OSS (#189)
 - remodel: use base64 encoding for install script to support csh/tcsh login shells (#296)
