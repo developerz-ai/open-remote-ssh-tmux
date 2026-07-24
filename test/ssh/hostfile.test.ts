@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { addHostToHostFile, checkNewHostInHostkeys } from '../../src/ssh/hostfile';
+import { addHostToHostFile, checkNewHostInHostkeys, verifyHostKey } from '../../src/ssh/hostfile';
 
 // Unit coverage for hostfile.ts — the sole owner of ~/.ssh/known_hosts reads and
 // writes for host-key verification. Every test injects a temp known_hosts path so
@@ -117,5 +117,101 @@ describe('addHostToHostFile', () => {
             expect(stat.mode & 0o777).toBe(0o700);
         }
         expect(await checkNewHostInHostkeys('example.com', file)).toBe(false);
+    });
+});
+
+// Build a known_hosts record whose key blob is `key`, in either the hashed
+// (`|1|salt|hash`) or plaintext host form, so verifyHostKey's byte-comparison
+// path can be exercised deterministically. The base64 key field is exactly
+// `key.toString('base64')` — the same encoding addHostToHostFile writes.
+function khLine(host: string, key: Buffer, hashed = false, type = 'ssh-ed25519'): string {
+    const keyB64 = key.toString('base64');
+    if (hashed) {
+        const salt = crypto.randomBytes(20);
+        const hash = crypto.createHmac('sha1', salt).update(host).digest();
+        return `${'|1|'}${salt.toString('base64')}|${hash.toString('base64')} ${type} ${keyB64}`;
+    }
+    return `${host} ${type} ${keyB64}`;
+}
+
+describe('verifyHostKey', () => {
+    const keyA = Buffer.from('key-alpha-bytes');
+    const keyB = Buffer.from('key-bravo-bytes');
+
+    it('reports the same key bytes on a hashed entry as known', () => {
+        expect(verifyHostKey('example.com', keyA, khLine('example.com', keyA, true) + '\n')).toBe('known');
+    });
+
+    it('reports the same key bytes on a plaintext entry as known', () => {
+        expect(verifyHostKey('example.com', keyA, khLine('example.com', keyA) + '\n')).toBe('known');
+    });
+
+    it('reports a different key for a known (hashed) host as mismatch', () => {
+        expect(verifyHostKey('example.com', keyB, khLine('example.com', keyA, true) + '\n')).toBe('mismatch');
+    });
+
+    it('reports a different key for a known (plaintext) host as mismatch', () => {
+        expect(verifyHostKey('example.com', keyB, khLine('example.com', keyA) + '\n')).toBe('mismatch');
+    });
+
+    it('reports an unseen host as unknown', () => {
+        expect(verifyHostKey('example.com', keyA, khLine('other.com', keyA) + '\n')).toBe('unknown');
+    });
+
+    it('reports empty known_hosts content as unknown', () => {
+        expect(verifyHostKey('example.com', keyA, '')).toBe('unknown');
+    });
+
+    it('matches a [host]:port entry only for that exact port form', () => {
+        const content = khLine('[example.com]:2222', keyA) + '\n';
+        expect(verifyHostKey('[example.com]:2222', keyA, content)).toBe('known');
+        expect(verifyHostKey('[example.com]:2222', keyB, content)).toBe('mismatch');
+        // the bare host is a different identity → not seen on file
+        expect(verifyHostKey('example.com', keyA, content)).toBe('unknown');
+    });
+
+    it('matches any host in a comma-separated host list', () => {
+        const content = khLine('a.com,b.com', keyA) + '\n';
+        expect(verifyHostKey('a.com', keyA, content)).toBe('known');
+        expect(verifyHostKey('b.com', keyB, content)).toBe('mismatch');
+        expect(verifyHostKey('c.com', keyA, content)).toBe('unknown');
+    });
+
+    it('accepts any one recorded key for a host with multiple keys', () => {
+        // A host legitimately publishes several host keys (e.g. rsa + ed25519);
+        // presenting any recorded one is known, an unrecorded one is a mismatch.
+        const content = [khLine('h.com', keyA), khLine('h.com', keyB, true)].join('\n');
+        expect(verifyHostKey('h.com', keyA, content)).toBe('known');
+        expect(verifyHostKey('h.com', keyB, content)).toBe('known');
+        expect(verifyHostKey('h.com', Buffer.from('key-charlie'), content)).toBe('mismatch');
+    });
+
+    it('ignores blank, comment and malformed lines and still decides', () => {
+        const content = [
+            '',
+            '# a comment',
+            '   ',
+            'garbage-with-no-key-fields',
+            '|1|truncated-hashed-entry',
+            khLine('example.com', keyA),
+        ].join('\n');
+        expect(verifyHostKey('example.com', keyA, content)).toBe('known');
+        expect(verifyHostKey('example.com', keyB, content)).toBe('mismatch');
+        expect(verifyHostKey('nope.com', keyA, content)).toBe('unknown');
+    });
+
+    it('ignores a host-matching line that carries no key blob (no false mismatch)', () => {
+        // A malformed host-only record must not flip a first connect into a hard
+        // mismatch failure — it is not a valid recorded key.
+        expect(verifyHostKey('example.com', keyA, 'example.com\n')).toBe('unknown');
+    });
+
+    it('finds the host among multiple valid entries', () => {
+        const content = [
+            khLine('other.com', keyB),
+            khLine('example.com', keyA, true),
+            '# trailing comment',
+        ].join('\n');
+        expect(verifyHostKey('example.com', keyA, content)).toBe('known');
     });
 });
