@@ -130,9 +130,9 @@ export function buildAttachOrCreate(
 
     return [
         create,
-        `set-window-option -t ${target} remain-on-exit off`,
-        `set-option -t ${target} status off`,
-        `set-option -t ${target} history-limit ${historyLimit}`,
+        `set-window-option -t =${target} remain-on-exit off`,
+        `set-option -t =${target} status off`,
+        `set-option -t =${target} history-limit ${historyLimit}`,
     ].join(' \\; ');
 }
 
@@ -158,9 +158,9 @@ export function buildAttachOrCreateArgv(
     }
     return [
         ...create,
-        ';', 'set-window-option', '-t', name, 'remain-on-exit', 'off',
-        ';', 'set-option', '-t', name, 'status', 'off',
-        ';', 'set-option', '-t', name, 'history-limit', String(historyLimit),
+        ';', 'set-window-option', '-t', `=${name}`, 'remain-on-exit', 'off',
+        ';', 'set-option', '-t', `=${name}`, 'status', 'off',
+        ';', 'set-option', '-t', `=${name}`, 'history-limit', String(historyLimit),
     ];
 }
 
@@ -173,14 +173,22 @@ export function buildListSessions(): string {
         + escapeShellArg('#{session_name} #{session_attached} #{session_windows} #{session_created}');
 }
 
-/** `tmux has-session -t <name>`. */
+// `-t <name>` is prefix/fuzzy target matching in tmux — `has-session -t code-<h>-0`
+// would report `code-<h>-01` as present, and `kill-session -t code-<h>-0` would kill
+// that neighbour (a live session). `=` forces an exact-name target. It sits OUTSIDE
+// the quotes so the shell concatenates it onto the still-escaped name; the argv form
+// (`buildAttachOrCreateArgv`) prepends it to the inert element instead. Every builder
+// that takes a `-t` target uses `=`; `new-session -s` is exempt (it names the new
+// session, exact by construction).
+
+/** `tmux has-session -t =<name>`. */
 export function buildHasSession(name: string): string {
-    return `tmux has-session -t ${escapeShellArg(name)}`;
+    return `tmux has-session -t =${escapeShellArg(name)}`;
 }
 
-/** `tmux kill-session -t <name>`. */
+/** `tmux kill-session -t =<name>`. */
 export function buildKillSession(name: string): string {
-    return `tmux kill-session -t ${escapeShellArg(name)}`;
+    return `tmux kill-session -t =${escapeShellArg(name)}`;
 }
 
 /**

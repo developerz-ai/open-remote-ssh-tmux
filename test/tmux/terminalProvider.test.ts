@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { SLOT_MAPPING_STATE_KEY, TmuxTerminalProvider } from '../../src/tmux/terminalProvider';
-import { buildAttachOrCreateArgv, sessionName } from '../../src/tmux/tmuxSession';
+import { buildAttachOrCreateArgv, escapeShellArg, sessionName } from '../../src/tmux/tmuxSession';
 
 // The terminal provider is the user-facing heart of the fork: it decides which
 // tmux session (slot) each VS Code terminal maps to. Both hard invariants live
@@ -57,6 +57,11 @@ const row = (sessionId: string, attached: boolean, windows = 1, created = 170000
  * against a set of existing names (empty stderr = present; not-found stderr =
  * absent), mirroring how the real tmux CLI reports over `SSHConnection#exec`
  * (no exit code surfaced — status is read from stdout/stderr).
+ *
+ * `has-session` is matched on the EXACT `-t =<name>` target the real tmux uses,
+ * not a loose substring of the whole command: a bare `includes(name)` mimicked the
+ * very prefix-match bug the `=` fix removes (it would report `code-<h>-01` present
+ * when only `code-<h>-0` exists). The `=` + trailing quote bound the token.
  */
 function fakeExec(opts: { list?: string[]; existing?: string[] } = {}) {
     const listOut = (opts.list ?? []).join('\n');
@@ -66,7 +71,7 @@ function fakeExec(opts: { list?: string[]; existing?: string[] } = {}) {
             return { stdout: listOut, stderr: '' };
         }
         if (command.includes('has-session')) {
-            const present = [...existing].some(n => command.includes(n));
+            const present = [...existing].some(n => command.includes(`=${escapeShellArg(n)}`));
             return present ? { stdout: '', stderr: '' } : { stdout: '', stderr: `can't find session` };
         }
         return { stdout: '', stderr: '' };

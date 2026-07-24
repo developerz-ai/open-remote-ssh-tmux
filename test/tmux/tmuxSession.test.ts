@@ -99,9 +99,13 @@ describe('buildListSessions', () => {
 });
 
 describe('buildHasSession / buildKillSession', () => {
-    it('targets the escaped session name', () => {
-        expect(buildHasSession(`code-${HASH_PROJ}-0`)).toBe(`tmux has-session -t 'code-${HASH_PROJ}-0'`);
-        expect(buildKillSession(`code-${HASH_PROJ}-0`)).toBe(`tmux kill-session -t 'code-${HASH_PROJ}-0'`);
+    it('targets the escaped session name with an exact-match (=) prefix', () => {
+        // `-t <name>` is prefix/fuzzy match in tmux: `has-session -t code-<h>-0`
+        // would match `code-<h>-01`, and `kill-session` would kill the wrong live
+        // session. `=` forces an exact match. The `=` sits outside the quotes so the
+        // shell concatenates it onto the (still fully escaped) name.
+        expect(buildHasSession(`code-${HASH_PROJ}-0`)).toBe(`tmux has-session -t ='code-${HASH_PROJ}-0'`);
+        expect(buildKillSession(`code-${HASH_PROJ}-0`)).toBe(`tmux kill-session -t ='code-${HASH_PROJ}-0'`);
     });
 });
 
@@ -110,11 +114,13 @@ describe('buildAttachOrCreate', () => {
     const ESC = `'code-${HASH_PROJ}-0'`;
 
     it('emits attach-or-create (-A) plus per-session hardening/cosmetics', () => {
+        // set-option/set-window-option target the session with an exact-match `=`
+        // prefix so hardening never lands on a prefix-colliding neighbour session.
         expect(buildAttachOrCreate(NAME, '/home/user/proj')).toBe(
             `tmux new-session -A -s ${ESC} -c '/home/user/proj'`
-            + ` \\; set-window-option -t ${ESC} remain-on-exit off`
-            + ` \\; set-option -t ${ESC} status off`
-            + ` \\; set-option -t ${ESC} history-limit 50000`,
+            + ` \\; set-window-option -t =${ESC} remain-on-exit off`
+            + ` \\; set-option -t =${ESC} status off`
+            + ` \\; set-option -t =${ESC} history-limit 50000`,
         );
     });
 
@@ -129,9 +135,9 @@ describe('buildAttachOrCreate', () => {
     it('routes the shell command through the escaper', () => {
         expect(buildAttachOrCreate(NAME, '/home/user/proj', '/bin/zsh')).toBe(
             `tmux new-session -A -s ${ESC} -c '/home/user/proj' '/bin/zsh'`
-            + ` \\; set-window-option -t ${ESC} remain-on-exit off`
-            + ` \\; set-option -t ${ESC} status off`
-            + ` \\; set-option -t ${ESC} history-limit 50000`,
+            + ` \\; set-window-option -t =${ESC} remain-on-exit off`
+            + ` \\; set-option -t =${ESC} status off`
+            + ` \\; set-option -t =${ESC} history-limit 50000`,
         );
     });
 
@@ -145,9 +151,9 @@ describe('buildAttachOrCreate', () => {
         // `rm -rf $HOME`. Single-quote escaping renders `'`, `;`, and `$` inert.
         expect(buildAttachOrCreate(NAME, `/tmp/pwn'; rm -rf $HOME'`)).toBe(
             `tmux new-session -A -s ${ESC} -c '/tmp/pwn'\\''; rm -rf $HOME'\\'''`
-            + ` \\; set-window-option -t ${ESC} remain-on-exit off`
-            + ` \\; set-option -t ${ESC} status off`
-            + ` \\; set-option -t ${ESC} history-limit 50000`,
+            + ` \\; set-window-option -t =${ESC} remain-on-exit off`
+            + ` \\; set-option -t =${ESC} status off`
+            + ` \\; set-option -t =${ESC} history-limit 50000`,
         );
     });
 });
@@ -160,11 +166,13 @@ describe('buildAttachOrCreateArgv', () => {
     const NAME = `code-${HASH_PROJ}-0`;
 
     it('emits attach-or-create argv with per-session hardening/cosmetics', () => {
+        // `-s` names the NEW session (exact by construction); the set-option/-window
+        // targets use the exact-match `=` prefix, in lockstep with the shell form.
         expect(buildAttachOrCreateArgv(NAME, '/home/user/proj')).toEqual([
             'new-session', '-A', '-s', NAME, '-c', '/home/user/proj',
-            ';', 'set-window-option', '-t', NAME, 'remain-on-exit', 'off',
-            ';', 'set-option', '-t', NAME, 'status', 'off',
-            ';', 'set-option', '-t', NAME, 'history-limit', '50000',
+            ';', 'set-window-option', '-t', `=${NAME}`, 'remain-on-exit', 'off',
+            ';', 'set-option', '-t', `=${NAME}`, 'status', 'off',
+            ';', 'set-option', '-t', `=${NAME}`, 'history-limit', '50000',
         ]);
     });
 
