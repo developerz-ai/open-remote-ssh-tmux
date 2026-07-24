@@ -94,12 +94,16 @@ export class HostTreeDataProvider extends Disposable implements vscode.TreeDataP
     }
 
     private async openRemoteSSHWindow(element: HostItem, reuseWindow: boolean) {
-        const sshDest = new SSHDestination(element.hostname);
+        // `element.hostname` is a Host alias/value straight from the user's SSH
+        // config, so route it through the same `SSHDestination.parse` boundary as
+        // every other command-input site (user@/port/bracketed-IPv6 aware) rather
+        // than the raw-string constructor.
+        const sshDest = SSHDestination.parse(element.hostname);
         openRemoteSSHWindow(sshDest.toEncodedString(), reuseWindow);
     }
 
     private async openRemoteSSHLocationWindow(element: HostLocationItem, reuseWindow: boolean) {
-        const sshDest = new SSHDestination(element.hostname);
+        const sshDest = SSHDestination.parse(element.hostname);
         openRemoteSSHLocationWindow(sshDest.toEncodedString(), element.path, reuseWindow);
     }
 }

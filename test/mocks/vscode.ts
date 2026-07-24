@@ -134,9 +134,22 @@ export const messageResponses: { warning: unknown } = { warning: undefined };
  * per call so a test can assert what — and whether — a dialog was shown. */
 export const shownMessages: { warning: unknown[][]; information: unknown[][]; error: unknown[][] } = { warning: [], information: [], error: [] };
 
+/** Seedable return value for `window.showInputBox` — a test sets this to the string
+ * the simulated user typed (or leaves it `undefined` to model dismiss/Escape). */
+export const inputBoxResponses: { value: string | undefined } = { value: undefined };
+
+/** Every `window.showInputBox(options)` call, recorded so a test can exercise the
+ * options' own `validateInput`, matching how the real UI would reject bad input
+ * before the value is even returned to the caller. */
+export const shownInputBoxes: { title?: string; validateInput?: (value: string) => string | undefined | null }[] = [];
+
 export const window = {
     createOutputChannel(channelName: string): MockOutputChannel {
         return new MockOutputChannel(channelName);
+    },
+    showInputBox(options?: { title?: string; validateInput?: (value: string) => string | undefined | null }): Promise<string | undefined> {
+        shownInputBoxes.push(options ?? {});
+        return Promise.resolve(inputBoxResponses.value);
     },
     showWarningMessage(message: string, ...items: unknown[]): Promise<unknown> {
         shownMessages.warning.push([message, ...items]);
@@ -148,6 +161,17 @@ export const window = {
     },
     showErrorMessage(message: string, ...items: unknown[]): Promise<unknown> {
         shownMessages.error.push([message, ...items]);
+        return Promise.resolve(undefined);
+    },
+};
+
+/** Every `commands.executeCommand(...)` call, recorded as `(command, args)` so a
+ * test can assert what a handler asked VS Code to do (e.g. open a new window). */
+export const executedCommands: { command: string; args: unknown[] }[] = [];
+
+export const commands = {
+    executeCommand(command: string, ...args: unknown[]): Promise<unknown> {
+        executedCommands.push({ command, args });
         return Promise.resolve(undefined);
     },
 };
