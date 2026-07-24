@@ -222,7 +222,21 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         // must not block new terminals, so its rejection is swallowed here.
         await this.initialized.catch(() => { /* restore failure never blocks a new terminal */ });
         await this.refreshRemote(); // no-steal snapshot, refreshed on create
-        const slot = this.allocateSlot();
+        let slot = this.allocateSlot();
+        // Shrink the no-steal TOCTOU: VS Code spawns the tmux process only *after*
+        // this returns (a window we can't observe from here), so the snapshot above
+        // can go stale — another client could attach our slot in between. Re-probe as
+        // the last remote read before committing; if the chosen slot went free →
+        // attached-elsewhere since, allocate again against the refreshed set
+        // (`allocateSlot` skips `attachedRemoteSlots`). The two probes are kept
+        // deliberately (don't collapse to one): the second is what makes the decision
+        // reflect the freshest reachable state. This only narrows the race — the
+        // return→spawn window is irreducible from here.
+        await this.refreshRemote();
+        if (this.attachedRemoteSlots.has(slot)) {
+            this.log.trace(`tmux terminal: slot ${slot} taken since snapshot — reallocating`);
+            slot = this.allocateSlot();
+        }
         this.openSlots.add(slot);
         const name = sessionName(this.ctx.hostKey, this.ctx.workspaceKey, slot);
         this.mapping.set(slot, name);

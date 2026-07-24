@@ -134,6 +134,49 @@ describe('slot allocation', () => {
     });
 });
 
+describe('no-steal TOCTOU (re-probe immediately before returning)', () => {
+    // The no-steal guard reads a `list-sessions` snapshot, but VS Code spawns the
+    // tmux process only *after* provideTerminalProfile returns — a window this code
+    // cannot observe. A single snapshot is therefore TOCTOU: another client can
+    // attach the chosen slot in between. The provider re-probes as the last remote
+    // read before committing to *shrink* (never close) that window, re-picking a
+    // slot taken since the first snapshot instead of stealing it.
+
+    it('skips a slot taken (attached elsewhere) between the first snapshot and returning', async () => {
+        // First `list-sessions`: empty → slot 0 looks free. Every later one: slot 0
+        // is now attached by another client. Without the re-probe the provider hands
+        // out slot 0 (a steal); with it, the fresher snapshot pushes it to slot 1.
+        let listCalls = 0;
+        const exec = vi.fn(async (command: string) => {
+            if (command.includes('list-sessions')) {
+                listCalls++;
+                return { stdout: listCalls === 1 ? '' : row(name(0), true), stderr: '' };
+            }
+            return { stdout: '', stderr: '' };
+        });
+        const { provider } = makeProvider({ exec });
+
+        expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(1));
+        expect(listCalls).toBeGreaterThanOrEqual(2); // re-probed before returning
+    });
+
+    it('keeps its chosen slot when the re-probe shows only an unrelated slot taken', async () => {
+        // A re-probe revealing another client on some *other* slot must not bump a
+        // new terminal off a slot that is still free.
+        let listCalls = 0;
+        const exec = vi.fn(async (command: string) => {
+            if (command.includes('list-sessions')) {
+                listCalls++;
+                return { stdout: listCalls === 1 ? '' : row(name(5), true), stderr: '' };
+            }
+            return { stdout: '', stderr: '' };
+        });
+        const { provider } = makeProvider({ exec });
+
+        expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(0));
+    });
+});
+
 describe('init race (no duplicate/mirrored tab on a slot being restored or adopted)', () => {
     // extension.ts kicks off initialize() fire-and-forget, then registers the
     // profile provider. A "New Terminal" (or the auto-terminal VS Code opens on
