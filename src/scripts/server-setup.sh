@@ -43,9 +43,13 @@ print_install_results_and_exit() {
   exit 0
 }
 
-LOCKFILE="$TMP_DIR/server_install.lock"
+# Per-user lock (inside $SERVER_DATA_DIR, not the world-writable $TMP_DIR) so
+# another local user can't block/DoS this install by pre-creating a shared
+# lock file path they own.
+LOCKFILE="$SERVER_DATA_DIR/.server_install.lock"
 
 if command -v flock >/dev/null 2>&1; then
+  mkdir -p -- "$SERVER_DATA_DIR"
   exec {FD}<>"$LOCKFILE"
   # wait 30s to acquire lock, otherwise fail
   flock -x -w 30 $FD || print_install_results_and_exit 1
@@ -193,7 +197,19 @@ fi
 if %%MODIFY_PRODUCT_JSON%%; then
   if command -v sed >/dev/null 2>&1; then
     echo "Will modify product.json on remote to match the commit value"
-    sed -i -E 's/"commit": "[0-9a-f]+",/"commit": "'"$DISTRO_COMMIT"'",/' "$SERVER_DIR/product.json";
+    # `sed -i -E` is GNU-only: BSD/macOS sed treats the arg after `-i` as a
+    # mandatory backup-suffix, so `-E` is swallowed as the suffix and the
+    # regex flag is lost (or the whole invocation errors out) — this made
+    # `serverValidation: 'force'` silently no-op on macOS remotes. Portable
+    # form: write to a temp file, then `mv` it into place.
+    PRODUCT_JSON="$SERVER_DIR/product.json"
+    PRODUCT_JSON_TMP="$PRODUCT_JSON.tmp"
+    if sed -E 's/"commit": "[0-9a-f]+",/"commit": "'"$DISTRO_COMMIT"'",/' "$PRODUCT_JSON" > "$PRODUCT_JSON_TMP"; then
+      mv -- "$PRODUCT_JSON_TMP" "$PRODUCT_JSON"
+    else
+      echo "Error modifying product.json"
+      rm -f -- "$PRODUCT_JSON_TMP"
+    fi
   else
     echo "Cannot find the 'sed' command, make sure it is installed to modify product.json with the matching commit."
   fi
@@ -202,7 +218,17 @@ fi
 # Try to find if server is already running
 if [[ -f "$SERVER_PIDFILE" ]]; then
   SERVER_PID="$(cat "$SERVER_PIDFILE")"
-  SERVER_RUNNING_PROCESS="$(ps -o pid,args -p "$SERVER_PID" | grep "$SERVER_SCRIPT")"
+  if [[ $SERVER_PID =~ ^[0-9]+$ ]]; then
+    SERVER_RUNNING_PROCESS="$(ps -o pid,args -p "$SERVER_PID" | grep "$SERVER_SCRIPT")"
+  else
+    # Garbage/empty pid file: `ps -p` on a non-numeric argument is undefined
+    # across ps implementations and must not be trusted to mean "not
+    # running" — that false negative would spawn a duplicate server and
+    # delete the token file out from under the still-live instance. Fall
+    # back to the full-scan the else-branch below already uses.
+    echo "Warning: pid file contains invalid data, falling back to full process scan"
+    SERVER_RUNNING_PROCESS="$(ps -o pid,args -A | grep "$SERVER_SCRIPT" | grep -v grep)"
+  fi
 else
   SERVER_RUNNING_PROCESS="$(ps -o pid,args -A | grep "$SERVER_SCRIPT" | grep -v grep)"
 fi
