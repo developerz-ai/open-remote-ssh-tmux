@@ -177,6 +177,38 @@ describe('no-steal TOCTOU (re-probe immediately before returning)', () => {
     });
 });
 
+describe('no-steal guard survives a transient probe failure (snapshot retention)', () => {
+    // `attachedRemoteSlots` IS the no-steal guard. A *transient* `list-sessions`
+    // failure (network blip mid-session) must not silently disarm it: the last known
+    // snapshot is retained, so a new terminal still skips the slot another client
+    // holds instead of stealing it. Clearing the set on every failed probe would open
+    // exactly the steal the guard exists to prevent. Retention errs safe — a slot the
+    // other client has since detached stays guarded only until the next *successful*
+    // probe re-syncs it (self-healing, worst case a higher slot number, never a steal).
+
+    it('retains the last attached-elsewhere snapshot when a later probe fails', async () => {
+        // First probe: slot 0 is attached by another client → seeds the guard. Every
+        // later probe throws. With the bug (clear-on-failure) the guard empties and the
+        // new terminal steals slot 0; with retention it still skips it → slot 1.
+        let listCalls = 0;
+        const exec = vi.fn(async (command: string) => {
+            if (command.includes('list-sessions')) {
+                listCalls++;
+                if (listCalls === 1) {
+                    return { stdout: row(name(0), true), stderr: '' };
+                }
+                throw new Error('connection reset'); // transient blip on every later probe
+            }
+            return { stdout: '', stderr: '' };
+        });
+        const { provider } = makeProvider({ exec });
+
+        await provider.initialize(); // seeds attachedRemoteSlots = {0} from the good snapshot
+        // The failing probes inside provideTerminalProfile must keep slot 0 guarded.
+        expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(1));
+    });
+});
+
 describe('init race (no duplicate/mirrored tab on a slot being restored or adopted)', () => {
     // extension.ts kicks off initialize() fire-and-forget, then registers the
     // profile provider. A "New Terminal" (or the auto-terminal VS Code opens on

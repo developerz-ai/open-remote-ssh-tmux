@@ -394,8 +394,14 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         try {
             result = await this.exec(buildListSessions());
         } catch (err) {
+            // Retain the last-known `attachedRemoteSlots` on a *transient* probe
+            // failure (network blip): clearing it would silently disarm the no-steal
+            // guard, and the next new terminal could -A-attach a slot another client
+            // holds (mirrored keystrokes). Erring safe keeps a since-detached slot
+            // guarded only until the next *successful* probe re-syncs it — worst case
+            // a higher slot number, never a steal. The empty return still means "saw no
+            // sessions this round" so restore/adoption don't act on data we don't have.
             this.log.trace(`tmux list-sessions failed: ${errorText(err)}`);
-            this.attachedRemoteSlots = new Set();
             return [];
         }
         const sessions: RemoteSession[] = [];
