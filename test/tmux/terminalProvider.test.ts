@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { SLOT_MAPPING_STATE_KEY, TmuxTerminalProvider } from '../../src/tmux/terminalProvider';
+import { SLOT_MAPPING_STATE_KEY, TOMBSTONE_STATE_KEY, TmuxTerminalProvider } from '../../src/tmux/terminalProvider';
 import { buildAttachOrCreateArgv, escapeShellArg, sessionName } from '../../src/tmux/tmuxSession';
 
 // The terminal provider is the user-facing heart of the fork: it decides which
@@ -350,6 +350,101 @@ describe('adoption (hand-off / reconciliation)', () => {
 
         expect(opened).toEqual([]);
         expect(provider.mappedSlots()).toEqual([]);
+    });
+});
+
+describe('tombstone (a user-closed terminal stays closed across reloads)', () => {
+    // A terminal the user explicitly closes must not come back on the next reload.
+    // The old provider kept the mapping (restore re-attached it) *and* left the
+    // still-live detached session on the remote (adoption re-adopted it) — so a
+    // closed terminal resurrected on every reconnect. The fix persists a per-slot
+    // tombstone on explicit close; restore *and* adoption skip tombstoned slots; and
+    // opening a NEW terminal on that slot clears the tombstone. The session is never
+    // killed (close = detach), so a deliberate reopen -A-attaches it again.
+
+    /** Flush pending microtasks/timers (the close handler persists fire-and-forget). */
+    const flush = (): Promise<void> => new Promise<void>(res => setTimeout(res, 0));
+    /** The persisted user-closed slots, as a plain array, for assertions. */
+    const tombstonesIn = (state: ReturnType<typeof fakeState>): number[] =>
+        (state.get(TOMBSTONE_STATE_KEY) as number[] | undefined) ?? [];
+
+    it('persists a tombstone for the slot on explicit close (mapping + session kept)', async () => {
+        const { provider, state } = makeProvider();
+        const profile = await provider.provideTerminalProfile(); // slot 0
+        const term = { creationOptions: optionsOf(profile) } as unknown as import('vscode').Terminal;
+        provider.handleTerminalOpened(term);
+
+        provider.handleTerminalClosed(term);
+        await flush();
+
+        expect(tombstonesIn(state)).toContain(0);                 // slot 0 tombstoned
+        expect(provider.mappedSlots()).toEqual([0]);              // mapping kept (never killed)
+        expect(state.get(SLOT_MAPPING_STATE_KEY)).toEqual({ '0': name(0) });
+    });
+
+    it('does not restore a tombstoned mapped slot on reload', async () => {
+        // Reload = same client, same workspaceState: slot 0 is mapped AND tombstoned,
+        // its detached session still alive on the remote. Restore must skip it.
+        const state = fakeState({
+            [SLOT_MAPPING_STATE_KEY]: { '0': name(0) },
+            [TOMBSTONE_STATE_KEY]: [0],
+        });
+        const exec = fakeExec({ list: [row(name(0), false)], existing: [name(0)] });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ state, exec, opened });
+
+        await provider.initialize();
+
+        expect(opened).toEqual([]);                  // not re-attached (stays closed)
+        expect(provider.mappedSlots()).toEqual([0]); // mapping kept — session never killed
+    });
+
+    it('does not adopt a tombstoned slot on reload (even when unmapped)', async () => {
+        // The other half of the resurrection bug: a detached-live session on a
+        // tombstoned slot the client no longer maps must not be re-adopted.
+        const state = fakeState({ [TOMBSTONE_STATE_KEY]: [1] });
+        const exec = fakeExec({ list: [row(name(1), false)] }); // detached, live, unmapped
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ state, exec, opened });
+
+        await provider.initialize();
+
+        expect(opened).toEqual([]);
+        expect(provider.mappedSlots()).toEqual([]);
+    });
+
+    it('clears (and persists) the tombstone when a new terminal allocates that slot', async () => {
+        // Opening a NEW terminal on a tombstoned slot is a deliberate reopen: lift the
+        // tombstone so a later reload restores it normally again.
+        const state = fakeState({ [TOMBSTONE_STATE_KEY]: [0] });
+        const { provider } = makeProvider({ state });
+
+        expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(0));
+        expect(tombstonesIn(state)).not.toContain(0);
+    });
+
+    it('a reopened (un-tombstoned) slot restores again on the next reload', async () => {
+        // End-to-end: close (tombstone) -> reopen (clear) -> reload restores. If the
+        // clear failed to persist, the reload below would skip slot 0 and open nothing.
+        const state = fakeState();
+        const first = makeProvider({ state, exec: fakeExec({ existing: [name(0)] }) });
+        const profile = await first.provider.provideTerminalProfile(); // slot 0
+        const term = { creationOptions: optionsOf(profile) } as unknown as import('vscode').Terminal;
+        first.provider.handleTerminalOpened(term);
+        first.provider.handleTerminalClosed(term);            // tombstone slot 0
+        await flush();
+        await first.provider.provideTerminalProfile();        // reopen slot 0 -> clears tombstone
+        expect(tombstonesIn(state)).not.toContain(0);
+
+        const opened: LaunchOptions[] = [];
+        const reload = makeProvider({
+            state,
+            exec: fakeExec({ list: [row(name(0), false)], existing: [name(0)] }),
+            opened,
+        });
+        await reload.provider.initialize();
+
+        expect(opened.map(targetSession)).toEqual([name(0)]); // restored again
     });
 });
 
