@@ -118,6 +118,26 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
 
     private labelFormatterDisposable: vscode.Disposable | undefined;
 
+    /** Exposed for tmux terminal provider wiring — the SSH connection after resolve completes. */
+    getSSHConnection(): SSHConnection | undefined {
+        return this.sshConnection;
+    }
+
+    /** Exposed for tmux terminal provider wiring — the probe result after resolve completes. */
+    getTmuxCapability(): TmuxCapability | undefined {
+        return this.tmuxCapability;
+    }
+
+    /** Callback invoked after successful resolve() to wire tmux terminal components.
+     * Must not throw; resolution failures are handled before calling. */
+    private onResolveSuccess?: (() => void);
+
+    /** Register a callback to be invoked after resolve() succeeds. Used by extension.ts
+     * to wire terminal provider/reaper after SSH connection + tmux capability are known. */
+    onResolveSuccessfullyCompleted(callback: () => void): void {
+        this.onResolveSuccess = callback;
+    }
+
     constructor(
         readonly context: vscode.ExtensionContext,
         readonly logger: Log
@@ -319,6 +339,14 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
 
                 const resolvedResult: vscode.ResolverResult = new vscode.ResolvedAuthority('127.0.0.1', tunnelConfig.localPort, installResult.connectionToken);
                 resolvedResult.extensionHostEnv = envVariables;
+
+                // Trigger tmux wiring callback after successful resolution
+                try {
+                    this.onResolveSuccess?.();
+                } catch (err) {
+                    this.logger.trace(`onResolveSuccess callback failed: ${err instanceof Error ? err.message : String(err)}`);
+                }
+
                 return resolvedResult;
             } catch (e: unknown) {
                 this.logger.error(`Error resolving authority`, e);
