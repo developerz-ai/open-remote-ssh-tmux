@@ -46,8 +46,11 @@ class TunnelInfo implements vscode.Disposable {
 
 interface SSHKey {
     filename: string;
-    parsedKey: ParsedKey;
-    fingerprint: string;
+    // Absent for an encrypted private key with no `.pub` sibling — identityFiles
+    // keeps it (flagged `isPrivate`) rather than dropping it, since we can't
+    // derive a parsedKey/fingerprint without the passphrase yet.
+    parsedKey?: ParsedKey;
+    fingerprint?: string;
     agentSupport?: boolean;
     isPrivate?: boolean;
 }
@@ -508,7 +511,9 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
             if (methodsLeft.includes('publickey') && identityKeys.length && preferredAuthentications.includes('publickey')) {
                 const identityKey = identityKeys.shift()!;
 
-                this.logger.info(`Trying publickey authentication: ${identityKey.filename} ${identityKey.parsedKey.type} SHA256:${identityKey.fingerprint}`);
+                this.logger.info(identityKey.parsedKey
+                    ? `Trying publickey authentication: ${identityKey.filename} ${identityKey.parsedKey.type} SHA256:${identityKey.fingerprint}`
+                    : `Trying publickey authentication: ${identityKey.filename} (encrypted, passphrase required)`);
 
                 if (identityKey.agentSupport) {
                     return callback({
@@ -517,12 +522,13 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                         agent: new class extends ssh2.OpenSSHAgent {
                             // Only return the current key
                             override getIdentities(callback: (err: Error | undefined, publicKeys?: ParsedKey[]) => void): void {
-                                callback(undefined, [identityKey.parsedKey]);
+                                // Invariant: agentSupport is only ever set alongside a resolved parsedKey (see identityFiles.ts).
+                                callback(undefined, [identityKey.parsedKey!]);
                             }
                         }(this.sshAgentSock!)
                     });
                 }
-                if (identityKey.isPrivate) {
+                if (identityKey.isPrivate && identityKey.parsedKey) {
                     return callback({
                         type: 'publickey',
                         username: sshUser,

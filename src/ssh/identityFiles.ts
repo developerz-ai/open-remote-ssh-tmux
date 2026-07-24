@@ -28,8 +28,10 @@ const DEFAULT_IDENTITY_FILES: string[] = [
 
 export interface SSHKey {
     filename: string;
-    parsedKey: ParsedKey;
-    fingerprint: string;
+    // Absent for an encrypted private key kept via the `isPrivate` branch below —
+    // we can't derive a parsedKey/fingerprint without the passphrase yet.
+    parsedKey?: ParsedKey;
+    fingerprint?: string;
     agentSupport?: boolean;
     isPrivate?: boolean;
 }
@@ -42,16 +44,30 @@ export async function gatherIdentityFiles(identityFiles: string[], sshAgentSock:
     }
 
     const identityFileContentsResult = await Promise.allSettled(identityFiles.map(async keyPath => {
-        keyPath = await fileExists(keyPath + '.pub') ? keyPath + '.pub' : keyPath;
-        return fs.promises.readFile(keyPath);
+        const usingPublicKey = await fileExists(keyPath + '.pub');
+        const contents = await fs.promises.readFile(usingPublicKey ? keyPath + '.pub' : keyPath);
+        return { contents, usingPublicKey };
     }));
     const fileKeys: SSHKey[] = identityFileContentsResult.map((result, i) => {
         if (result.status === 'rejected') {
             return undefined;
         }
 
-        const parsedResult = ssh2.utils.parseKey(result.value);
+        const { contents, usingPublicKey } = result.value;
+        const parsedResult = ssh2.utils.parseKey(contents);
         if (parsedResult instanceof Error || !parsedResult) {
+            // An encrypted private key with no `.pub` sibling fails to parse here
+            // because we don't have its passphrase yet — that's expected, not a
+            // real error. Keep the entry (flagged `isPrivate`, no parsedKey/
+            // fingerprint yet) instead of silently dropping the identity, so the
+            // SSH auth handler gets a chance to prompt for the passphrase.
+            if (!usingPublicKey && parsedResult instanceof Error && parsedResult.message === 'Encrypted private OpenSSH key detected, but no passphrase given') {
+                return {
+                    filename: identityFiles[i],
+                    isPrivate: true
+                };
+            }
+
             logger.error(`Error while parsing SSH public key ${identityFiles[i]}:`, parsedResult);
             return undefined;
         }
@@ -99,7 +115,7 @@ export async function gatherIdentityFiles(identityFiles: string[], sshAgentSock:
     const agentKeys: SSHKey[] = [];
     const preferredIdentityKeys: SSHKey[] = [];
     for (const agentKey of sshAgentKeys) {
-        const foundIdx = fileKeys.findIndex(k => agentKey.parsedKey.type === k.parsedKey.type && agentKey.fingerprint === k.fingerprint);
+        const foundIdx = fileKeys.findIndex(k => agentKey.parsedKey && k.parsedKey && agentKey.parsedKey.type === k.parsedKey.type && agentKey.fingerprint === k.fingerprint);
         if (foundIdx >= 0) {
             preferredIdentityKeys.push({ ...fileKeys[foundIdx], agentSupport: true });
             fileKeys.splice(foundIdx, 1);
@@ -110,7 +126,7 @@ export async function gatherIdentityFiles(identityFiles: string[], sshAgentSock:
     preferredIdentityKeys.push(...agentKeys);
     preferredIdentityKeys.push(...fileKeys);
 
-    logger.trace(`Identity keys:`, preferredIdentityKeys.length ? preferredIdentityKeys.map(k => `${k.filename} ${k.parsedKey.type} SHA256:${k.fingerprint}`).join('\n') : 'None');
+    logger.trace(`Identity keys:`, preferredIdentityKeys.length ? preferredIdentityKeys.map(k => k.parsedKey ? `${k.filename} ${k.parsedKey.type} SHA256:${k.fingerprint}` : `${k.filename} (encrypted, passphrase required)`).join('\n') : 'None');
 
     return preferredIdentityKeys;
 }
