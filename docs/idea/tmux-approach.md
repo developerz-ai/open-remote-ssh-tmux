@@ -107,8 +107,22 @@ fallback is still Route B as originally scoped — no plan changes needed to
 pivot, just swap the injection point in `terminalProvider.ts`.
 
 **Route A implications carried into `04`:**
-- No remote Machine-settings mutation needed — lower risk, no risk of us
-  clobbering the user's own `terminal.integrated.*` settings.
+- No remote *Machine*-settings mutation (Route B's `terminal.integrated.profiles.linux`
+  shell injection) needed — lower risk, no risk of us clobbering the user's own shell
+  config. VS Code's terminal extension point has no manifest-level "make this the
+  default" flag (`id`/`title`/`icon` only — confirmed against `contributes.terminal`'s
+  schema during `09` acceptance testing), so making tmux "the default terminal on a
+  resolved Unix host" (as stated above) still needs exactly one settings write:
+  `terminal.integrated.defaultProfile.linux`, **Workspace**-scoped and only when unset
+  (`extension.ts#setDefaultTerminalProfileIfUnset`) — never User/Global, never
+  overriding a choice already made. This is narrower than Route B and was missing from
+  the original v1.0.0 RC; `09`'s matrix row 1 caught it (fresh terminal launched plain
+  bash, zero tmux sessions on the remote) alongside a second bug in the same area: the
+  RC's `contributes` block had a stray top-level `"terminal.profiles"` key (a copy of a
+  *settings*-schema shape) instead of the real `"terminal": {"profiles": [...]}"`
+  extension point, so `registerTerminalProfileProvider('tmux', ...)` was a silent
+  no-op. Both fixed together, re-verified live (VSCodium + Xvfb + a real Docker SSH
+  remote): `tmux ls` shows exactly one `code-*` session after opening a terminal.
 - `contributes.terminal.profiles` (05) + `registerTerminalProfileProvider`
   is the real (non-spike) implementation shape for step 1 of `04`.
 - Dedupe against VS Code's own persistent-terminal revive (`04` step 3) is

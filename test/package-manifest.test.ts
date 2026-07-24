@@ -153,6 +153,37 @@ describe('package.json manifest drift guard', () => {
         });
     });
 
+    describe('tmux terminal profile', () => {
+        // Regression coverage for a real 09-verify bug: contributes.terminal.profiles
+        // (the actual VS Code extension point: contributes.terminal -> {profiles: []})
+        // had been mis-authored as a top-level `"terminal.profiles"` key shaped like a
+        // *settings* schema — an unrecognized contribution point VS Code silently
+        // ignores, so `registerTerminalProfileProvider('tmux', ...)` (src/extension.ts)
+        // never had a matching profile and was a no-op: "New Terminal" launched a plain
+        // shell, zero tmux sessions on the remote. Caught empirically in the 09
+        // acceptance matrix (row 1), fixed alongside this test.
+        it('contributes a real contributes.terminal.profiles entry (not a stray top-level key)', () => {
+            expect(contributes['terminal.profiles'], 'contributes["terminal.profiles"] is not a real VS Code extension point — it is silently ignored').toBeUndefined();
+
+            const terminal = contributes.terminal as JsonObject | undefined;
+            expect(terminal, 'contributes.terminal is missing').toBeDefined();
+            const profiles = terminal!.profiles as Array<{ id: string; title: string }> | undefined;
+            expect(profiles, 'contributes.terminal.profiles is missing').toBeDefined();
+            expect(profiles!.some(p => p.id === 'tmux')).toBe(true);
+        });
+
+        it('the contributed profile id matches the id passed to registerTerminalProfileProvider in src/', () => {
+            const terminal = contributes.terminal as JsonObject;
+            const profiles = terminal.profiles as Array<{ id: string; title: string }>;
+            const registerCall = /registerTerminalProfileProvider\(\s*['"]([^'"]+)['"]/;
+            const extensionSrc = fs.readFileSync(path.resolve(srcDir, 'extension.ts'), 'utf8');
+            const match = extensionSrc.match(registerCall);
+            expect(match, 'no registerTerminalProfileProvider(...) call found in src/extension.ts').not.toBeNull();
+            const registeredId = match![1];
+            expect(profiles.some(p => p.id === registeredId)).toBe(true);
+        });
+    });
+
     it('the kill command\'s manifest id matches the constant exported by commands.ts', () => {
         const killCommand = commands.find(c => c.command === KILL_WORKSPACE_SESSIONS_COMMAND_ID);
         expect(killCommand, `expected contributes.commands to contain "${KILL_WORKSPACE_SESSIONS_COMMAND_ID}"`).toBeDefined();

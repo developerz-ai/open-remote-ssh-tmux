@@ -129,6 +129,45 @@ describe('slot allocation', () => {
     });
 });
 
+describe('live terminal close wiring (onDidOpenTerminal / onDidCloseTerminal)', () => {
+    // Regression coverage for a real 09-verify bug: `releaseSlot` is pure and
+    // unit-tested (see "reuses the lowest freed slot" above), but nothing ever
+    // called it from a real VS Code close event — extension.ts never wired
+    // `vscode.window.onDidCloseTerminal`. So closing and reopening a terminal
+    // within one window session never freed a slot: every "New Terminal" after a
+    // close minted a brand-new, ever-growing session instead of reattaching the
+    // one just detached (found live: 5 open/kill cycles -> 5 distinct sessions on
+    // the remote, not 1 reused slot). The fix correlates a live `vscode.Terminal`
+    // back to its slot via the session name baked into `shellArgs` at open time.
+    it('handleTerminalOpened + handleTerminalClosed round-trip frees the slot for reuse', async () => {
+        const { provider } = makeProvider();
+        const profile = await provider.provideTerminalProfile(); // slot 0
+        const fakeTerminal = { creationOptions: optionsOf(profile) } as unknown as import('vscode').Terminal;
+
+        provider.handleTerminalOpened(fakeTerminal);
+        provider.handleTerminalClosed(fakeTerminal);
+
+        expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(0));
+    });
+
+    it('ignores a terminal that is not one of ours (no shellArgs / foreign session)', () => {
+        const { provider } = makeProvider();
+        const foreign = { creationOptions: { shellPath: '/bin/bash' } } as unknown as import('vscode').Terminal;
+        expect(() => provider.handleTerminalOpened(foreign)).not.toThrow();
+        expect(() => provider.handleTerminalClosed(foreign)).not.toThrow();
+    });
+
+    it('closing an unopened/unknown terminal is a no-op (does not free an unrelated slot)', async () => {
+        const { provider } = makeProvider();
+        await provider.provideTerminalProfile(); // slot 0
+        const unknown = { creationOptions: { shellPath: 'tmux', shellArgs: [] } } as unknown as import('vscode').Terminal;
+
+        provider.handleTerminalClosed(unknown);
+
+        expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(1)); // 0 still open
+    });
+});
+
 describe('restore mapping (per client, on reload)', () => {
     it('re-attaches mapped slots whose session survives and prunes the dead', async () => {
         const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0), '2': name(2) } });
