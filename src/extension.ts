@@ -4,7 +4,7 @@ import { RemoteSSHResolver, REMOTE_SSH_AUTHORITY } from './authResolver';
 import { KILL_WORKSPACE_SESSIONS_COMMAND_ID, killWorkspaceSessions, openSSHConfigFile, promptOpenRemoteSSHWindow, type WorkspaceKillTarget } from './commands';
 import { HostTreeDataProvider } from './hostTreeView';
 import { getRemoteWorkspaceLocationData, RemoteLocationHistory } from './remoteLocationHistory';
-import { TmuxTerminalProvider, type OpenTerminal } from './tmux/terminalProvider';
+import { TmuxTerminalProvider, type OpenTerminal, type RemoteExec } from './tmux/terminalProvider';
 import { SessionReaper } from './tmux/sessionReaper';
 
 export async function activate(context: vscode.ExtensionContext) {
@@ -17,11 +17,13 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Wire tmux terminal provider and session reaper after remote resolution completes.
     // The provider/reaper are gated on PR3 capability (tmux available) and PR5 setting
-    // (remote.SSH.tmux.enabled). This callback fires after resolve() succeeds, when
-    // SSH connection and tmux capability are known.
-    remoteSSHResolver.onResolveSuccessfullyCompleted(() => {
-        wireTmuxTerminalLayer(context, remoteSSHResolver, logger);
-    });
+    // (remote.SSH.tmux.enabled). This callback fires after *every* resolve() succeeds —
+    // including reconnects — so it wires the layer exactly once and only refreshes it
+    // thereafter (idempotentResolveHandler): re-registering the terminal profile
+    // provider throws "already registered" and would orphan the live provider.
+    remoteSSHResolver.onResolveSuccessfullyCompleted(
+        idempotentResolveHandler(() => wireTmuxTerminalLayer(context, remoteSSHResolver, logger))
+    );
 
     const locationHistory = new RemoteLocationHistory(context);
     const locationData = getRemoteWorkspaceLocationData();
@@ -46,13 +48,17 @@ export async function activate(context: vscode.ExtensionContext) {
  * Constructs and registers TmuxTerminalProvider, SessionReaper with injected
  * Log, exec, clock; pushes disposables for cleanup.
  *
- * Called from resolver callback after resolve() completes (SSH connection exists).
+ * Called from the resolver callback after resolve() completes. Returns a
+ * {@link TmuxTerminalLayer} handle whose `refresh()` a later resolve (reconnect)
+ * calls instead of wiring again, or `undefined` when a gate is unmet (capability
+ * unavailable / setting off / not on a remote) or wiring throws — so the wrapping
+ * {@link idempotentResolveHandler} retries wiring on the next resolve.
  */
 function wireTmuxTerminalLayer(
     context: vscode.ExtensionContext,
     resolver: RemoteSSHResolver,
     logger: Log
-): void {
+): TmuxTerminalLayer | undefined {
     try {
         // PR3 gate: tmux must be available on the remote.
         const capability = resolver.getTmuxCapability();
@@ -81,16 +87,11 @@ function wireTmuxTerminalLayer(
         const { hostKey, workspaceKey } = sessionContext;
         const cwd = workspaceKey;
 
-        // Construct the terminal provider with injected dependencies.
-        // exec is deferred — it's fetched from the SSH connection when needed.
-        const sshConnection = resolver.getSSHConnection();
-        if (!sshConnection) {
-            // SSH connection should exist by now (resolve() just completed).
-            // If not, something went wrong; skip wiring.
-            return;
-        }
-
-        const exec = async (command: string) => sshConnection.exec(command);
+        // exec resolves the resolver's *current* SSH connection at call time (see
+        // lazyExec) — never captured — so a reconnect's fresh connection is picked up
+        // automatically and post-reconnect terminals/reaper hit the live channel
+        // instead of the dead pre-reconnect one (headline #3).
+        const exec = lazyExec(resolver);
         const openTerminal: OpenTerminal = (options) => vscode.window.createTerminal(options);
 
         const terminalProvider = new TmuxTerminalProvider({
@@ -163,10 +164,72 @@ function wireTmuxTerminalLayer(
         });
 
         logger.trace('Tmux terminal layer wired successfully');
+
+        // The reconnect handle: on a later resolve-success the provider/reaper are
+        // already registered and their lazy `exec` targets the fresh connection, so
+        // nothing is re-registered. Re-reconcile provider state (re-attach survivors,
+        // adopt orphans that appeared during the drop — reopen() is idempotent) and
+        // re-run the reaper to clear any corpses left by the disconnect.
+        return {
+            refresh: () => {
+                terminalProvider.initialize()
+                    .catch((err) => logger.trace(`Tmux provider refresh failed: ${err instanceof Error ? err.message : String(err)}`));
+                reaper.reap()
+                    .catch((err) => logger.trace(`Tmux reaper refresh failed: ${err instanceof Error ? err.message : String(err)}`));
+            },
+        };
     } catch (err) {
-        // Wiring failure must never break the connection; log and continue.
+        // Wiring failure must never break the connection; log and continue. No layer
+        // is returned, so idempotentResolveHandler retries wiring on the next resolve.
         logger.trace(`Tmux wiring failed: ${err instanceof Error ? err.message : String(err)}`);
+        return undefined;
     }
+}
+
+/**
+ * A wired tmux terminal layer's reconnect handle. `refresh()` is what a later
+ * resolve-success (reconnect) invokes in place of re-wiring: it re-reconciles
+ * provider state and re-runs the reaper, but never re-registers the profile
+ * provider / event handlers / default-profile write (those survive the reconnect).
+ */
+interface TmuxTerminalLayer {
+    refresh(): void;
+}
+
+/**
+ * Build the resolve-success callback that wires the tmux layer exactly once, then
+ * on every later resolve (reconnect) refreshes the existing layer instead of
+ * re-registering it. `wire` is injected (rather than called inline) so this
+ * idempotency is unit-testable without the VS Code terminal surface; it returns
+ * `undefined` while a gate is unmet, in which case wiring is retried next resolve.
+ */
+export function idempotentResolveHandler(wire: () => TmuxTerminalLayer | undefined): () => void {
+    let layer: TmuxTerminalLayer | undefined;
+    return () => {
+        if (layer) {
+            layer.refresh(); // reconnect: refresh provider state + re-reap only, no re-register
+            return;
+        }
+        layer = wire();
+    };
+}
+
+/**
+ * A {@link RemoteExec} bound to the resolver's *current* SSH connection, resolved
+ * at call time rather than captured at wire time. On a reconnect the resolver swaps
+ * in a fresh `SSHConnection`; a captured connection would pin every terminal and the
+ * reaper to the dead pre-reconnect channel — the "post-reconnect terminals fail"
+ * headline bug. Rejects when no connection is live so the provider/reaper degrade via
+ * their existing never-throw probe paths (a failed exec reads as "saw nothing").
+ */
+export function lazyExec(resolver: RemoteSSHResolver): RemoteExec {
+    return async (command: string) => {
+        const connection = resolver.getSSHConnection();
+        if (!connection) {
+            throw new Error('SSH connection is not available');
+        }
+        return connection.exec(command);
+    };
 }
 
 /** Title of the contributed profile (`package.json` contributes.terminal.profiles) —

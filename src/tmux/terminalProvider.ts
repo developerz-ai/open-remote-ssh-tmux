@@ -379,8 +379,14 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         return slot;
     }
 
-    /** Open (or re-attach — `-A` is idempotent) a terminal for `slot`. */
+    /** Open (or re-attach — `-A` is idempotent) a terminal for `slot`. Idempotent
+     * across reconnects: a re-resolve re-runs {@link reconcile} over the same mapping,
+     * so a slot already backing an open terminal in this window is skipped rather than
+     * spawning a second, mirrored tab. Only genuinely-not-open survivors/orphans open. */
     private reopen(slot: number): void {
+        if (this.openSlots.has(slot)) {
+            return;
+        }
         this.openSlots.add(slot);
         this.openTerminal(this.buildOptions(slot));
     }
