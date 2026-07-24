@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
     compileTemplate,
     escapeCustomInstallPath,
+    findServerInstallPath,
     generateBashInstallScript,
     parseServerInstallOutput,
     ServerInstallOptions,
@@ -57,6 +58,48 @@ describe('compileTemplate', () => {
         await writeTemplate('t.sh', 'VALUE="%%KEY%%"');
         expect(compileTemplate('t.sh', { KEY: 'contains $$ literally' }, extensionPath))
             .toBe('VALUE="contains $$ literally"');
+    });
+});
+
+// `findServerInstallPath` resolves a per-host custom install path
+// (`remote.SSH.serverInstallPath`) from a hostname -> path map whose keys may
+// be `Host`-style wildcard patterns; `matchHostnamePattern` (unexported, only
+// reachable through this) decides which pattern wins. No test exists yet.
+describe('findServerInstallPath', () => {
+    it('prefers an exact match over any wildcard', () => {
+        const pathMap = { '*': '/opt/general', '*.example.com': '/opt/subdomain', 'host.example.com': '/opt/exact' };
+        expect(findServerInstallPath('host.example.com', pathMap)).toBe('/opt/exact');
+    });
+
+    it('prefers a more specific wildcard over the catch-all', () => {
+        const pathMap = { '*': '/opt/general', '*.example.com': '/opt/subdomain' };
+        expect(findServerInstallPath('host.example.com', pathMap)).toBe('/opt/subdomain');
+    });
+
+    it('falls back to the catch-all wildcard when nothing more specific matches', () => {
+        const pathMap = { '*': '/opt/general', '*.example.com': '/opt/subdomain' };
+        expect(findServerInstallPath('host.other.org', pathMap)).toBe('/opt/general');
+    });
+
+    it('picks the longer (more specific) of two matching wildcard patterns', () => {
+        const pathMap = { '*.com': '/opt/short', '*.example.com': '/opt/long' };
+        expect(findServerInstallPath('host.example.com', pathMap)).toBe('/opt/long');
+    });
+
+    it('escapes regex metacharacters in the pattern so "." only matches a literal dot', () => {
+        // A naive wildcard->regex conversion that forgets to escape "." would let
+        // "host.name" match "hostXname" (since unescaped "." means "any char").
+        const pathMap = { 'host.name': '/opt/dotted' };
+        expect(findServerInstallPath('hostXname', pathMap)).toBeUndefined();
+        expect(findServerInstallPath('host.name', pathMap)).toBe('/opt/dotted');
+    });
+
+    it('returns undefined when no pattern matches', () => {
+        expect(findServerInstallPath('unmatched.example.com', { 'other.example.com': '/opt/other' })).toBeUndefined();
+    });
+
+    it('returns undefined for an empty path map', () => {
+        expect(findServerInstallPath('any.host', {})).toBeUndefined();
     });
 });
 

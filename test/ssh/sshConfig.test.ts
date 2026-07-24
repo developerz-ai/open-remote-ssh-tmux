@@ -131,6 +131,54 @@ describe('SSHConfiguration.loadFromFS', () => {
         expect(config.getHostConfiguration('bar')['HostName']).toBe('bar.example.com');
     });
 
+    it('expands a comma-separated Include value as multiple independent patterns, not one literal path', async () => {
+        tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ssh-config-test-'));
+        const first = path.join(tmpDir, 'first.conf');
+        const second = path.join(tmpDir, 'second.conf');
+        await fs.promises.writeFile(first, 'Host first-host\n    HostName first.example.com\n');
+        await fs.promises.writeFile(second, 'Host second-host\n    HostName second.example.com\n');
+        const configPath = path.join(tmpDir, 'config');
+        await fs.promises.writeFile(configPath, `Include ${first}, ${second}\n`);
+        configOverrides.set('remote.SSH.configFile', configPath);
+
+        const config = await SSHConfiguration.loadFromFS();
+        expect(config.getHostConfiguration('first-host')['HostName']).toBe('first.example.com');
+        expect(config.getHostConfiguration('second-host')['HostName']).toBe('second.example.com');
+    });
+
+    it('resolves each comma-separated Include entry as its own glob, matching multiple files per entry', async () => {
+        tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ssh-config-test-'));
+        const includeDir = path.join(tmpDir, 'config.d');
+        await fs.promises.mkdir(includeDir, { recursive: true });
+        await fs.promises.writeFile(path.join(includeDir, 'a.conf'), 'Host glob-a\n    HostName a.example.com\n');
+        await fs.promises.writeFile(path.join(includeDir, 'b.conf'), 'Host glob-b\n    HostName b.example.com\n');
+        const configPath = path.join(tmpDir, 'config');
+        // Absolute glob pattern (not a bare relative one) so it's independent of
+        // the Include-resolution cwd quirk (glob always resolves relative to
+        // ~/.ssh regardless of which config file is being parsed).
+        await fs.promises.writeFile(configPath, `Include ${path.join(includeDir, '*.conf')}\n`);
+        configOverrides.set('remote.SSH.configFile', configPath);
+
+        const config = await SSHConfiguration.loadFromFS();
+        expect(config.getHostConfiguration('glob-a')['HostName']).toBe('a.example.com');
+        expect(config.getHostConfiguration('glob-b')['HostName']).toBe('b.example.com');
+    });
+
+    it('normalizes a multi-value IdentityFile line to a string[] instead of a single string', async () => {
+        const config = await loadFromContent(
+            'Host foo\n    IdentityFile ~/.ssh/id_rsa\n    IdentityFile ~/.ssh/id_ed25519\n'
+        );
+        const hostConfig = config.getHostConfiguration('foo');
+        expect(Array.isArray(hostConfig['IdentityFile'])).toBe(true);
+        expect(hostConfig['IdentityFile']).toHaveLength(2);
+    });
+
+    it('still returns a single IdentityFile line as a 1-element array (ssh-config always arrays this directive)', async () => {
+        const config = await loadFromContent('Host foo\n    IdentityFile ~/.ssh/id_rsa\n');
+        const hostConfig = config.getHostConfiguration('foo');
+        expect(hostConfig['IdentityFile']).toEqual(['~/.ssh/id_rsa']);
+    });
+
     it('applies an Include directive nested inside a Host block', async () => {
         tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ssh-config-test-'));
         const includedPath = path.join(tmpDir, 'included.conf');

@@ -565,3 +565,96 @@ describe('profile options (invisible + argv, no injection surface)', () => {
         expect(provider.mappedSlots()).toEqual([0]);
     });
 });
+
+describe('readMapping (malformed persisted state, defensive parsing)', () => {
+    // The constructor loads the persisted slot->sessionName mapping through
+    // `readMapping`, which must tolerate a hand-edited or corrupted
+    // workspaceState blob (bad key, bad value) by dropping just the bad entry
+    // rather than throwing or resurrecting garbage slots.
+    it('drops a non-numeric key, a negative slot, a non-integer slot, and a non-string value; keeps the valid entry', async () => {
+        const state = fakeState({
+            [SLOT_MAPPING_STATE_KEY]: {
+                'x': name(9),
+                '-1': name(9),
+                '1.5': name(9),
+                '0': 42,
+                '3': name(3),
+            },
+        });
+        const exec = fakeExec({ existing: [name(3)] });
+        const { provider } = makeProvider({ state, exec });
+
+        await provider.initialize();
+
+        expect(provider.mappedSlots()).toEqual([3]);
+    });
+
+    it('treats a completely empty/missing persisted mapping as no survivors, without throwing', async () => {
+        const { provider } = makeProvider({ state: fakeState({}) });
+        expect(() => provider.mappedSlots()).not.toThrow();
+        expect(provider.mappedSlots()).toEqual([]);
+    });
+});
+
+describe('sessionExists (has-session stderr variants)', () => {
+    // sessionExists reads MISSING_SESSION_RE against stderr (no exit code is
+    // surfaced by exec). Every phrasing tmux actually uses for "not there" must
+    // prune the mapping, not just the one variant exercised elsewhere
+    // ("can't find session").
+    it.each([
+        `no server running on /tmp/tmux-1000/default`,
+        `error connecting to /tmp/tmux-1000/default (No such file or directory)`,
+    ])('prunes a mapped slot whose has-session reports: %s', async (stderr) => {
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const exec = vi.fn(async (command: string) => {
+            if (command.includes('list-sessions')) {
+                return { stdout: '', stderr: '' };
+            }
+            if (command.includes('has-session')) {
+                return { stdout: '', stderr };
+            }
+            return { stdout: '', stderr: '' };
+        });
+        const { provider } = makeProvider({ state, exec });
+
+        await provider.initialize();
+
+        expect(provider.mappedSlots()).toEqual([]); // pruned, not kept as a false survivor
+    });
+});
+
+describe('folderName (tab title from a remote cwd, edge inputs)', () => {
+    // folderName titles the tab after the workspace folder — must degrade
+    // sanely for edge-case remote paths instead of producing an empty title.
+    it.each([
+        ['/home/user/proj/', 'proj'],       // trailing slash
+        ['/', '/'],                          // root: no segment after stripping the slash
+        ['', ''],                            // empty cwd: falls back to the whole (empty) path
+        ['/home/user//proj///', 'proj'],     // multiple trailing slashes
+    ])('titles cwd %s as %s', async (cwd, expected) => {
+        const provider = new TmuxTerminalProvider({
+            ctx: { hostKey: HOST, workspaceKey: WS, cwd },
+            exec: fakeExec(),
+            state: fakeState(),
+            openTerminal: () => { /* not exercised */ },
+            log: { info: vi.fn(), trace: vi.fn() },
+        });
+        const options = optionsOf(await provider.provideTerminalProfile());
+        expect(options.name).toBe(expected);
+    });
+});
+
+describe('slotFromCreationOptions (defensive parsing of shellArgs)', () => {
+    // handleTerminalOpened parses the slot back out of `-s <name>` in
+    // shellArgs. A malformed/foreign options object (here: "-s" present but as
+    // the very last element, with no name following it) must resolve to
+    // "not ours" rather than throwing or indexing past the array.
+    it('does not throw when "-s" is the last shellArgs element with no value after it', () => {
+        const { provider } = makeProvider();
+        const dangling = { creationOptions: { shellPath: 'tmux', shellArgs: ['new-session', '-s'] } } as unknown as import('vscode').Terminal;
+
+        expect(() => provider.handleTerminalOpened(dangling)).not.toThrow();
+        // Not recognised as one of ours, so closing it must not free any slot.
+        expect(() => provider.handleTerminalClosed(dangling)).not.toThrow();
+    });
+});
