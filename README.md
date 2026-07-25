@@ -206,6 +206,13 @@ and v1.1.0. v1.0.0 and v1.1.0 are the only releases.
   50k-line scrollback existed but was reachable only via tmux's own
   keybindings — a leaked tmux UI. Now `mouse on`, with `set-clipboard on` so
   drag-select still reaches the local clipboard over OSC52.
+- **<kbd>PageUp</kbd> recalled the previous command** (through v1.1.1). The same
+  bug as the wheel, one input device over: tmux binds nothing to PageUp, so the
+  key reached the shell and readline's stock `/etc/inputrc` ran
+  history-search-backward — PageUp "scrolled" the command above, not the screen.
+  Fixed in **v1.1.2**: PageUp enters copy mode already paged up, PageDown pages
+  back and leaves copy mode by itself at the bottom, and a full-screen app on the
+  alternate screen (vim, less, htop) still gets both keys verbatim.
 - **Terminal options were silently ignored** (pre-1.0.0). `set-option -t <name>`
   needs a trailing colon; without it `status`/`history-limit` never applied.
 - **`historyLimit` was a complete no-op** (through v1.0.3). tmux reads
@@ -399,6 +406,7 @@ tmux terminals: 0 re-attached, 1 reclaimed, 0 adopted, 0 pruned
 | "Persistent Shell" is in the picker but opens a normal shell | The default profile points elsewhere, so `New Terminal` bypasses tmux. | Set `"terminal.integrated.defaultProfile.linux": "Persistent Shell"`, or clear your existing default so the extension can set it. |
 | Reopening a window gives an **empty** terminal while previous work seems lost | Fixed in 1.1.0. VS Code keeps a closed window's pty alive for its reconnection grace (3h), so the tmux client stays *attached* and v1.0.0 refused to reattach. | Upgrade. Your work was never lost — `tmux ls` on the remote still shows the session; 1.1.0 reclaims it automatically. |
 | Scroll wheel cycles shell history instead of scrolling | Fixed in 1.1.0 (`mouse on` was never set). | Upgrade. |
+| <kbd>PageUp</kbd> recalls the previous command instead of scrolling | Fixed in 1.1.2 (nothing was bound to the key, so the shell got it and readline ran history-search-backward). | Upgrade. |
 | Splits are not restored after a restart | Fixed in 1.1.0. v1.0.0 marked terminals `isTransient`, which opted them out of VS Code's layout persistence. | Upgrade. |
 
 ### Inspecting the remote directly

@@ -136,7 +136,60 @@ describe('buildAttachOrCreateArgv', () => {
             ';', 'set-option', '-t', `=${NAME}:`, 'history-limit', '50000',
             ';', 'set-option', '-t', `=${NAME}:`, 'mouse', 'on',
             ';', 'set-option', '-s', 'set-clipboard', 'on',
+            ';', 'bind-key', '-n', 'PPage', 'if-shell', '-F', '#{alternate_on}',
+            'send-keys PPage', 'copy-mode -eu',
+            ';', 'bind-key', '-n', 'NPage', 'if-shell', '-F', '#{alternate_on}',
+            'send-keys NPage',
         ]);
+    });
+
+    // Same class of bug as the scroll wheel: with no root-table binding, PageUp is
+    // just bytes for the shell, and a stock `/etc/inputrc` (and most zsh setups) maps
+    // it to history-search-backward — so PageUp "scrolls" the COMMAND above instead of
+    // the screen, and the 50000-line scrollback is again reachable only through tmux's
+    // own `prefix + [`. Binding PageUp to `copy-mode -u` makes the key do what every
+    // terminal user means by it. `-e` (exit-on-bottom) is what makes PageDown's other
+    // half work: paging back down to the last line leaves copy mode on its own, so the
+    // user never has to know they were in a tmux mode at all.
+    it('binds PageUp to copy-mode so it scrolls the screen, not shell history', () => {
+        const argv = buildAttachOrCreateArgv(NAME, '/home/user/proj');
+        const at = argv.indexOf('PPage');
+        expect(at, 'PageUp unbound — it would run history-search-backward').toBeGreaterThan(-1);
+        expect(argv.slice(at - 3, at)).toEqual([';', 'bind-key', '-n']);
+        expect(argv[argv.length - 1 - argv.slice().reverse().indexOf('copy-mode -eu')])
+            .toBe('copy-mode -eu');
+    });
+
+    // A full-screen app (vim, less, htop, a pager) has its own idea of PageUp/PageDown
+    // and draws on the alternate screen, where there is no scrollback to page into.
+    // `if-shell -F '#{alternate_on}'` sends the key through untouched for exactly those
+    // panes — the binding only takes over when the pane is the normal screen, i.e. when
+    // scrolling is the only thing PageUp could sensibly mean. `-F` is a format test, so
+    // no shell is spawned per keypress.
+    it('passes PageUp/PageDown through to full-screen apps on the alternate screen', () => {
+        const argv = buildAttachOrCreateArgv(NAME, '/home/user/proj');
+        for (const [key, send] of [['PPage', 'send-keys PPage'], ['NPage', 'send-keys NPage']]) {
+            const at = argv.indexOf(key);
+            expect(argv.slice(at + 1, at + 5)).toEqual(['if-shell', '-F', '#{alternate_on}', send]);
+        }
+    });
+
+    // PageDown gets no else-branch on purpose. In copy mode tmux's own copy-mode table
+    // already pages down (and `-e` drops out at the bottom), so the root binding is only
+    // consulted when the pane is NOT in a mode — where there is nothing below the live
+    // screen to scroll to and the only thing the key could do is the history-search-forward
+    // this whole binding exists to stop. `if-shell` with no else command is the no-op.
+    it('swallows PageDown outside copy mode instead of recalling the next command', () => {
+        const argv = buildAttachOrCreateArgv(NAME, '/home/user/proj');
+        const at = argv.indexOf('NPage');
+        expect(argv.slice(at + 1)).toEqual(['if-shell', '-F', '#{alternate_on}', 'send-keys NPage']);
+    });
+
+    // The key table is server-global — tmux has no per-session bindings — so these two
+    // MUST come after the `-gu` restore, like every other fallible command in the chain.
+    it('binds keys only after the global history-limit has been restored', () => {
+        const argv = buildAttachOrCreateArgv(NAME, '/home/user/proj');
+        expect(argv.indexOf('bind-key')).toBeGreaterThan(argv.indexOf('-gu'));
     });
 
     // THE BUG THIS ORDERING EXISTS FOR. `history-limit` is consumed when a PANE is
