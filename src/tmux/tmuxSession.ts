@@ -32,6 +32,24 @@ const DEFAULT_HISTORY_LIMIT = 50000;
  * reaper conservative: a foreign `code`, `codex-x`, or `code-notes` is ignored. */
 const OWNED_SESSION_RE = new RegExp(`^${SESSION_PREFIX}[0-9a-f]+-\\d+$`);
 
+/**
+ * The `if-shell -F` predicate guarding the PageUp/PageDown bindings below: expands to
+ * `1` when the pane's application must receive the key untouched, `0` when the pane is
+ * a bare shell prompt — the one situation where the key can only mean "scroll".
+ *
+ * Two arms, and both are load-bearing (each verified against a real tmux 3.4 server):
+ *  - `alternate_on` — vim/htop/a pager draws on the alternate screen, which has no
+ *    scrollback to page into. Note `seq 1 500 | less` reports
+ *    `pane_current_command=bash` (tmux names the pipeline's leader), so this arm, not
+ *    the command test, is what saves a piped pager;
+ *  - `#{m:*sh,#{pane_current_command}}` — a foreground command that is NOT a shell is a
+ *    TUI on the NORMAL screen, which is exactly how Claude Code runs (`claude`, or
+ *    `node` when installed through npm). Gating on `alternate_on` alone would steal
+ *    PageUp from it. Nearly every shell name ends in `sh` (bash/zsh/fish/dash/ksh/tcsh),
+ *    so the glob is the whole test; an exotic shell (`nu`, `xonsh`) simply keeps its keys.
+ */
+const PASS_KEYS_THROUGH = '#{?alternate_on,1,#{?#{m:*sh,#{pane_current_command}},0,1}}';
+
 /** A parsed row from `tmux list-sessions` (see `buildListSessions` `-F`). */
 export interface TmuxSession {
     /** `#{session_name}` */
@@ -199,20 +217,21 @@ export function buildAttachOrCreateArgv(
         // up one screen; `-e` makes it exit by itself once PageDown reaches the bottom,
         // so copy mode is never something the user has to notice, let alone leave.
         //
-        // `if-shell -F '#{alternate_on}'` is a format test (no shell per keypress): a
-        // full-screen app — vim, less, htop — owns its own paging and has no scrollback
-        // to page into, so it keeps the key verbatim. PageDown deliberately has no
-        // else-branch: outside copy mode there is nothing below the live screen, and the
-        // only thing left for the key to do is the history-search-forward being fixed.
+        // `if-shell -F` is a format test (no shell per keypress) against
+        // `PASS_KEYS_THROUGH` above: the binding takes the key ONLY at a bare shell
+        // prompt, so vim/less/htop and normal-screen TUIs like Claude Code keep their own
+        // PageUp/PageDown. PageDown deliberately has no else-branch: outside copy mode
+        // there is nothing below the live screen, and the only thing left for the key to
+        // do is the history-search-forward being fixed.
         //
         // Scope, stated plainly: key tables are SERVER-global — tmux has no per-session
         // bindings — so unlike `mouse`/`status` these two outlive our sessions and apply
         // to the user's own sessions on the same server until it exits (never written to
         // their ~/.tmux.conf). Same accepted blast radius as `set-clipboard` above, and
         // the same reason they sit after the `-gu` restore: anything fallible last.
-        ';', 'bind-key', '-n', 'PPage', 'if-shell', '-F', '#{alternate_on}',
+        ';', 'bind-key', '-n', 'PPage', 'if-shell', '-F', PASS_KEYS_THROUGH,
         'send-keys PPage', 'copy-mode -eu',
-        ';', 'bind-key', '-n', 'NPage', 'if-shell', '-F', '#{alternate_on}',
+        ';', 'bind-key', '-n', 'NPage', 'if-shell', '-F', PASS_KEYS_THROUGH,
         'send-keys NPage',
     ];
 }

@@ -119,6 +119,16 @@ describe('buildAttachOrCreateArgv', () => {
     // is a bare `;` element (the shell form writes `\;` only to survive the shell).
     const NAME = `code-${HASH_PROJ}-0`;
 
+    // The `if-shell -F` predicate guarding the PageUp/PageDown bindings: 1 = the pane's
+    // application keeps the key, 0 = it means "scroll" and is ours. Pinned here as a
+    // literal (not imported) so a change to the builder's format string has to be made
+    // deliberately in both places. Every arm verified against a real tmux 3.4 server:
+    // bash prompt → 0; `node` in the foreground → 1; `seq 1 500 | less` → 1 through the
+    // alternate-screen arm, because a piped pager still reports
+    // `pane_current_command=bash` — which is why the command test extends the
+    // `alternate_on` test rather than replacing it.
+    const PASS_THROUGH = '#{?alternate_on,1,#{?#{m:*sh,#{pane_current_command}},0,1}}';
+
     it('emits attach-or-create argv with per-session hardening/cosmetics', () => {
         // `-s` names the NEW session (exact by construction); `set-window-option`'s
         // `-t` is target-session and accepts bare `=<name>`. `set-option`'s `-t` is
@@ -136,9 +146,9 @@ describe('buildAttachOrCreateArgv', () => {
             ';', 'set-option', '-t', `=${NAME}:`, 'history-limit', '50000',
             ';', 'set-option', '-t', `=${NAME}:`, 'mouse', 'on',
             ';', 'set-option', '-s', 'set-clipboard', 'on',
-            ';', 'bind-key', '-n', 'PPage', 'if-shell', '-F', '#{alternate_on}',
+            ';', 'bind-key', '-n', 'PPage', 'if-shell', '-F', PASS_THROUGH,
             'send-keys PPage', 'copy-mode -eu',
-            ';', 'bind-key', '-n', 'NPage', 'if-shell', '-F', '#{alternate_on}',
+            ';', 'bind-key', '-n', 'NPage', 'if-shell', '-F', PASS_THROUGH,
             'send-keys NPage',
         ]);
     });
@@ -160,17 +170,19 @@ describe('buildAttachOrCreateArgv', () => {
             .toBe('copy-mode -eu');
     });
 
-    // A full-screen app (vim, less, htop, a pager) has its own idea of PageUp/PageDown
-    // and draws on the alternate screen, where there is no scrollback to page into.
-    // `if-shell -F '#{alternate_on}'` sends the key through untouched for exactly those
-    // panes — the binding only takes over when the pane is the normal screen, i.e. when
-    // scrolling is the only thing PageUp could sensibly mean. `-F` is a format test, so
-    // no shell is spawned per keypress.
-    it('passes PageUp/PageDown through to full-screen apps on the alternate screen', () => {
+    // The keys are OURS only at a bare shell prompt — the one place PageUp has no other
+    // meaning and readline would run history-search-backward. Everything else keeps them:
+    //   - alternate screen on  → vim/htop/a pager owns the keys, and there is no
+    //     scrollback to page into anyway;
+    //   - foreground command is not a shell → a TUI on the NORMAL screen, which is
+    //     exactly how Claude Code (and any other Ink/React app) runs. Gating on
+    //     `alternate_on` alone would steal PageUp from it.
+    // `-F` is a format test, so no shell is spawned per keypress.
+    it('takes the keys only at a shell prompt — a normal-screen TUI keeps them', () => {
         const argv = buildAttachOrCreateArgv(NAME, '/home/user/proj');
         for (const [key, send] of [['PPage', 'send-keys PPage'], ['NPage', 'send-keys NPage']]) {
             const at = argv.indexOf(key);
-            expect(argv.slice(at + 1, at + 5)).toEqual(['if-shell', '-F', '#{alternate_on}', send]);
+            expect(argv.slice(at + 1, at + 5)).toEqual(['if-shell', '-F', PASS_THROUGH, send]);
         }
     });
 
@@ -179,10 +191,10 @@ describe('buildAttachOrCreateArgv', () => {
     // consulted when the pane is NOT in a mode — where there is nothing below the live
     // screen to scroll to and the only thing the key could do is the history-search-forward
     // this whole binding exists to stop. `if-shell` with no else command is the no-op.
-    it('swallows PageDown outside copy mode instead of recalling the next command', () => {
+    it('swallows PageDown at a shell prompt instead of recalling the next command', () => {
         const argv = buildAttachOrCreateArgv(NAME, '/home/user/proj');
         const at = argv.indexOf('NPage');
-        expect(argv.slice(at + 1)).toEqual(['if-shell', '-F', '#{alternate_on}', 'send-keys NPage']);
+        expect(argv.slice(at + 1)).toEqual(['if-shell', '-F', PASS_THROUGH, 'send-keys NPage']);
     });
 
     // The key table is server-global — tmux has no per-session bindings — so these two

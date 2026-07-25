@@ -1,3 +1,6 @@
+## 1.1.3
+- fix: the 1.1.2 PageUp binding took the key from Claude Code. It passed the key through only on the alternate screen, but an Ink/React TUI — Claude Code, and most others — draws on the *normal* screen, so it looked like a shell prompt. The binding now takes PageUp/PageDown only when the pane's foreground command is a shell *and* the alternate screen is off; everything else (`claude`, `node`, a REPL, vim, htop) keeps both keys. Both arms are needed: a piped pager (`seq 1 500 | less`) still reports `pane_current_command=bash`, so only the alternate-screen test saves it
+
 ## 1.1.2
 - fix: <kbd>PageUp</kbd> recalled the previous command instead of scrolling. tmux binds nothing to it, so the key reached the shell, where readline's stock `/etc/inputrc` maps it to history-search-backward — the keyboard half of the wheel bug fixed in 1.1.0. PageUp now enters tmux copy mode already paged up, and PageDown pages back down and drops out of it on its own at the bottom, so scrolling never surfaces a tmux mode. A full-screen app on the alternate screen (vim, less, htop) keeps both keys verbatim, and PageDown outside copy mode is swallowed rather than recalling the next command
 
