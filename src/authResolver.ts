@@ -204,6 +204,9 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
      * the terminal layer: VS Code keys `terminal.integrated.defaultProfile.<suffix>` off the
      * REMOTE platform, so writing that setting needs this, not the client's platform. */
     private remotePlatform: string | undefined;
+    /** The `ssh-remote+…` authority this resolver was last asked to resolve — see
+     * {@link getAuthority}. */
+    private resolvedAuthority: string | undefined;
     /** Terminal environment variables this resolver has already contributed, so a
      * re-resolve rewrites only what changed (`common/envCollection.ts`). Survives across
      * resolve attempts because the resolver instance does. */
@@ -220,6 +223,13 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
     /** Remote OS after resolve completes — see {@link defaultProfileSettingKey}. */
     getRemotePlatform(): string | undefined {
         return this.remotePlatform;
+    }
+
+    /** The full `ssh-remote+<encoded-host>` authority of this connection, for addressing the
+     * remote filesystem (`vscode.Uri`). Set as soon as `resolve` is entered, so it is
+     * available even while the connection is still coming up. */
+    getAuthority(): string | undefined {
+        return this.resolvedAuthority;
     }
 
     getTmuxCapability(): TmuxCapability | undefined {
@@ -249,6 +259,12 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
         }
 
         this.logger.info(`Resolving ssh remote authority '${authority}' (attempt #${context.resolveAttempt})`);
+
+        // Remember the authority VS Code is actually connected through. It is the only
+        // first-hand source of it — `vscode.env.remoteName` gives just the type (`ssh-remote`),
+        // and the workspace-folder URI is absent in an empty window — and the clipboard bridge
+        // needs the full string to address the remote filesystem (`getAuthority`).
+        this.resolvedAuthority = authority;
 
         const sshDest = SSHDestination.parseEncoded(dest);
 

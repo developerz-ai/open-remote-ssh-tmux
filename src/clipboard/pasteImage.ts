@@ -193,7 +193,7 @@ export function captureAttempts(
     hasText: boolean,
 ): CaptureAttempt[] {
     const attempts: CaptureAttempt[] = buildLocalCaptureCandidates(deps.platform, localPath).map(candidate => ({
-        label: candidate.argv[0],
+        label: candidate.label ?? candidate.argv[0],
         run: (): Promise<Uint8Array | undefined> => runCaptureCandidate(candidate, localPath),
     }));
     if (!hasText) {

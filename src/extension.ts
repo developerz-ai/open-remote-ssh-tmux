@@ -71,15 +71,26 @@ export async function activate(context: vscode.ExtensionContext) {
     // nothing bridges them. Falls back to an ordinary paste whenever there is no image on
     // the clipboard, so the keybinding never swallows a normal text paste.
     context.subscriptions.push(vscode.commands.registerCommand('openremotessh.pasteImage', async () => {
-        const authority = vscode.workspace.workspaceFolders?.[0]?.uri.authority;
-        const handled = authority
-            ? await pasteClipboardImage({
+        // Prefer the open folder's authority; fall back to the one the resolver was asked for.
+        // The folder URI is absent in an empty window (and `vscode.env.remoteName` only ever
+        // says `ssh-remote`, not which host), and without an authority there is no remote
+        // filesystem to write the image to.
+        const authority = vscode.workspace.workspaceFolders?.[0]?.uri.authority
+            ?? remoteSSHResolver.getAuthority();
+        let handled = false;
+        if (authority) {
+            handled = await pasteClipboardImage({
                 exec: lazyExec(remoteSSHResolver),
                 log: logger,
                 platform: process.platform,
                 authority,
-            })
-            : false;
+            });
+        } else {
+            // Previously this fell through to a text paste in silence, which is how the
+            // feature came to be reported as "nothing happens and there are no logs" — the
+            // one outcome with no trace at all was also the easiest one to hit.
+            logger.info('clipboard image: no remote authority for this window — pasting as text');
+        }
         if (!handled) {
             await vscode.commands.executeCommand('workbench.action.terminal.paste');
         }
