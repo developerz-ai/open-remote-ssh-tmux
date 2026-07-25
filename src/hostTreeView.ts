@@ -24,6 +24,34 @@ class HostLocationItem {
 
 type DataTreeItem = HostItem | HostLocationItem;
 
+/**
+ * The tree's root nodes: the user's configured hosts, plus any host we remember a folder for
+ * that the config does not name.
+ *
+ * Those two sets are not the same, which is the bug this exists to fix. A root node used to
+ * come *only* from a `Host` entry in the SSH config, while a remembered folder is keyed by the
+ * hostname decoded from the remote authority — so connecting to `host.example.com` directly
+ * (rather than through a configured alias) recorded the folder under a key with no node to
+ * hang it on. It sat in `globalState`, correct and unreachable: reported from the field as
+ * "I opened a dir and it's not showing in the list". Wildcard/negated `Host` patterns are
+ * excluded from the configured list upstream (they name no single host), which makes a
+ * config built out of patterns another way to hit the same dead end.
+ *
+ * Configured hosts keep their file order — that order is the user's, and re-sorting a list
+ * they scan by position would be its own small betrayal. The remembered-only extras go after
+ * them, sorted, because `globalState` key order is an implementation detail and a tree that
+ * reshuffles itself between renders is worse than one that is merely alphabetical.
+ *
+ * Pure and exported so the merge rule is unit-testable without standing up TreeItem,
+ * EventEmitter and ThemeIcon; the view keeps only presentation.
+ */
+export function rootHostList(configured: readonly string[], remembered: readonly string[]): string[] {
+    const hosts = [...new Set(configured)];
+    const known = new Set(hosts);
+    const extras = remembered.filter(host => !known.has(host)).sort((a, b) => a.localeCompare(b));
+    return [...hosts, ...extras];
+}
+
 export class HostTreeDataProvider extends Disposable implements vscode.TreeDataProvider<DataTreeItem> {
 
     private readonly _onDidChangeTreeData = this._register(new vscode.EventEmitter<DataTreeItem | DataTreeItem[] | void>());
@@ -75,7 +103,7 @@ export class HostTreeDataProvider extends Disposable implements vscode.TreeDataP
     async getChildren(element?: HostItem): Promise<DataTreeItem[]> {
         if (!element) {
             const sshConfigFile = await SSHConfiguration.loadFromFS();
-            const hosts = sshConfigFile.getAllConfiguredHosts();
+            const hosts = rootHostList(sshConfigFile.getAllConfiguredHosts(), this.locationHistory.getHosts());
             return hosts.map(hostname => new HostItem(hostname, this.locationHistory.getHistory(hostname)));
         }
         if (element instanceof HostItem) {

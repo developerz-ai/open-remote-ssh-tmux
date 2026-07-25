@@ -57,6 +57,50 @@ describe('RemoteLocationHistory', () => {
             const history = new RemoteLocationHistory(context);
             expect(history.getHistory('h')).toEqual(['/a', '/b']);
         });
+
+        // `globalState` is shared by every window of the profile, so the window showing the
+        // tree is usually NOT the window that opened the folder. Answering from the
+        // constructor's snapshot meant the "SSH Targets" view of an already-open window
+        // showed a stale list — and even its explicit Refresh command could not fix it,
+        // because refresh only re-fires the tree event and never re-read storage.
+        it('reflects a write from another window without being reconstructed', () => {
+            const ctx = fakeContext({ h: ['/a'] });
+            const history = new RemoteLocationHistory(ctx.context);
+
+            ctx.seedExternal({ h: ['/a'], other: ['/z'] });
+
+            expect(history.getHistory('other')).toEqual(['/z']);
+        });
+    });
+
+    describe('getHosts', () => {
+        it('is empty when nothing has been remembered', () => {
+            const { context } = fakeContext();
+            expect(new RemoteLocationHistory(context).getHosts()).toEqual([]);
+        });
+
+        it('lists every host with a remembered location', () => {
+            const { context } = fakeContext({ hA: ['/a'], hB: ['/b'] });
+            expect(new RemoteLocationHistory(context).getHosts()).toEqual(['hA', 'hB']);
+        });
+
+        // Same shared-storage reason as getHistory above: the tree asks for the host list on
+        // every render, and that answer has to come from storage, not from activation time.
+        it('reflects a host added by another window', () => {
+            const ctx = fakeContext({ hA: ['/a'] });
+            const history = new RemoteLocationHistory(ctx.context);
+
+            ctx.seedExternal({ hA: ['/a'], hB: ['/b'] });
+
+            expect(history.getHosts()).toEqual(['hA', 'hB']);
+        });
+
+        it('omits a host whose entry normalised away to nothing', () => {
+            // `normalizeHistory` drops non-string members; a host left with no usable path
+            // must not become an empty root node in the tree.
+            const { context } = fakeContext({ hA: ['/a'], hB: [42] });
+            expect(new RemoteLocationHistory(context).getHosts()).toEqual(['hA']);
+        });
     });
 
     describe('addLocation', () => {
