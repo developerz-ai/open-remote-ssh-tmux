@@ -46,11 +46,36 @@ jobs:
           npm run lint:all
 
       - name: Lint commit
+        # `github.event.before` cannot be handed to commitlint as-is. It is all-zeros when
+        # the branch is created, and after a force-push it names the branch's PREVIOUS head
+        # — a commit that may be unreachable, on a diverged history, or absent from this
+        # clone entirely. `<gone>..<head>` then dies with "fatal: Invalid revision range"
+        # and reds the build for a commit that already passed. Seen for real: restoring
+        # main after GitHub's fork-sync "discard commits" button reset it onto upstream, so
+        # `before` was an upstream commit unrelated to our line of history.
+        # So: resolve a base this clone can actually diff against, and degrade to the
+        # pushed commit alone rather than failing.
         run: |
-          if [[ "${BASE_SHA}" = "0000000000000000000000000000000000000000" ]]; then
-            npx commitlint --to HEAD --verbose
+          BASE=""
+          if [[ "${BASE_SHA}" != "0000000000000000000000000000000000000000" ]] \
+            && git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null \
+            && git merge-base --is-ancestor "${BASE_SHA}" "${HEAD_SHA}"; then
+            # Ordinary fast-forward push: `before..head` is exactly the new commits.
+            BASE="${BASE_SHA}"
+          fi
+          if [[ -z "${BASE}" ]] && git rev-parse -q --verify "${HEAD_SHA}^" >/dev/null; then
+            # Force-push, branch creation, or a `before` this clone never had: what the
+            # push introduced is unknowable, so lint the pushed commit and nothing else.
+            # Walking back to the merge base instead would re-lint the whole divergence —
+            # 35 already-merged commits in the fork-sync case, one of which predates this
+            # rule and fails it. CI must not red on history it cannot change.
+            BASE="${HEAD_SHA}^"
+          fi
+          if [[ -n "${BASE}" ]]; then
+            npx commitlint --from "${BASE}" --to "${HEAD_SHA}" --verbose
           else
-            npx commitlint --from "${BASE_SHA}" --to "${HEAD_SHA}" --verbose
+            # Root commit: no parent to anchor a range to.
+            npx commitlint --to "${HEAD_SHA}" --verbose
           fi
         env:
           BASE_SHA: ${{ github.event.before }}
