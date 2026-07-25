@@ -190,6 +190,30 @@ export function buildAttachOrCreateArgv(
         // it applies to the user's whole tmux server until that server exits, and is
         // never written to their ~/.tmux.conf.
         ';', 'set-option', '-s', 'set-clipboard', 'on',
+        // The keyboard half of the same Invisible-UX problem `mouse on` fixes for the
+        // wheel. tmux binds nothing to PageUp in the root table, so the key reaches the
+        // shell as bytes — and readline's stock `/etc/inputrc` (plus most zsh setups)
+        // maps it to history-search-backward, so PageUp "scrolls" to the COMMAND above
+        // instead of the screen, with the 50000-line scrollback again reachable only
+        // through tmux's own `prefix + [`. `copy-mode -u` enters copy mode already paged
+        // up one screen; `-e` makes it exit by itself once PageDown reaches the bottom,
+        // so copy mode is never something the user has to notice, let alone leave.
+        //
+        // `if-shell -F '#{alternate_on}'` is a format test (no shell per keypress): a
+        // full-screen app — vim, less, htop — owns its own paging and has no scrollback
+        // to page into, so it keeps the key verbatim. PageDown deliberately has no
+        // else-branch: outside copy mode there is nothing below the live screen, and the
+        // only thing left for the key to do is the history-search-forward being fixed.
+        //
+        // Scope, stated plainly: key tables are SERVER-global — tmux has no per-session
+        // bindings — so unlike `mouse`/`status` these two outlive our sessions and apply
+        // to the user's own sessions on the same server until it exits (never written to
+        // their ~/.tmux.conf). Same accepted blast radius as `set-clipboard` above, and
+        // the same reason they sit after the `-gu` restore: anything fallible last.
+        ';', 'bind-key', '-n', 'PPage', 'if-shell', '-F', '#{alternate_on}',
+        'send-keys PPage', 'copy-mode -eu',
+        ';', 'bind-key', '-n', 'NPage', 'if-shell', '-F', '#{alternate_on}',
+        'send-keys NPage',
     ];
 }
 
