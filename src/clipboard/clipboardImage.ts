@@ -34,6 +34,10 @@ const SAFE_TOKEN = /^[A-Za-z0-9_-]+$/;
 export interface CaptureCandidate {
     readonly argv: string[];
     readonly output: 'file' | 'stdout';
+    /** Name for the "tried: …" log line. Defaults to `argv[0]`, which is enough until two
+     * candidates share a binary — the two Windows readers are both `powershell.exe`, and
+     * "powershell.exe, powershell.exe" cannot tell you which clipboard API declined. */
+    readonly label?: string;
 }
 
 /**
@@ -52,31 +56,67 @@ export interface CaptureCandidate {
 export function buildLocalCaptureCandidates(platform: string, outPath: string): CaptureCandidate[] {
     switch (platform) {
         case 'win32':
-            // `[Windows.Forms.Clipboard]::GetImage()`, not `Get-Clipboard -Format Image`
-            // (what shipped first, and what did not work): the latter exists only in Windows
-            // PowerShell 5.x — it was dropped from PowerShell 7 — and returns $null for
-            // clipboard contents delivered as a DIB, which is exactly what Win+Shift+S and
-            // most screenshot tools put there. GetImage() handles both, but it needs its
-            // assembly loaded explicitly and a single-threaded apartment: the clipboard is an
-            // STA-only OLE API, and it silently yields nothing from an MTA host.
+            // Two readers, because Windows has no single dependable one.
             //
-            // The PNG encoder is named explicitly too — the default `Save(path)` overload
-            // picks a format from nothing and can emit a non-PNG payload under a .png name,
-            // which anything sniffing by extension then mis-reads.
-            return [{
-                output: 'file',
-                argv: [
-                    'powershell.exe', '-NoProfile', '-NonInteractive', '-STA', '-Command',
-                    'Add-Type -AssemblyName System.Windows.Forms,System.Drawing; '
-                    + '$img = [System.Windows.Forms.Clipboard]::GetImage(); '
-                    + 'if ($img -eq $null) { exit 1 }; '
-                    + `$img.Save('${psQuote(outPath)}', [System.Drawing.Imaging.ImageFormat]::Png); exit 0`,
-                ],
-            }];
+            // Not `Get-Clipboard -Format Image` (what shipped first, and did not work): it
+            // exists only in Windows PowerShell 5.x — dropped from PowerShell 7 — and returns
+            // $null for clipboard contents delivered as a DIB, which is exactly what
+            // Win+Shift+S and most screenshot tools put there.
+            //
+            // WPF's `[Windows.Clipboard]::GetImage()` leads: it is the combination the
+            // long-standing implementations settled on (vscode-paste-image's `pc.ps1`, itself
+            // derived from img-clipboard-dump). WinForms follows as a second opinion — the two
+            // negotiate clipboard formats differently, and a DIB one declines the other has
+            // been observed to accept. Both need `-STA`: the clipboard is an STA-only OLE API
+            // and silently yields nothing from an MTA host.
+            //
+            // Both go through `-EncodedCommand` rather than inline `-Command` text, which is
+            // the fix for the reported "nothing happens" on Windows. The scripts contain
+            // `$variables`, single quotes, semicolons and a Windows path, and every one of
+            // those has to survive argument processing plus a CreateProcess command-line
+            // round trip. `$` in particular does not reliably survive — a spawning runtime
+            // stripping it outright is a documented failure (opencode #17616), and it turns
+            // `$img` into the bare word `img` for reasons no log can explain. Base64 of
+            // UTF-16LE is one opaque token with nothing left to interpret.
+            return [
+                {
+                    output: 'file',
+                    label: 'powershell (WPF clipboard)',
+                    argv: [...POWERSHELL_FLAGS, encodePowerShellCommand(
+                        'Add-Type -Assembly PresentationCore; '
+                        + '$img = [Windows.Clipboard]::GetImage(); '
+                        + 'if ($img -eq $null) { exit 1 }; '
+                        + `$stream = [IO.File]::Open('${psQuote(outPath)}', 'Create'); `
+                        + '$encoder = New-Object Windows.Media.Imaging.PngBitmapEncoder; '
+                        + '$encoder.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($img)) | Out-Null; '
+                        + '$encoder.Save($stream) | Out-Null; '
+                        + '$stream.Dispose(); exit 0'
+                    )],
+                },
+                {
+                    output: 'file',
+                    label: 'powershell (WinForms clipboard)',
+                    argv: [...POWERSHELL_FLAGS, encodePowerShellCommand(
+                        'Add-Type -AssemblyName System.Windows.Forms,System.Drawing; '
+                        + '$img = [System.Windows.Forms.Clipboard]::GetImage(); '
+                        + 'if ($img -eq $null) { exit 1 }; '
+                        // The PNG encoder is named explicitly — the default `Save(path)`
+                        // overload picks a format from nothing and can emit a non-PNG payload
+                        // under a .png name, which anything sniffing by extension mis-reads.
+                        + `$img.Save('${psQuote(outPath)}', [System.Drawing.Imaging.ImageFormat]::Png); exit 0`
+                    )],
+                },
+            ];
         case 'darwin':
             // pngpaste is not shipped with macOS (`brew install pngpaste`); a missing binary
-            // exits non-zero exactly like an imageless clipboard, so it just falls through.
-            return [{ output: 'file', argv: ['pngpaste', outPath] }];
+            // exits non-zero exactly like an imageless clipboard, so it just falls through —
+            // to AppleScript, which ships with the OS and is what Claude Code's own paste
+            // relies on. Without that fallback a stock Mac has no native reader at all and
+            // gets pushed to the visible webview panel for something the OS can do itself.
+            return [
+                { output: 'file', argv: ['pngpaste', outPath] },
+                { output: 'file', argv: ['osascript', '-e', appleScriptClipboardToPng(outPath)] },
+            ];
         case 'linux':
             // Wayland first. It is the default session on current GNOME and KDE, xclip cannot
             // speak to it at all, and a Wayland desktop running XWayland still answers an
@@ -93,11 +133,55 @@ export function buildLocalCaptureCandidates(platform: string, outPath: string): 
     }
 }
 
+/** Flags shared by both Windows readers. `-STA` is load-bearing (the clipboard is an STA-only
+ * OLE API); `-NoProfile` keeps a user's profile from printing into our output or slowing the
+ * spawn; `-NonInteractive` guarantees it can never sit waiting on a prompt. */
+const POWERSHELL_FLAGS = ['powershell.exe', '-NoProfile', '-NonInteractive', '-STA', '-EncodedCommand'];
+
+/** Encode a script for `powershell.exe -EncodedCommand`: base64 of UTF-16LE, which is the
+ * one form PowerShell accepts. See the win32 branch above for why the scripts are passed
+ * this way instead of as inline `-Command` text. */
+function encodePowerShellCommand(script: string): string {
+    return Buffer.from(script, 'utf16le').toString('base64');
+}
+
 /** Escape a value for a PowerShell single-quoted string, where a literal quote is doubled.
  * Without this a username containing an apostrophe (`C:\Users\O'Brien\…`) would close the
  * string early and hand the rest of the path to the parser as code. */
 function psQuote(value: string): string {
     return value.replace(/'/g, `''`);
+}
+
+/**
+ * AppleScript that writes the clipboard's PNG to `outPath`, or fails if there isn't one.
+ *
+ * `set eof` truncates before writing: the candidate that ran before this one may have left a
+ * partial file behind, and AppleScript's `write` appends from the current mark rather than
+ * replacing the contents — which would produce a corrupt PNG with a valid-looking size.
+ *
+ * The `on error` arm closes the handle and re-raises. `the clipboard as «class PNGf»` throws
+ * when the clipboard holds no image, which is an ordinary outcome here, but the file is
+ * already open by then and leaving it open would leak the handle for the life of the process.
+ * Re-raising keeps the non-zero exit the caller reads as "this reader found nothing".
+ */
+function appleScriptClipboardToPng(outPath: string): string {
+    const target = asQuote(outPath);
+    return [
+        `set outFile to open for access (POSIX file "${target}") with write permission`,
+        'try',
+        '    set eof outFile to 0',
+        '    write (the clipboard as «class PNGf») to outFile',
+        '    close access outFile',
+        'on error errMsg',
+        '    close access outFile',
+        '    error errMsg',
+        'end try',
+    ].join('\n');
+}
+
+/** Escape a value for an AppleScript double-quoted string: backslash first, then quote. */
+function asQuote(value: string): string {
+    return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
 /**

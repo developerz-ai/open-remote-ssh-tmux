@@ -100,7 +100,20 @@ describe('captureAttempts: native readers are silent, the webview one is not', (
     // Native readers still run with text present: a browser's "copy image" puts the source
     // URL on the text clipboard next to the bitmap, and the bitmap is the point.
     it('still runs the native readers when the clipboard holds text', () => {
-        expect(labels('win32', true)).toEqual(['powershell.exe']);
+        expect(labels('win32', true)).toEqual(['powershell (WPF clipboard)', 'powershell (WinForms clipboard)']);
+    });
+
+    // Two candidates on the same binary must stay distinguishable in the log, or the line
+    // that explains a miss reads "powershell.exe, powershell.exe" and says nothing about
+    // which clipboard API actually declined.
+    it('carries the per-candidate label rather than the binary name', () => {
+        expect(new Set(labels('win32', false)).size).toBe(labels('win32', false).length);
+    });
+
+    // macOS has two natives now: pngpaste if it was installed, then AppleScript, which is
+    // always there. The webview stays last — it is the only one that shows a panel.
+    it('tries pngpaste then osascript on darwin before the webview', () => {
+        expect(labels('darwin', false)).toEqual(['pngpaste', 'osascript', 'webview']);
     });
 
     // The platforms with no native reader at all are exactly the ones that need the

@@ -22,42 +22,100 @@ describe('buildLocalCaptureCandidates: read the LOCAL clipboard (extension runs 
     // splits X11/Wayland, and every one of these binaries is optional. The caller tries
     // them in order and falls through to the webview bridge when they all miss.
 
+    /** The script a `-EncodedCommand` candidate actually runs, decoded back for assertions.
+     *  PowerShell expects base64 of UTF-16LE, so this is the inverse of that. */
+    const decodePowerShell = (candidate: { argv: string[] }): string => {
+        const encoded = candidate.argv[candidate.argv.indexOf('-EncodedCommand') + 1];
+        return Buffer.from(encoded, 'base64').toString('utf16le');
+    };
+
     it('offers a PowerShell reader on win32 that writes a PNG to the given path', () => {
         const [first] = buildLocalCaptureCandidates('win32', 'C:\\tmp\\shot.png');
         expect(first.argv[0]).toBe('powershell.exe');
         expect(first.output).toBe('file');
-        const script = first.argv.join(' ');
+        const script = decodePowerShell(first);
         expect(script).toContain('C:\\tmp\\shot.png');
-        // Must save as PNG explicitly — the default `Save(path)` overload picks an encoder
-        // from nothing and can write a non-PNG payload under a .png name.
+        // Must encode as PNG explicitly — an encoder chosen by default can write a non-PNG
+        // payload under a .png name, which anything sniffing by extension then mis-reads.
         expect(script).toContain('Png');
+    });
+
+    // THE FIELD BUG, and the reason the script is no longer passed as inline `-Command` text.
+    //
+    // The script needs `$variables`, and `$` does not survive every layer between here and
+    // PowerShell's parser: argument processing in the spawning runtime can strip it outright
+    // (documented in the wild — opencode #17616, "Bun spawn strips $ in PowerShell"), leaving
+    // `$img` as the bare word `img` and a script that fails for reasons no log can explain.
+    // Quoting is the same story: the command carries single quotes, semicolons and a Windows
+    // path, all of which have to cross a CreateProcess command-line round trip intact.
+    //
+    // `-EncodedCommand` sidesteps the entire class: base64 of UTF-16LE is one opaque token
+    // with no character any layer wants to interpret. It is also what the established
+    // implementations reach for after hitting exactly this.
+    it('passes the script as -EncodedCommand so quoting and $ cannot be mangled', () => {
+        const [first] = buildLocalCaptureCandidates('win32', 'C:\\tmp\\shot.png');
+        expect(first.argv).toContain('-EncodedCommand');
+        expect(first.argv).not.toContain('-Command');
+        // Base64 only: nothing for a shell, cmd.exe or CreateProcess quoting to touch.
+        const encoded = first.argv[first.argv.indexOf('-EncodedCommand') + 1];
+        expect(encoded).toMatch(/^[A-Za-z0-9+/]+={0,2}$/);
+        // And it must round-trip to a script that still has its variables.
+        expect(decodePowerShell(first)).toContain('$img');
     });
 
     // `Get-Clipboard -Format Image` (the first shipped attempt) is the wrong API here: it
     // exists only in Windows PowerShell 5.x — removed from PowerShell 7 — and returns null
     // for clipboard contents that arrive as a DIB, which is what Win+Shift+S produces.
-    // `[Windows.Forms.Clipboard]::GetImage()` handles both, but needs its assembly loaded
-    // and an STA apartment, so both are stated explicitly rather than assumed.
-    it('loads the Windows.Forms assembly, requests STA, and uses Clipboard::GetImage', () => {
-        const [first] = buildLocalCaptureCandidates('win32', 'C:\\tmp\\shot.png');
-        const script = first.argv.join(' ');
-        expect(script).toContain('Add-Type');
-        expect(script).toContain('System.Windows.Forms');
-        expect(script).toContain('Clipboard]::GetImage()');
-        expect(first.argv).toContain('-STA');
+    // Both replacements need an STA apartment: the clipboard is an STA-only OLE API and
+    // silently yields nothing from an MTA host.
+    it('requests STA and skips the profile on every Windows candidate', () => {
+        for (const candidate of buildLocalCaptureCandidates('win32', 'C:\\tmp\\shot.png')) {
+            expect(candidate.argv).toContain('-STA');
+            expect(candidate.argv).toContain('-NoProfile');
+        }
+    });
+
+    // WPF's `[Windows.Clipboard]::GetImage()` + PngBitmapEncoder is the combination the
+    // long-standing implementations use (vscode-paste-image's pc.ps1, itself from
+    // img-clipboard-dump), so it leads. WinForms' `Clipboard::GetImage()` follows as a
+    // second opinion: the two go through different clipboard-format negotiation, and a DIB
+    // one declines the other has been observed to accept.
+    it('tries the WPF clipboard reader first, then WinForms as a second opinion', () => {
+        const candidates = buildLocalCaptureCandidates('win32', 'C:\\tmp\\shot.png');
+        expect(candidates).toHaveLength(2);
+
+        const wpf = decodePowerShell(candidates[0]);
+        expect(wpf).toContain('PresentationCore');
+        expect(wpf).toContain('[Windows.Clipboard]::GetImage()');
+        expect(wpf).toContain('PngBitmapEncoder');
+
+        const forms = decodePowerShell(candidates[1]);
+        expect(forms).toContain('System.Windows.Forms');
+        expect(forms).toContain('Clipboard]::GetImage()');
+    });
+
+    // Two candidates on one binary: without distinct labels the "tried: ..." log line reads
+    // "powershell.exe, powershell.exe" and cannot say which API declined the clipboard.
+    it('labels the two Windows candidates distinctly for the log', () => {
+        const [wpf, forms] = buildLocalCaptureCandidates('win32', 'C:\\tmp\\shot.png');
+        expect(wpf.label).toBeDefined();
+        expect(forms.label).toBeDefined();
+        expect(wpf.label).not.toBe(forms.label);
     });
 
     // PowerShell single-quoted strings escape a quote by doubling it. A username with an
     // apostrophe ("C:\Users\O'Brien\...") would otherwise terminate the string early and
     // turn the rest of the path into code.
     it('escapes single quotes in the output path', () => {
-        const [first] = buildLocalCaptureCandidates('win32', 'C:\\Users\\O\'Brien\\shot.png');
-        expect(first.argv.join(' ')).toContain('O\'\'Brien');
+        for (const candidate of buildLocalCaptureCandidates('win32', 'C:\\Users\\O\'Brien\\shot.png')) {
+            expect(decodePowerShell(candidate)).toContain('O\'\'Brien');
+        }
     });
 
     it('exits non-zero when the Windows clipboard holds no image', () => {
-        const [first] = buildLocalCaptureCandidates('win32', 'C:\\tmp\\shot.png');
-        expect(first.argv.join(' ')).toContain('exit 1');
+        for (const candidate of buildLocalCaptureCandidates('win32', 'C:\\tmp\\shot.png')) {
+            expect(decodePowerShell(candidate)).toContain('exit 1');
+        }
     });
 
     it('uses pngpaste on darwin', () => {
@@ -65,6 +123,32 @@ describe('buildLocalCaptureCandidates: read the LOCAL clipboard (extension runs 
         expect(first.argv[0]).toBe('pngpaste');
         expect(first.argv).toContain('/tmp/shot.png');
         expect(first.output).toBe('file');
+    });
+
+    // pngpaste is a `brew install`, so on a stock Mac the only native reader is absent and
+    // the user is pushed to the visible webview panel for something the OS can do itself.
+    // AppleScript's `the clipboard as «class PNGf»` ships with macOS — it is what Claude
+    // Code's own paste relies on — so it belongs in the chain as the no-install fallback.
+    it('falls back to osascript on darwin, so pngpaste is not required', () => {
+        const candidates = buildLocalCaptureCandidates('darwin', '/tmp/shot.png');
+        expect(candidates.map(c => c.argv[0])).toEqual(['pngpaste', 'osascript']);
+
+        const script = candidates[1].argv.join('\n');
+        expect(script).toContain('«class PNGf»');
+        expect(script).toContain('/tmp/shot.png');
+        // Truncate first: the failed candidate before it may have left a partial file, and
+        // AppleScript's `write` appends from the current mark rather than replacing.
+        expect(script).toContain('set eof');
+        // The handle must be closed even when the clipboard holds no PNG, or a miss leaks a
+        // file handle for the life of the process.
+        expect(script).toContain('close access');
+    });
+
+    it('escapes double quotes and backslashes in the osascript path', () => {
+        const candidates = buildLocalCaptureCandidates('darwin', '/tmp/we"ird\\shot.png');
+        const script = candidates[1].argv.join('\n');
+        expect(script).toContain('we\\"ird');
+        expect(script).toContain('\\\\shot.png');
     });
 
     // Wayland is the default on current GNOME/KDE and xclip cannot talk to it at all, so a
