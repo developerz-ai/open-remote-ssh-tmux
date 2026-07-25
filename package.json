@@ -2,7 +2,7 @@
 	"name": "open-remote-ssh-tmux",
 	"displayName": "Open Remote - SSH (tmux)",
 	"description": "Use any remote machine with a SSH server as your development environment.",
-	"version": "1.1.0",
+	"version": "1.1.1",
 	"publisher": "developerz-ai",
 	"repository": {
 		"type": "git",
