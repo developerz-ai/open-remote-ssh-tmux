@@ -48,8 +48,28 @@ export class RemoteLocationHistory {
         this.remoteLocationHistory = this.read();
     }
 
+    /** Locations remembered for `host`, freshest first.
+     *
+     *  Read through to `globalState` rather than answering from the constructor's snapshot:
+     *  that storage is shared by every window of the profile, and the window *showing* the
+     *  tree is usually not the window that opened the folder. Answering from the snapshot
+     *  made an already-open "SSH Targets" view permanently stale — its own Refresh command
+     *  could not fix it either, since refresh re-fires the tree event and never re-read
+     *  storage. The read is a `Map` lookup plus a normalise of a ≤20-entries-per-host object,
+     *  on a user-driven tree render; the staleness cost far more than the parse does. */
     getHistory(host: string): string[] {
+        this.remoteLocationHistory = this.read();
         return this.remoteLocationHistory[host] ?? [];
+    }
+
+    /** Every host with at least one remembered location, in storage order.
+     *
+     *  The tree needs this because a remembered host is not necessarily a *configured* one:
+     *  connecting by FQDN records the folder under that FQDN, which may appear nowhere in the
+     *  user's SSH config. See `rootHostList` in `hostTreeView.ts`. */
+    getHosts(): string[] {
+        this.remoteLocationHistory = this.read();
+        return Object.keys(this.remoteLocationHistory);
     }
 
     async addLocation(host: string, path: string) {
