@@ -21,6 +21,7 @@ import * as os from 'os';
 import { isNullable } from '@zokugun/is-it-type';
 import { ServerVersion } from './serverConfig';
 import { probeTmux, type TmuxCapability } from './tmux/tmuxBootstrap';
+import { applyEnvCollection } from './common/envCollection';
 
 const PASSWORD_RETRY_COUNT = 3;
 const PASSPHRASE_RETRY_COUNT = 3;
@@ -199,6 +200,14 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
     private socksTunnel: SSHTunnelConfig | undefined;
     private tunnels: TunnelInfo[] = [];
     private tmuxCapability: TmuxCapability | undefined;
+    /** Remote OS as reported by the server install (`linux`/`macos`/`windows`), captured for
+     * the terminal layer: VS Code keys `terminal.integrated.defaultProfile.<suffix>` off the
+     * REMOTE platform, so writing that setting needs this, not the client's platform. */
+    private remotePlatform: string | undefined;
+    /** Terminal environment variables this resolver has already contributed, so a
+     * re-resolve rewrites only what changed (`common/envCollection.ts`). Survives across
+     * resolve attempts because the resolver instance does. */
+    private readonly appliedEnvVariables = new Map<string, string>();
 
     private labelFormatterDisposable: vscode.Disposable | undefined;
 
@@ -208,6 +217,11 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
     }
 
     /** Exposed for tmux terminal provider wiring — the probe result after resolve completes. */
+    /** Remote OS after resolve completes — see {@link defaultProfileSettingKey}. */
+    getRemotePlatform(): string | undefined {
+        return this.remotePlatform;
+    }
+
     getTmuxCapability(): TmuxCapability | undefined {
         return this.tmuxCapability;
     }
@@ -387,6 +401,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                     this.context.extensionPath
                 );
 
+                this.remotePlatform = installResult.platform;
                 // Probe for tmux capability on the remote
                 this.tmuxCapability = await probeTmux(
                     (cmd) => this.sshConnection!.exec(cmd),
@@ -402,12 +417,19 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                     }
                 }
 
-                // Update terminal env variables
-                this.context.environmentVariableCollection.persistent = false;
-                for (const [key, value] of Object.entries(envVariables)) {
-                    if (value) {
-                        this.context.environmentVariableCollection.replace(key, value);
-                    }
+                // Update terminal env variables, but only where they actually changed.
+                // A reconnect re-resolves the same socket path (it comes from the
+                // already-running server), and re-writing it would mark every open terminal
+                // stale — VS Code then offers to relaunch them, which for this fork's
+                // tmux-backed terminals means discarding the session that survived the
+                // reconnect in the first place. See `common/envCollection.ts`.
+                const changedEnv = applyEnvCollection(
+                    this.context.environmentVariableCollection,
+                    this.appliedEnvVariables,
+                    envVariables
+                );
+                if (changedEnv.length) {
+                    this.logger.trace(`Terminal environment updated: ${changedEnv.join(', ')}`);
                 }
 
                 if (enableDynamicForwarding) {

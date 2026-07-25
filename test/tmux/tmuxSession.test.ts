@@ -128,10 +128,105 @@ describe('buildAttachOrCreateArgv', () => {
         // (status bar leaked, a hard Invisible-UX violation). The trailing `:`
         // (`=<name>:`) is required to get exact-match session + default window.
         expect(buildAttachOrCreateArgv(NAME, '/home/user/proj')).toEqual([
-            'new-session', '-A', '-s', NAME, '-c', '/home/user/proj',
+            'set-option', '-g', 'history-limit', '50000',
+            ';', 'new-session', '-A', '-s', NAME, '-c', '/home/user/proj',
+            ';', 'set-option', '-gu', 'history-limit',
             ';', 'set-window-option', '-t', `=${NAME}`, 'remain-on-exit', 'off',
             ';', 'set-option', '-t', `=${NAME}:`, 'status', 'off',
             ';', 'set-option', '-t', `=${NAME}:`, 'history-limit', '50000',
+            ';', 'set-option', '-t', `=${NAME}:`, 'mouse', 'on',
+            ';', 'set-option', '-s', 'set-clipboard', 'on',
+        ]);
+    });
+
+    // THE BUG THIS ORDERING EXISTS FOR. `history-limit` is consumed when a PANE is
+    // created, not when the option is set — and `new-session` has already created the
+    // session's one and only pane before any chained `set-option` runs. So the old form
+    // (set the option at session scope after new-session) left every terminal on tmux's
+    // 2000-line default while `show-options` cheerfully reported 50000, making the
+    // advertised `remote.SSH.tmux.historyLimit` setting a complete no-op. Verified on the
+    // live server: `show-options history-limit` = 50000 on all six real sessions, while
+    // `display-message '#{history_limit}'` = 2000 on every one of them.
+    //
+    // The only lever tmux gives is the GLOBAL option, read at pane creation. So set it,
+    // create, then immediately restore with `-gu`. Verified end-to-end on real tmux 3.4:
+    // new pane = 50000, the user's global back to 2000, pre-existing sessions untouched.
+    it('sets the global history-limit BEFORE new-session, since panes read it at creation', () => {
+        const argv = buildAttachOrCreateArgv(NAME, '/home/user/proj', undefined, { historyLimit: 12345 });
+        expect(argv.slice(0, 4)).toEqual(['set-option', '-g', 'history-limit', '12345']);
+        expect(argv.indexOf('new-session')).toBeGreaterThan(argv.indexOf('-g'));
+    });
+
+    // The global belongs to the user's whole tmux server, so it must not stay changed.
+    // Restoring immediately after `new-session` (and before the cosmetic options) is
+    // deliberate: tmux aborts a `;` chain at the first failing command, so anything that
+    // can fail must come AFTER the restore or a failure would leak our value.
+    it('restores the global with -gu immediately after new-session, before anything fallible', () => {
+        const argv = buildAttachOrCreateArgv(NAME, '/home/user/proj');
+        const restore = argv.indexOf('-gu');
+        expect(restore).toBeGreaterThan(argv.indexOf('new-session'));
+        expect(restore).toBeLessThan(argv.indexOf('set-window-option'));
+        expect(argv[restore + 1]).toBe('history-limit');
+    });
+
+    // Invisible UX: without `mouse on`, tmux leaves mouse reporting off, so the wheel
+    // emits arrow keys straight into the shell — scrolling "scrolls commands" (bash
+    // history) instead of the screen, and the 50000-line history-limit we configure is
+    // reachable ONLY via tmux's own `prefix + [` keybinding. That is a tmux UI the user
+    // must never need to know about, so mouse mode is not optional and not a setting.
+    it('enables mouse mode so the wheel scrolls scrollback, not shell history', () => {
+        const argv = buildAttachOrCreateArgv(NAME, '/home/user/proj');
+        const mouse = argv.indexOf('mouse');
+        expect(mouse, 'mouse option missing — wheel would cycle shell history').toBeGreaterThan(-1);
+        expect(argv[mouse + 1]).toBe('on');
+        // Scoped to this session (`-t =<name>:`), never a global `-g` that would
+        // reconfigure the user's own tmux sessions on the same server.
+        expect(argv.slice(mouse - 4, mouse)).toEqual([';', 'set-option', '-t', `=${NAME}:`]);
+    });
+
+    // `set-clipboard on` makes tmux emit OSC52 when text is copied, so a drag-select
+    // inside the remote tmux lands in the LOCAL clipboard across the SSH link (tmux's
+    // default `external` only forwards OSC52 from apps, never for tmux's own copies).
+    // This is what keeps mouse mode from degrading copy/paste: with mouse reporting on,
+    // selection belongs to tmux, so tmux has to be the one to reach the clipboard.
+    //
+    // `-s` (server scope) is deliberate and load-bearing: `set-clipboard` IS a server
+    // option, so a session-targeted `-t =<name>:` set is silently promoted to server
+    // scope anyway (verified against real tmux 3.4). Writing `-s` makes the real scope
+    // legible at the call site instead of hiding a global write behind session syntax.
+    it('enables OSC52 clipboard forwarding at its true (server) scope', () => {
+        const argv = buildAttachOrCreateArgv(NAME, '/home/user/proj');
+        const clip = argv.indexOf('set-clipboard');
+        expect(clip).toBeGreaterThan(-1);
+        expect(argv[clip + 1]).toBe('on');
+        expect(argv.slice(clip - 3, clip)).toEqual([';', 'set-option', '-s']);
+    });
+
+    // `takeOver` emits `-D`, which with `-A` makes tmux behave like `attach-session -d`:
+    // it evicts whatever client is already on the session before attaching. Verified
+    // against a real tmux 3.4 server — the old client's pty disappears from
+    // `list-clients`, the new one appears, and the pane's running process is untouched.
+    // Used only to reclaim a slot THIS client owns whose pty VS Code kept alive past the
+    // window close (the 3h reconnection grace); never to take a session another machine
+    // holds. See src/tmux/slotState.ts.
+    it('emits -D right after -A when taking a slot back from a stale client', () => {
+        const argv = buildAttachOrCreateArgv(NAME, '/home/user/proj', undefined, { takeOver: true });
+        const at = argv.indexOf('new-session');
+        expect(argv.slice(at, at + 7)).toEqual([
+            'new-session', '-A', '-D', '-s', NAME, '-c', '/home/user/proj',
+        ]);
+    });
+
+    it('omits -D by default so a normal attach never evicts anyone', () => {
+        expect(buildAttachOrCreateArgv(NAME, '/home/user/proj')).not.toContain('-D');
+        expect(buildAttachOrCreateArgv(NAME, '/home/user/proj', undefined, { takeOver: false })).not.toContain('-D');
+    });
+
+    it('keeps the shell argument last when taking over', () => {
+        const argv = buildAttachOrCreateArgv(NAME, '/home/user/proj', '/bin/zsh', { takeOver: true });
+        const at = argv.indexOf('new-session');
+        expect(argv.slice(at, at + 8)).toEqual([
+            'new-session', '-A', '-D', '-s', NAME, '-c', '/home/user/proj', '/bin/zsh',
         ]);
     });
 
@@ -142,7 +237,9 @@ describe('buildAttachOrCreateArgv', () => {
     });
 
     it('appends the shell command as its own argv element when given', () => {
-        expect(buildAttachOrCreateArgv(NAME, '/home/user/proj', '/bin/zsh').slice(0, 7)).toEqual([
+        const argv = buildAttachOrCreateArgv(NAME, '/home/user/proj', '/bin/zsh');
+        const at = argv.indexOf('new-session');
+        expect(argv.slice(at, at + 7)).toEqual([
             'new-session', '-A', '-s', NAME, '-c', '/home/user/proj', '/bin/zsh',
         ]);
     });

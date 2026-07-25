@@ -2,7 +2,7 @@
 	"name": "open-remote-ssh-tmux",
 	"displayName": "Open Remote - SSH (tmux)",
 	"description": "Use any remote machine with a SSH server as your development environment.",
-	"version": "1.0.0",
+	"version": "1.1.0",
 	"publisher": "developerz-ai",
 	"repository": {
 		"type": "git",
@@ -87,7 +87,8 @@
 		"onCommand:openremotessh.tmux.killWorkspaceSessions",
 		"onResolveRemoteAuthority:ssh-remote",
 		"onTerminalProfile:tmux",
-		"onView:sshHosts"
+		"onView:sshHosts",
+		"onCommand:openremotessh.pasteImage"
 	],
 	"contributes": {
 		"configuration": {
@@ -215,6 +216,12 @@
 					"description": "Automatically clean up empty and dead tmux sessions when connecting to a remote.",
 					"scope": "application",
 					"default": true
+				},
+				"remote.SSH.tmux.setDefaultProfile": {
+					"type": "boolean",
+					"markdownDescription": "Make the tmux-backed \"Persistent Shell\" the default terminal profile, so a plain **New Terminal** is persistent without picking a profile. This writes `terminal.integrated.defaultProfile.<platform>` at **Workspace** scope — i.e. into `.vscode/settings.json` inside the remote folder, which is a tracked file in your repository. Set to `false` to leave your settings untouched and select \"Persistent Shell\" from the terminal dropdown manually.",
+					"scope": "application",
+					"default": true
 				}
 			}
 		},
@@ -291,6 +298,11 @@
 				"command": "openremotessh.explorer.add",
 				"title": "Add New",
 				"icon": "$(plus)"
+			},
+			{
+				"command": "openremotessh.pasteImage",
+				"title": "Paste Image into Terminal",
+				"category": "Remote-SSH"
 			}
 		],
 		"resourceLabelFormatters": [
@@ -464,7 +476,15 @@
 					"group": "inline@2"
 				}
 			]
-		}
+		},
+		"keybindings": [
+			{
+				"command": "openremotessh.pasteImage",
+				"key": "ctrl+alt+v",
+				"mac": "cmd+alt+v",
+				"when": "terminalFocus"
+			}
+		]
 	},
 	"icon": "resources/icon.png",
 	"galleryBanner": {
