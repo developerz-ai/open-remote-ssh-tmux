@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { decideDefaultProfile, decideTmuxWiring, deriveTmuxSessionContext, idempotentResolveHandler, lazyExec, readTmuxSettings, reconcileDefaultTerminalProfile, TMUX_PROFILE_TITLE } from '../src/extension';
+import { decideDefaultProfile, decideTmuxWiring, defaultProfileSettingKey, deriveTmuxSessionContext, idempotentResolveHandler, lazyExec, readTmuxSettings, reconcileDefaultTerminalProfile, TMUX_PROFILE_TITLE } from '../src/extension';
 import type { RemoteSSHResolver } from '../src/authResolver';
 import type Log from '../src/common/logger';
 import { ConfigurationTarget, configOverrides, inspectOverrides, TerminalProfile, updateCalls } from './mocks/vscode';
@@ -280,9 +280,42 @@ describe('reconcileDefaultTerminalProfile: applies the decision to Workspace sco
 // available (via a fallback plain-shell provider) so the user sees the profile in the
 // terminal picker even if tmux is not working. This prevents "Profile not found" errors
 // and provides graceful degradation when the setting is 'off' or the remote lacks tmux.
-// extension.ts registers this provider unconditionally (before the tmux-gated wiring),
-// and the real TmuxTerminalProvider overrides it for the same 'tmux' id once wired — see
-// the `registerTerminalProfileProvider('tmux', ...)` calls in wireTmuxTerminalLayer/activate.
+// activate() seeds the shared TerminalProfileRegistration with this provider (before the
+// tmux-gated wiring), and wireTmuxTerminalLayer *swaps* the real TmuxTerminalProvider in
+// once wired. It is a swap, not a second registration: VS Code allows one provider per
+// profile id and throws "already registered" otherwise — the v1.0.0 bug this fallback was
+// silently masking. See test/tmux/profileRegistration.test.ts.
+// VS Code picks the `terminal.integrated.defaultProfile.<suffix>` suffix from the REMOTE
+// operating system, not from "is this a Unix host" — its terminal profile service resolves
+// the suffix via the remote agent environment (`windows` / `osx` / `linux`). The layer
+// hardcoded `.linux`, so on a macOS remote — which IS wired, since the tmux probe only gates
+// off an explicit `windows` platform — the write went to a key VS Code never reads. The
+// profile registered fine but "New Terminal" opened a plain non-persistent shell, and the
+// user had to pick "Persistent Shell" from the dropdown every single time. The mirror
+// cleanup path and the "did the user already set a default?" inspection were equally inert.
+describe('defaultProfileSettingKey: the suffix follows the REMOTE platform', () => {
+    it('maps macOS remotes to the osx suffix, not linux', () => {
+        expect(defaultProfileSettingKey('macos')).toBe('defaultProfile.osx');
+        expect(defaultProfileSettingKey('darwin')).toBe('defaultProfile.osx');
+    });
+
+    it('maps Windows remotes to the windows suffix', () => {
+        expect(defaultProfileSettingKey('windows')).toBe('defaultProfile.windows');
+    });
+
+    it('maps Linux and other Unix remotes to the linux suffix', () => {
+        expect(defaultProfileSettingKey('linux')).toBe('defaultProfile.linux');
+        expect(defaultProfileSettingKey('freebsd')).toBe('defaultProfile.linux');
+    });
+
+    // An unlabelled platform is treated as a Unix remote everywhere else in this codebase
+    // (see tmuxBootstrap's gate, which only short-circuits on the literal 'windows'), so the
+    // default here must agree rather than invent a third behaviour.
+    it('defaults to linux when the remote platform is unknown', () => {
+        expect(defaultProfileSettingKey(undefined)).toBe('defaultProfile.linux');
+    });
+});
+
 describe('FallbackTerminalProvider: graceful degradation when tmux is not wired', () => {
     it('provides a plain vscode.TerminalProfile (no tmux shell/args) synchronously', () => {
         const provider = new FallbackTerminalProvider();

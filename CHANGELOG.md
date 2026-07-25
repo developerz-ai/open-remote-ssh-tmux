@@ -1,3 +1,21 @@
+## 1.1.0
+- feat: paste a local screenshot into the focused remote terminal with `Ctrl+Alt+V` (`Cmd+Alt+V` on macOS) — the image is written to the remote and its path pasted, so a remote CLI tool (e.g. Claude Code) can read it; falls through to an ordinary paste when the clipboard holds no image
+- feat: `mouse on` so the scroll wheel scrolls the scrollback instead of cycling shell history, with `set-clipboard on` so drag-select still reaches the local clipboard over OSC52
+- feat: `remote.SSH.tmux.setDefaultProfile` setting to opt out of the Workspace-scope `terminal.integrated.defaultProfile.<platform>` write that makes a plain "New Terminal" persistent
+- fix: the tmux layer never wired at all — the fallback and the real provider both registered on the `tmux` profile id, VS Code throws on the second, and every "Persistent Shell" silently opened a plain shell with no tmux session; registration now has a single owner (`src/tmux/profileRegistration.ts`)
+- fix: reopening a window abandoned live work — VS Code keeps a closed window's pty (and the tmux client inside it) alive for its 3h reconnection grace, which reconciliation misread as "another machine holds this"; ownership is now decided by the client-local slot mapping and our own stale client is evicted with tmux `-D` (`src/tmux/slotState.ts`)
+- fix: `remote.SSH.tmux.historyLimit` was a complete no-op — tmux reads `history-limit` when a pane is created, before any chained `set-option` can run, so every terminal sat on the 2000-line default; it is now set globally before `new-session` and restored with `-gu` immediately after
+- fix: closing a terminal left a running session nothing would ever show again (the "tombstone" behaviour); a user close now kills its session, as in stock open-remote-ssh, while a window close or reload still only detaches
+- fix: a window reload could silently disable restore — all four `TerminalExitReason`s were treated as an explicit user close
+- fix: split/group terminal layout was discarded on every reload (`isTransient`); restore now queues sessions for VS Code's own revive to claim, so the layout comes from VS Code and the sessions from here
+- fix: a reload could still produce duplicate terminals — the restore queue closed on a fixed 2.5s timer, but VS Code revives when the workbench finishes restoring, seconds later on a real remote; the late revive then found an empty queue and minted new sessions, leaving four tabs (two unsplit, two split) where two belonged. The wait now ends on evidence — every queued slot claimed or observed in the window — with a timer only as the backstop for a revive that never comes
+- fix: "wants to relaunch the terminal to contribute to its environment" on every reconnect — the `SSH_AUTH_SOCK` contribution is now diffed and skipped when unchanged, since relaunching is precisely what discards a surviving tmux session (`src/common/envCollection.ts`)
+- fix: macOS remotes never got the default profile — `terminal.integrated.defaultProfile.<suffix>` is derived from the remote OS instead of hardcoded to `linux`
+- fix: three races that could cost a live session — concurrent profile requests taking the same slot, `new-session -A` racing an in-flight `kill-session`, and overlapping `workspaceState` writes
+- fix: a dropped channel pruned the slot mapping one slot at a time, because an undeliverable `has-session` probe was read as "session gone"
+- fix: one failing `createTerminal` aborted the whole reconcile, discarding mapping state for sessions still alive on the remote
+- docs: document the paste-image bridge, the tmux options the layer sets, and the close/detach semantics; drop stale claims about `isTransient` splits and "close = detach, never kill"
+
 ## 1.0.0
 - feat: fork as open-remote-ssh-tmux — tmux-backed persistent remote terminals that survive client disconnects, window closes, and machine hand-off (PC ↔ laptop ↔ VPS)
 - feat: deterministic tmux session naming keyed to host+workspace with attach-or-create semantics — re-opening a workspace re-attaches the same session, never a duplicate

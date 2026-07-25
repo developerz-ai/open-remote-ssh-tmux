@@ -52,6 +52,14 @@ export interface TmuxSession {
 
 /** Per-session options applied at create time. */
 export interface AttachOrCreateOptions {
+    /** Emit `-D`, which alongside `-A` makes tmux behave like `attach-session -d`: evict
+     * whatever client is already attached, then attach this one. Set ONLY when reclaiming
+     * a slot this client owns whose pty VS Code kept alive past the window close (its
+     * reconnection grace is 3h by default), never for a session another machine holds —
+     * see `slotState.ts` for the ownership rule that gates it. Verified on a real tmux
+     * 3.4 server: the stale client is dropped and the pane's process is untouched.
+     * Default false. */
+    readonly takeOver?: boolean;
     /** Scrollback lines for windows created after the session starts. Default 50000. */
     readonly historyLimit?: number;
 }
@@ -123,7 +131,11 @@ export function buildAttachOrCreateArgv(
     opts: AttachOrCreateOptions = {},
 ): string[] {
     const historyLimit = opts.historyLimit ?? DEFAULT_HISTORY_LIMIT;
-    const create = ['new-session', '-A', '-s', name, '-c', cwd];
+    // `-D` must sit with the other `new-session` flags, before `-s`: it is a flag of the
+    // attach behaviour `-A` selects, not a standalone command.
+    const create = opts.takeOver
+        ? ['new-session', '-A', '-D', '-s', name, '-c', cwd]
+        : ['new-session', '-A', '-s', name, '-c', cwd];
     if (shell !== undefined) {
         create.push(shell);
     }
@@ -136,10 +148,48 @@ export function buildAttachOrCreateArgv(
     // tmux entirely, could not catch). `=<name>:` (trailing colon = exact session,
     // empty/default window) is the form `set-option` actually accepts.
     return [
-        ...create,
+        // `history-limit` is consumed when a PANE is created, not when the option is set —
+        // and `new-session` creates the session's one and only pane before any chained
+        // `set-option` can run. Setting it at session scope afterwards (as this builder used
+        // to) therefore did nothing at all: `show-options` reported 50000 while
+        // `#{history_limit}` on the actual pane stayed at tmux's 2000-line default, making
+        // the advertised `remote.SSH.tmux.historyLimit` setting a silent no-op. Confirmed on
+        // six live sessions before the fix. The global option is the only one read at pane
+        // creation, so set it here and restore it the moment the session exists.
+        'set-option', '-g', 'history-limit', String(historyLimit),
+        ';', ...create,
+        // Restore the user's global immediately — it belongs to their whole tmux server, not
+        // to us. This sits before every option below on purpose: tmux aborts a `;` chain at
+        // the first failing command, so anything that can fail must come after the restore,
+        // otherwise one bad target would leave our value burned into their server.
+        ';', 'set-option', '-gu', 'history-limit',
         ';', 'set-window-option', '-t', `=${name}`, 'remain-on-exit', 'off',
         ';', 'set-option', '-t', `=${name}:`, 'status', 'off',
         ';', 'set-option', '-t', `=${name}:`, 'history-limit', String(historyLimit),
+        // Invisible UX, not a nicety: tmux defaults `mouse` to off, which leaves mouse
+        // reporting disabled, so the scroll wheel emits arrow keys straight into the
+        // shell — the wheel "scrolls commands" (bash history) instead of the screen, and
+        // the history-limit set directly above is reachable only via tmux's own
+        // `prefix + [` copy-mode binding. Requiring a tmux keybinding to scroll is
+        // exactly the leaked-tmux-UI this fork forbids, so this is unconditional.
+        // Trade-off (accepted deliberately): with mouse reporting on, drag-selection
+        // belongs to tmux rather than VS Code — hence `set-clipboard` below. Alt+drag
+        // remains the escape hatch to VS Code's own selection.
+        ';', 'set-option', '-t', `=${name}:`, 'mouse', 'on',
+        // Makes tmux emit OSC52 on copy, so a drag-select inside the remote tmux reaches
+        // the LOCAL clipboard over the SSH link; tmux's default `external` forwards OSC52
+        // only for apps running *inside* tmux, never for tmux's own copy-mode. Without
+        // this, `mouse on` above would trade a broken wheel for broken copy/paste.
+        //
+        // `-s` (server scope) is deliberate: `set-clipboard` IS a server option, so a
+        // session-targeted `-t =<name>:` write is silently promoted to server scope
+        // anyway (verified against a real tmux 3.4 server — the same class of silent
+        // mis-scoping that made `status`/`history-limit` no-ops above). Writing `-s`
+        // states the true blast radius at the call site instead of hiding a global write
+        // behind session syntax. It is the one option here that outlives our sessions:
+        // it applies to the user's whole tmux server until that server exits, and is
+        // never written to their ~/.tmux.conf.
+        ';', 'set-option', '-s', 'set-clipboard', 'on',
     ];
 }
 

@@ -14,6 +14,7 @@
    |-----|------|---------|---------|
    | `remote.SSH.tmux.enabled` | `"auto" \| "on" \| "off"` enum | `"auto"` | auto = on when Unix+tmux found (03); off = pure upstream behaviour |
    | `remote.SSH.tmux.reapOnConnect` | boolean | `true` | run the 04 reaper at resolve time |
+   | `remote.SSH.tmux.setDefaultProfile` | boolean | `true` | may the layer write `terminal.integrated.defaultProfile.<platform>` (Workspace scope, i.e. into the remote repo's `.vscode/settings.json`)? `false` keeps the user's repo clean at the cost of picking "Persistent Shell" manually |
    | `remote.SSH.tmux.historyLimit` | number | `50000` | per-session scrollback (02 options) |
    Scope `application` like siblings (`package.json:92-186`). No setting that
    exposes raw tmux config — invisible UX; power users have their own tmux.

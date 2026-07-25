@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import { KILL_WORKSPACE_SESSIONS_COMMAND_ID } from '../src/commands';
-import { TMUX_PROFILE_TITLE } from '../src/extension';
+import { TMUX_PROFILE_ID, TMUX_PROFILE_TITLE } from '../src/extension';
 
 // Drift guard: package.json's `contributes` is hand-authored and easy to let go
 // stale (settings renamed/typo'd, a command's id changed in one place but not the
@@ -273,15 +273,31 @@ describe('package.json manifest drift guard', () => {
             expect(profiles!.some(p => p.id === 'tmux')).toBe(true);
         });
 
-        it('the contributed profile id matches the id passed to registerTerminalProfileProvider in src/', () => {
+        // The id the provider is registered under now comes from TMUX_PROFILE_ID (the
+        // single owner, TerminalProfileRegistration, takes it once) rather than a literal
+        // at the register call site — so pin the constant against the manifest directly
+        // instead of grepping source text, exactly as the title guard below does.
+        it('the contributed profile id matches TMUX_PROFILE_ID in src/extension.ts', () => {
             const terminal = contributes.terminal as JsonObject;
             const profiles = terminal.profiles as Array<{ id: string; title: string }>;
-            const registerCall = /registerTerminalProfileProvider\(\s*['"]([^'"]+)['"]/;
-            const extensionSrc = fs.readFileSync(path.resolve(srcDir, 'extension.ts'), 'utf8');
-            const match = extensionSrc.match(registerCall);
-            expect(match, 'no registerTerminalProfileProvider(...) call found in src/extension.ts').not.toBeNull();
-            const registeredId = match![1];
-            expect(profiles.some(p => p.id === registeredId)).toBe(true);
+            expect(profiles.some(p => p.id === TMUX_PROFILE_ID)).toBe(true);
+        });
+
+        // Guards the regression this whole registration owner exists for: two direct
+        // registerTerminalProfileProvider calls on the same contributed id is exactly how
+        // v1.0.0 shipped — VS Code throws "already registered" on the second, the tmux
+        // layer never wired, and "Persistent Shell" silently opened a plain bash terminal.
+        // src/ must route registration through TerminalProfileRegistration, whose single
+        // call site is profileRegistration.ts.
+        it('registers the profile id in exactly one place (the registration owner)', () => {
+            // Comments are stripped first: the guard is about calls in *code*, and the
+            // modules explaining this very regression name the API in their prose.
+            const stripComments = (source: string): string => source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+            const callers = fs.readdirSync(srcDir, { recursive: true, encoding: 'utf8' })
+                .filter(file => file.endsWith('.ts'))
+                .filter(file => /registerTerminalProfileProvider\s*\(/.test(stripComments(fs.readFileSync(path.resolve(srcDir, file), 'utf8'))));
+            expect(callers, 'registerTerminalProfileProvider must be called only by tmux/profileRegistration.ts')
+                .toEqual(['tmux/profileRegistration.ts']);
         });
 
         // The default-profile reconcile (extension.ts) selects/clears the tmux profile by
@@ -357,9 +373,16 @@ describe('CHANGELOG', () => {
         expect(notes.length).toBeGreaterThan(0);
     });
 
-    it('first heading is 1.0.0, the fork\'s rebrand release', () => {
+    // The release workflow tags `v<package.json version>` and then asks
+    // .github/scripts/get-changelog.js for that exact section (`## <version>`) to build the
+    // release body — a missing section fails the publish job *after* the tag is already
+    // pushed. Pinning the head of the CHANGELOG to the manifest version catches a bump that
+    // forgot its entry (or an entry that forgot its bump) at test time instead. Deliberately
+    // a drift guard rather than a hardcoded version: this file should not need editing every
+    // release.
+    it('first heading matches the version in package.json', () => {
         const changelog = fs.readFileSync(path.resolve(repoRoot, 'CHANGELOG.md'), 'utf8');
         const firstHeading = changelog.match(/^## (\d+\.\d+\.\d+)/m);
-        expect(firstHeading![1]).toBe('1.0.0');
+        expect(firstHeading![1]).toBe(readPackageJson().version);
     });
 });

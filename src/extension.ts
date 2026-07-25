@@ -7,7 +7,10 @@ import { HostTreeDataProvider } from './hostTreeView';
 import { getRemoteWorkspaceLocationData, RemoteLocationHistory } from './remoteLocationHistory';
 import { TmuxTerminalProvider, type OpenTerminal, type RemoteExec } from './tmux/terminalProvider';
 import { FallbackTerminalProvider } from './tmux/fallbackTerminalProvider';
+import { TerminalProfileRegistration } from './tmux/profileRegistration';
+import { pasteClipboardImage, sweepOldImages } from './clipboard/pasteImage';
 import { SessionReaper } from './tmux/sessionReaper';
+import { prepareEnvCollection } from './common/envCollection';
 
 export async function activate(context: vscode.ExtensionContext) {
     const logger = new Log('Remote - SSH');
@@ -17,14 +20,34 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(vscode.workspace.registerRemoteAuthorityResolver(REMOTE_SSH_AUTHORITY, remoteSSHResolver));
     context.subscriptions.push(remoteSSHResolver);
 
+    // Settle the terminal environment contribution NOW, at activation, while the window has
+    // no terminals for it to invalidate. Any later mutation marks open terminals stale, and
+    // VS Code only relaunches them silently when it judges that safe — a tmux terminal with
+    // a live process in it never is, so the user gets "…wants to relaunch the terminal to
+    // contribute to its environment" instead, on terminals where relaunching is precisely
+    // the wrong thing. The resolver's own write is diffed (`common/envCollection.ts`), so
+    // after this the collection only changes when a variable's value genuinely does.
+    prepareEnvCollection(context.environmentVariableCollection);
+
+    // Single owner of the contributed "tmux" profile id. VS Code permits exactly one
+    // provider per id and throws on a second register for the same id, so the fallback
+    // and the real tmux provider must *swap* through this handle rather than both
+    // calling registerTerminalProfileProvider (which is what silently killed the tmux
+    // layer in v1.0.0 — see profileRegistration.ts). Seeded with the plain-shell
+    // fallback so "Persistent Shell" is always in the picker, even when tmux is
+    // unavailable or disabled; wireTmuxTerminalLayer swaps in the real provider.
+    const profileRegistration = new TerminalProfileRegistration(TMUX_PROFILE_ID);
+    profileRegistration.use(new FallbackTerminalProvider());
+    context.subscriptions.push(profileRegistration);
+
     // Wire tmux terminal provider and session reaper after remote resolution completes.
     // The provider/reaper are gated on PR3 capability (tmux available) and PR5 setting
     // (remote.SSH.tmux.enabled). This callback fires after *every* resolve() succeeds —
     // including reconnects — so it wires the layer exactly once and only refreshes it
-    // thereafter (idempotentResolveHandler): re-registering the terminal profile
-    // provider throws "already registered" and would orphan the live provider.
+    // thereafter (idempotentResolveHandler): re-swapping the terminal profile provider
+    // per reconnect would needlessly churn the registration and orphan the live one.
     remoteSSHResolver.onResolveSuccessfullyCompleted(
-        idempotentResolveHandler(() => wireTmuxTerminalLayer(context, remoteSSHResolver, logger))
+        idempotentResolveHandler(() => wireTmuxTerminalLayer(context, remoteSSHResolver, profileRegistration, logger))
     );
 
     const locationHistory = new RemoteLocationHistory(context);
@@ -43,13 +66,24 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(vscode.commands.registerCommand('openremotessh.showLog', () => logger.show()));
     context.subscriptions.push(vscode.commands.registerCommand(KILL_WORKSPACE_SESSIONS_COMMAND_ID, () => killWorkspaceSessions(() => resolveKillTarget(remoteSSHResolver, logger))));
 
-    // Register a fallback terminal profile provider for the "tmux" profile id. This
-    // ensures the "Persistent Shell" profile is always available in the terminal picker,
-    // even when tmux is unavailable or disabled, providing graceful degradation. When
-    // tmux is available on an SSH remote, wireTmuxTerminalLayer will register the real
-    // TmuxTerminalProvider, which overrides this fallback for that case.
-    const fallbackProvider = new FallbackTerminalProvider();
-    context.subscriptions.push(vscode.window.registerTerminalProfileProvider('tmux', fallbackProvider));
+    // Paste a LOCAL screenshot into the focused REMOTE terminal: the clipboard lives on this
+    // machine, the tool that needs the image (e.g. Claude Code) runs on the server, and
+    // nothing bridges them. Falls back to an ordinary paste whenever there is no image on
+    // the clipboard, so the keybinding never swallows a normal text paste.
+    context.subscriptions.push(vscode.commands.registerCommand('openremotessh.pasteImage', async () => {
+        const authority = vscode.workspace.workspaceFolders?.[0]?.uri.authority;
+        const handled = authority
+            ? await pasteClipboardImage({
+                exec: lazyExec(remoteSSHResolver),
+                log: logger,
+                platform: process.platform,
+                authority,
+            })
+            : false;
+        if (!handled) {
+            await vscode.commands.executeCommand('workbench.action.terminal.paste');
+        }
+    }));
 }
 
 /**
@@ -67,6 +101,7 @@ export async function activate(context: vscode.ExtensionContext) {
 function wireTmuxTerminalLayer(
     context: vscode.ExtensionContext,
     resolver: RemoteSSHResolver,
+    profileRegistration: TerminalProfileRegistration,
     logger: Log
 ): TmuxTerminalLayer | undefined {
     try {
@@ -88,14 +123,14 @@ function wireTmuxTerminalLayer(
             // Not wiring → remove any stale tmux default we wrote on a prior (tmux-capable)
             // connect, so "New Terminal" falls back to the base shell instead of a profile
             // we never registered.
-            reconcileDefaultTerminalProfile(logger, false);
+            reconcileDefaultTerminalProfile(logger, false, resolver.getRemotePlatform());
             return;
         }
         if (decision !== 'wire' || !capability?.available) {
             // `'skip'` (disabled, or unavailable under `'auto'`). The `!capability?.available`
             // clause is redundant given `decision === 'wire'` implies availability — it is
             // there only to re-narrow `capability` to non-undefined for the compiler below.
-            reconcileDefaultTerminalProfile(logger, false); // clean up a stale tmux default, as above
+            reconcileDefaultTerminalProfile(logger, false, resolver.getRemotePlatform()); // clean up a stale tmux default, as above
             return;
         }
 
@@ -107,7 +142,7 @@ function wireTmuxTerminalLayer(
             // window, or a non-ssh-remote folder) — there is no stable host+workspace
             // identity, so wire nothing rather than fabricate one. Still reconcile the
             // default toward cleanup, since we are not wiring the layer here.
-            reconcileDefaultTerminalProfile(logger, false);
+            reconcileDefaultTerminalProfile(logger, false, resolver.getRemotePlatform());
             return;
         }
         const { hostKey, workspaceKey } = sessionContext;
@@ -129,6 +164,10 @@ function wireTmuxTerminalLayer(
             exec,
             state: context.workspaceState,
             openTerminal,
+            // Terminals VS Code has already revived from its own persistence (which is what
+            // restores split layout — see buildOptions). Reconcile reads this so it does not
+            // re-attach a session that is already on screen.
+            listTerminals: () => vscode.window.terminals,
             log: logger,
             // Launch tmux by the absolute path the probe resolved (`command -v tmux`),
             // so nix / `~/.local/bin` installs off the non-login PATH still work —
@@ -139,26 +178,34 @@ function wireTmuxTerminalLayer(
             historyLimit: settings.historyLimit,
         });
 
+        // Subscribe BEFORE initialize(). VS Code revives its persisted terminals around the
+        // same moment reconcile runs (both wait on the server connection), and a revived
+        // terminal that lands while reconcile is still awaiting a probe would otherwise go
+        // unseen — leaving two tabs attached to one session. Subscribed first, it is caught
+        // either by the reconcile-time sweep or by the duplicate guard in the handler.
+        context.subscriptions.push(vscode.window.onDidOpenTerminal(t => terminalProvider.handleTerminalOpened(t)));
+        // Free a terminal's slot when it actually closes — the counterpart to
+        // provideTerminalProfile()/reopen() allocating one. Without this a slot is
+        // never released within a live window: every "New Terminal" after a close
+        // mints a brand-new, ever-growing remote session instead of reattaching the
+        // one just detached (found live in the 09 acceptance matrix's churn row).
+        context.subscriptions.push(vscode.window.onDidCloseTerminal(t => terminalProvider.handleTerminalClosed(t)));
+
         // Initialize the provider (restore + adopt sessions from previous clients).
         terminalProvider.initialize()
             .catch((err) => {
                 logger.trace(`Failed to initialize tmux provider: ${err instanceof Error ? err.message : String(err)}`);
             });
 
-        // Register the terminal profile provider with VS Code. The id ("tmux") must
-        // match the contributed profile in package.json's contributes.terminal.profiles
-        // — registering without a matching contribution is a silent no-op (no entry in
-        // the profile picker, provider never invoked). See docs/idea/tmux-approach.md.
-        const providerDisposable = vscode.window.registerTerminalProfileProvider('tmux', terminalProvider);
-        context.subscriptions.push(providerDisposable);
-
-        // Free a terminal's slot when it actually closes — the counterpart to
-        // provideTerminalProfile()/reopen() allocating one. Without this a slot is
-        // never released within a live window: every "New Terminal" after a close
-        // mints a brand-new, ever-growing remote session instead of reattaching the
-        // one just detached (found live in the 09 acceptance matrix's churn row).
-        context.subscriptions.push(vscode.window.onDidOpenTerminal(t => terminalProvider.handleTerminalOpened(t)));
-        context.subscriptions.push(vscode.window.onDidCloseTerminal(t => terminalProvider.handleTerminalClosed(t)));
+        // Take over the contributed "tmux" profile id from the plain-shell fallback
+        // activate() seeded it with. This is a *swap*, not a second registration: VS Code
+        // permits one provider per id and throws "already registered" otherwise — which is
+        // precisely how v1.0.0 shipped, silently degrading every "Persistent Shell" to a
+        // plain bash terminal (see profileRegistration.ts). The id must match the
+        // contributed profile in package.json's contributes.terminal.profiles — owning an
+        // id with no matching contribution is a silent no-op (no entry in the profile
+        // picker, provider never invoked). See docs/idea/tmux-approach.md.
+        profileRegistration.use(terminalProvider);
 
         // Make tmux the default so a plain "New Terminal" already lands on it — the whole
         // point of "invisible UX" (tmux-approach.md:33: "the default terminal on a resolved
@@ -168,7 +215,7 @@ function wireTmuxTerminalLayer(
         // a default at ANY scope (a Workspace write silently overrides a User/Remote one).
         // The mirror case (not wiring → remove a stale write of ours) is reconciled on the
         // skip returns above, so the default never points at an unregistered profile.
-        reconcileDefaultTerminalProfile(logger, true);
+        reconcileDefaultTerminalProfile(logger, true, resolver.getRemotePlatform());
 
         // Construct the session reaper (housekeeping for empty/detached sessions).
         // Uses current time as the clock for age-based reap decisions.
@@ -193,6 +240,11 @@ function wireTmuxTerminalLayer(
         // Run reaper immediately on connect (cleanup leftover sessions).
         reapIfEnabled('Session reaper failed');
 
+        // Same connect-time housekeeping shape for pasted screenshots: sweep anything older
+        // than 48h out of this user's image directory. Best-effort and never awaited — an
+        // image sweep must not delay or fail the (already-succeeded) connection.
+        void sweepOldImages({ exec, log: logger });
+
         // Create a disposable for the reaper (so it can be cleaned up, though
         // it has no resources to free — reaper is stateless).
         context.subscriptions.push({
@@ -210,7 +262,10 @@ function wireTmuxTerminalLayer(
         // re-run the reaper to clear any corpses left by the disconnect.
         return {
             refresh: () => {
-                terminalProvider.initialize()
+                // A reconnect, not a reload: same window, same tabs, so VS Code revives
+                // nothing and never calls the profile provider. Restore therefore has no
+                // reason to hold its queue open waiting to be claimed — see `initialize`.
+                terminalProvider.initialize({ awaitRevive: false })
                     .catch((err) => logger.trace(`Tmux provider refresh failed: ${err instanceof Error ? err.message : String(err)}`));
                 reapIfEnabled('Tmux reaper refresh failed');
             },
@@ -281,6 +336,15 @@ export interface TmuxSettings {
     readonly historyLimit: number;
     /** `remote.SSH.tmux.reapOnConnect`: reap empty/dead sessions on (re)connect (default true). */
     readonly reapOnConnect: boolean;
+    /** `remote.SSH.tmux.setDefaultProfile`: may the layer write
+     * `terminal.integrated.defaultProfile.<platform>` at Workspace scope (default true)?
+     * That write lands in `.vscode/settings.json` INSIDE the user's remote folder — a
+     * tracked file in their repository, shared with everyone else who opens it, and left
+     * behind pointing at an unregistered profile if this extension is uninstalled. It is
+     * what makes a plain "New Terminal" persistent (the invisible-UX promise), so it stays
+     * on by default; users who would rather keep their repo clean can turn it off and pick
+     * "Persistent Shell" from the dropdown. */
+    readonly setDefaultProfile: boolean;
 }
 
 /**
@@ -295,6 +359,7 @@ export function readTmuxSettings(): TmuxSettings {
         enabled: config.get<string>('tmux.enabled', 'auto'),
         historyLimit: config.get<number>('tmux.historyLimit', 50000),
         reapOnConnect: config.get<boolean>('tmux.reapOnConnect', true),
+        setDefaultProfile: config.get<boolean>('tmux.setDefaultProfile', true),
     };
 }
 
@@ -333,6 +398,39 @@ export const TMUX_REQUIRED_UNAVAILABLE_MESSAGE =
  * the value `terminal.integrated.defaultProfile.linux` must reference to select it.
  * Exported so tests pin the exact string the reconcile writes/cleans up. */
 export const TMUX_PROFILE_TITLE = 'Persistent Shell';
+
+/** Id of the contributed profile (`package.json` contributes.terminal.profiles[].id) — the
+ * single terminal-profile id this extension owns, shared by the fallback and the real tmux
+ * provider via {@link TerminalProfileRegistration}. Exported so the manifest-drift test pins
+ * the contributed id and the code that registers against it to the same string. */
+export const TMUX_PROFILE_ID = 'tmux';
+
+/**
+ * The `terminal.integrated.defaultProfile.<suffix>` key for a given REMOTE platform.
+ *
+ * VS Code resolves that suffix from the remote agent's operating system — `windows`, `osx`
+ * or `linux` — not from the client's, and not from "is this a Unix host". This layer used to
+ * hardcode `.linux`, which is wrong for macOS remotes: those ARE wired (the tmux probe gates
+ * off only an explicit `'windows'` platform, and `macos` is a supported `remote.SSH.remotePlatform`
+ * value), so the write landed on a key VS Code never consults. The provider registered, the
+ * profile appeared in the dropdown, and "New Terminal" still opened a plain non-persistent
+ * shell — the invisible-UX promise failing silently on exactly one platform. The `'clear'`
+ * cleanup and the "has the user already chosen a default?" inspection were equally inert there.
+ *
+ * An unknown/absent platform maps to `linux`, matching how the rest of this codebase treats an
+ * unlabelled remote as Unix (see `probeTmux`'s gate).
+ */
+export function defaultProfileSettingKey(remotePlatform?: string): string {
+    switch (remotePlatform) {
+        case 'windows':
+            return 'defaultProfile.windows';
+        case 'macos':
+        case 'darwin':
+            return 'defaultProfile.osx';
+        default:
+            return 'defaultProfile.linux';
+    }
+}
 
 /**
  * The `inspect()` scopes a user's own `terminal.integrated.defaultProfile.linux` choice
@@ -386,16 +484,24 @@ export function decideDefaultProfile(inspected: DefaultProfileScopes | undefined
  * User/Global or the remote's own ~/.tmux.conf. Best-effort: a failure here must not break the
  * (already-succeeded) connection, so it only logs.
  */
-export function reconcileDefaultTerminalProfile(logger: Log, wiring: boolean): void {
+export function reconcileDefaultTerminalProfile(logger: Log, wiring: boolean, remotePlatform?: string): void {
     const terminalConfig = vscode.workspace.getConfiguration('terminal.integrated');
-    const inspected = terminalConfig.inspect<string>('defaultProfile.linux');
+    const key = defaultProfileSettingKey(remotePlatform);
+    const inspected = terminalConfig.inspect<string>(key);
     const action = decideDefaultProfile(inspected, wiring);
     if (action === 'none') {
         return;
     }
+    // Opting out blocks only the WRITE. A `'clear'` must still run, otherwise turning the
+    // setting off would strand a previous write of ours in the user's repo pointing at a
+    // profile we may no longer register — the opposite of what opting out is asking for.
+    if (action === 'set' && !readTmuxSettings().setDefaultProfile) {
+        logger.trace('Skipping default terminal profile write (remote.SSH.tmux.setDefaultProfile is false)');
+        return;
+    }
     const value = action === 'set' ? TMUX_PROFILE_TITLE : undefined;
     terminalConfig
-        .update('defaultProfile.linux', value, vscode.ConfigurationTarget.Workspace)
+        .update(key, value, vscode.ConfigurationTarget.Workspace)
         .then(
             undefined,
             (err: unknown) => logger.trace(`Could not ${action} default tmux terminal profile: ${err instanceof Error ? err.message : String(err)}`)
