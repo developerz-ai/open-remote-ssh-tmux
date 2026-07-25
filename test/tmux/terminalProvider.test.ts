@@ -87,6 +87,7 @@ function makeProvider(over: {
     listTerminals?: () => readonly import('vscode').Terminal[];
     reviveGraceMs?: number;
     reviveDeadlineMs?: number;
+    reviveQuietMs?: number;
 } = {}) {
     const opened = over.opened ?? [];
     const exec = over.exec ?? fakeExec();
@@ -101,6 +102,7 @@ function makeProvider(over: {
         // Defaults to the grace so the existing waiting tests stay as quick as they were;
         // the claim-driven tests below set it explicitly.
         reviveDeadlineMs: over.reviveDeadlineMs ?? over.reviveGraceMs ?? 0,
+        reviveQuietMs: over.reviveQuietMs ?? 0,
         log: { info: vi.fn(), trace: vi.fn() },
         historyLimit: over.historyLimit,
         tmuxPath: over.tmuxPath,
@@ -974,6 +976,72 @@ describe('revive grace (letting VS Code go first, deterministically)', () => {
             .toEqual([name(0), name(1)]);
         // ...and nothing is opened on top of them, so two tabs, not four.
         expect(opened).toEqual([]);
+    });
+
+    // FOLLOW-UP FROM THE SAME RIG, on v1.1.0. The duplicate was gone — two sessions, two
+    // tabs — but the second terminal took eleven seconds to appear:
+    //
+    //   46.868  tmux terminals: 2 to re-attach, ...
+    //   48.386  tmux terminal: slot 0 claimed from the restore queue   <- one revive, 1.5s in
+    //   59.402  tmux terminals: no revive after 10000ms, opening 1 queued session(s) directly
+    //
+    // VS Code revived ONE of the two persisted terminals, and waiting for *all* of them meant
+    // the odd one out paid the full backstop. But the first claim is itself the answer: revive
+    // is demonstrably running, and revives arrive in a burst (0.6s apart in the earlier log).
+    // So once anything has been claimed, a short quiet period is enough to conclude the burst
+    // is over — the long deadline is only for a revive that never starts at all.
+    it('stops waiting a beat after the last claim instead of holding for the deadline', async () => {
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0), '1': name(1) } });
+        const exec = fakeExec({ list: [row(name(0), false), row(name(1), false)], existing: [name(0), name(1)] });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({
+            state, exec, opened,
+            reviveGraceMs: 5,
+            // A deadline long enough that reaching it is unmistakable in the elapsed time.
+            reviveDeadlineMs: 5000,
+            reviveQuietMs: 30,
+        });
+
+        const startedAt = Date.now();
+        const init = provider.initialize();
+        // VS Code revives exactly one of the two, as in the log above.
+        const first = await provider.provideTerminalProfile();
+        await init;
+        const elapsed = Date.now() - startedAt;
+
+        expect(targetSession(optionsOf(first))).toBe(name(0));
+        // The unclaimed one still gets its terminal...
+        expect(opened.map(targetSession)).toEqual([name(1)]);
+        // ...without waiting out the backstop, which is what the user actually felt.
+        expect(elapsed).toBeLessThan(1500);
+    });
+
+    // Each new claim has to re-arm the quiet period, or a burst slower than one quiet window
+    // would be cut off half-way and the remaining sessions opened as duplicates of terminals
+    // VS Code was still in the middle of reviving.
+    it('re-arms the quiet period on every claim so a slow burst is not cut off', async () => {
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0), '1': name(1), '2': name(2) } });
+        const exec = fakeExec({
+            list: [row(name(0), false), row(name(1), false), row(name(2), false)],
+            existing: [name(0), name(1), name(2)],
+        });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({
+            state, exec, opened, reviveGraceMs: 5, reviveDeadlineMs: 5000, reviveQuietMs: 60,
+        });
+
+        const init = provider.initialize();
+        const claimed: string[] = [];
+        // Three revives, each landing after a gap shorter than the quiet window but well
+        // past the point a single un-rearmed window would have expired.
+        for (let i = 0; i < 3; i++) {
+            await new Promise(resolve => setTimeout(resolve, 40));
+            claimed.push(targetSession(optionsOf(await provider.provideTerminalProfile())));
+        }
+        await init;
+
+        expect(claimed).toEqual([name(0), name(1), name(2)]);
+        expect(opened).toEqual([]); // nothing opened on top of a revive still in progress
     });
 
     // The backstop must still fire, or a mapping with no revive behind it (persistence off,
