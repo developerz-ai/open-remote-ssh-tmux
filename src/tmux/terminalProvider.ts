@@ -110,6 +110,9 @@ export interface TmuxTerminalDeps {
     /** Backstop for the claim-driven wait ({@link REVIVE_DEADLINE_MS}). Injectable so tests
      * need not sleep. */
     readonly reviveDeadlineMs?: number;
+    /** Quiet period that ends the wait once a revive has started ({@link REVIVE_QUIET_MS}).
+     * Injectable so tests need not sleep. */
+    readonly reviveQuietMs?: number;
 }
 
 /**
@@ -170,6 +173,28 @@ export const REVIVE_GRACE_MS = 2500;
  */
 export const REVIVE_DEADLINE_MS = 10000;
 
+/**
+ * Quiet period that ends the wait once a revive has actually started.
+ *
+ * The deadline above is the answer to "is a revive coming at all?", and it is the wrong
+ * question to keep asking after the first one lands. VS Code revives its persisted terminals
+ * in a burst — 0.6s apart in the 1.0.9 log — and it may well revive *fewer* than we have
+ * sessions, because it only persisted the terminals from its own last window. Waiting for
+ * every queued slot then means the odd one out pays the full backstop, which is the second
+ * report from the same rig, on v1.1.0:
+ *
+ *   46.868  tmux terminals: 2 to re-attach, ...
+ *   48.386  tmux terminal: slot 0 claimed from the restore queue   <- one revive, 1.5s in
+ *   59.402  tmux terminals: no revive after 10000ms, opening 1 session(s) directly
+ *
+ * Correct — two sessions, two tabs, no duplicate — but the second terminal took eleven
+ * seconds to appear. The first claim is itself the evidence the deadline was waiting for:
+ * revive is running, so all that remains is to notice the burst has finished. Every claim
+ * re-arms this window, so a slow burst is never cut off half-way (which would open duplicates
+ * of terminals VS Code was still mid-revive on).
+ */
+export const REVIVE_QUIET_MS = 2000;
+
 /** How often the wait re-reads the window. Only the window needs polling — a claim ends the
  * wait by emptying the queue, and both are checked on the same tick. */
 const REVIVE_POLL_MS = 250;
@@ -215,6 +240,8 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
     private readonly reviveGraceMs: number;
     /** Backstop for the claim-driven wait (see {@link REVIVE_DEADLINE_MS}). */
     private readonly reviveDeadlineMs: number;
+    /** Quiet period that ends the wait after a revive has started (see {@link REVIVE_QUIET_MS}). */
+    private readonly reviveQuietMs: number;
 
     /** Persisted client-local mapping of slot → session name (survives reloads). */
     private readonly mapping: Map<number, string>;
@@ -263,6 +290,7 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         this.tmuxPath = deps.tmuxPath ?? TMUX_BIN;
         this.reviveGraceMs = deps.reviveGraceMs ?? REVIVE_GRACE_MS;
         this.reviveDeadlineMs = deps.reviveDeadlineMs ?? REVIVE_DEADLINE_MS;
+        this.reviveQuietMs = deps.reviveQuietMs ?? REVIVE_QUIET_MS;
         this.mapping = readMapping(deps.state);
         this.reservedSlots = new Set(this.mapping.keys());
     }
@@ -314,32 +342,66 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
      * `provideTerminalProfile` shifting it out of the queue (a relaunched terminal asking for
      * its profile), or it turning up in the window (a reload inside the reconnection grace
      * reconnects the pty and never asks). Neither is a timing assumption.
+     *
+     * Two different clocks, for two different questions ({@link REVIVE_QUIET_MS}): until the
+     * first slot is accounted for the question is "is a revive coming at all?", answered by
+     * the long backstop; after it, "has the burst finished?", answered by a short quiet period
+     * that every further claim re-arms. VS Code can revive fewer terminals than we have
+     * sessions, so waiting for the whole queue would make the odd one out pay the backstop.
      */
     private async awaitRevive(grace: number): Promise<void> {
         if (grace <= 0) {
             return; // reconnect: same window, same tabs, nothing to revive
         }
-        await delay(grace);
+        // Both of these are sampled BEFORE the grace. VS Code's first revive routinely lands
+        // *inside* it — it did in the field log, 1.5s into a 2.5s grace — and a baseline taken
+        // afterwards would read that claim as the starting state rather than as progress,
+        // leaving `lastClaim` unset and sending the wait to the long backstop: precisely the
+        // eleven-second stall this quiet period exists to remove.
+        let outstanding = this.outstandingRestores();
         // Adopted sessions belong to another machine's window, so no revive is coming for
         // them and there is nothing to wait on — a hand-off must not pay the deadline.
-        if (!this.pendingRestores.some(entry => entry.revivable)) {
+        const revivable = this.pendingRestores.some(entry => entry.revivable);
+        await delay(grace);
+        if (!revivable) {
             return;
         }
         const started = Date.now();
+        let lastClaim: number | undefined;
         for (;;) {
             this.adoptRevivedTerminals();
-            if (this.pendingRestores.every(entry => this.openSlots.has(entry.slot))) {
+            const remaining = this.outstandingRestores();
+            if (remaining === 0) {
                 return; // every queued slot is claimed or already on screen
             }
-            if (Date.now() - started >= this.reviveDeadlineMs) {
+            if (remaining < outstanding) {
+                outstanding = remaining;
+                lastClaim = Date.now(); // a revive is running; re-arm the quiet window
+            }
+            if (lastClaim !== undefined) {
+                if (Date.now() - lastClaim >= this.reviveQuietMs) {
+                    this.log.trace(
+                        `tmux terminals: revive went quiet for ${this.reviveQuietMs}ms with `
+                        + `${remaining} session(s) unclaimed, opening them directly`
+                    );
+                    return;
+                }
+            } else if (Date.now() - started >= this.reviveDeadlineMs) {
                 this.log.trace(
                     `tmux terminals: no revive after ${this.reviveDeadlineMs}ms, opening `
-                    + `${this.pendingRestores.length} queued session(s) directly`
+                    + `${remaining} queued session(s) directly`
                 );
                 return;
             }
             await delay(REVIVE_POLL_MS);
         }
+    }
+
+    /** Queued sessions that still have no terminal — the measure the revive wait watches.
+     * Counts the queue minus anything already on screen, so a slot claimed by a profile
+     * request and one observed in the window both register as progress. */
+    private outstandingRestores(): number {
+        return this.pendingRestores.filter(entry => !this.openSlots.has(entry.slot)).length;
     }
 
     private async plan(): Promise<void> {
