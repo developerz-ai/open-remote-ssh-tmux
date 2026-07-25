@@ -46,11 +46,27 @@ jobs:
           npm run lint:all
 
       - name: Lint commit
+        # Same guard as ci-main.yml, kept in lockstep. `base.sha` is normally a real
+        # ancestor, but it is the base branch's head *at PR creation*: if main is rewritten
+        # (force-push, fork-sync discard) or the PR branch is rebased, that commit can end
+        # up unreachable or on a diverged history, and `<base>..<head>` fails the build for
+        # commits that are perfectly well-formed.
         run: |
-          if [[ "${BASE_SHA}" = "0000000000000000000000000000000000000000" ]]; then
-            npx commitlint --to HEAD --verbose
+          BASE=""
+          if [[ "${BASE_SHA}" != "0000000000000000000000000000000000000000" ]] \
+            && git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null \
+            && git merge-base --is-ancestor "${BASE_SHA}" "${HEAD_SHA}"; then
+            BASE="${BASE_SHA}"
+          fi
+          if [[ -z "${BASE}" ]] && git rev-parse -q --verify "${HEAD_SHA}^" >/dev/null; then
+            # Base rewritten or unreachable: lint the PR head alone rather than re-linting
+            # the whole divergence, which would fail on already-merged history.
+            BASE="${HEAD_SHA}^"
+          fi
+          if [[ -n "${BASE}" ]]; then
+            npx commitlint --from "${BASE}" --to "${HEAD_SHA}" --verbose
           else
-            npx commitlint --from "${BASE_SHA}" --to "${HEAD_SHA}" --verbose
+            npx commitlint --to "${HEAD_SHA}" --verbose
           fi
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
