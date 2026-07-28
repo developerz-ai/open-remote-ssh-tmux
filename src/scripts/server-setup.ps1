@@ -3,15 +3,29 @@
 $TMP_DIR="$env:TEMP\$([System.IO.Path]::GetRandomFileName())"
 $ProgressPreference = "SilentlyContinue"
 
-$DISTRO_VERSION="%%DISTRO_VERSION%%"
-$DISTRO_COMMIT="%%DISTRO_COMMIT%%"
-$DISTRO_QUALITY="%%DISTRO_QUALITY%%"
-$DISTRO_VSCODIUM_RELEASE="%%DISTRO_VSCODIUM_RELEASE%%"
+# Quote a runtime value for a *nested* PowerShell parse (the `powershell -c "…"`
+# below re-parses the argument string it is handed). Same rule as
+# src/common/shellQuote.ts's escapePowerShellArg: wrap in '…', double every '.
+# Needed because $SERVER_DATA_DIR derives from the user-configurable
+# `remote.SSH.serverInstallPath`, and a Windows path may legally contain `'`
+# or `$` - either would escape the nested `'…'` and inject a command.
+function psQuote($value) { "'" + ($value -replace "'", "''") + "'" }
 
-$SERVER_APP_NAME="%%SERVER_APP_NAME%%"
-$SERVER_INITIAL_EXTENSIONS="%%SERVER_INITIAL_EXTENSIONS%%"
+# Every placeholder below is substituted as an *already single-quoted*
+# PowerShell literal (serverSetup.ts's escapePowerShellArg), hence no quotes:
+# in a double-quoted PowerShell string `$(…)` is a subexpression that gets
+# evaluated and `"` ends the string, so splicing a user-configurable setting
+# (serverInstallPath / serverDownloadUrlTemplate / serverBinaryName) into one
+# was remote code execution at connect time.
+$DISTRO_VERSION=%%DISTRO_VERSION%%
+$DISTRO_COMMIT=%%DISTRO_COMMIT%%
+$DISTRO_QUALITY=%%DISTRO_QUALITY%%
+$DISTRO_VSCODIUM_RELEASE=%%DISTRO_VSCODIUM_RELEASE%%
+
+$SERVER_APP_NAME=%%SERVER_APP_NAME%%
+$SERVER_INITIAL_EXTENSIONS=%%SERVER_INITIAL_EXTENSIONS%%
 $SERVER_LISTEN_FLAG="%%SERVER_LISTEN_FLAG%%"
-$SERVER_DATA_DIR="%%SERVER_DATA_DIR%%"
+$SERVER_DATA_DIR=%%SERVER_DATA_DIR%%
 $SERVER_DATA_DIR_FLAG="%%SERVER_DATA_DIR_FLAG%%"
 $SERVER_DIR="$SERVER_DATA_DIR\bin\$DISTRO_COMMIT"
 $SERVER_SCRIPT="$SERVER_DIR\bin\$SERVER_APP_NAME.cmd"
@@ -20,7 +34,7 @@ $SERVER_PIDFILE="$SERVER_DATA_DIR\.$DISTRO_COMMIT.pid"
 $SERVER_TOKENFILE="$SERVER_DATA_DIR\.$DISTRO_COMMIT.token"
 $SERVER_ARCH=
 $SERVER_CONNECTION_TOKEN=
-$SERVER_DOWNLOAD_URL="%%SERVER_DOWNLOAD_URL%%"
+$SERVER_DOWNLOAD_URL=%%SERVER_DOWNLOAD_URL%%
 $SERVER_VALIDATION_FLAG="%%SERVER_VALIDATION_FLAG%%"
 
 $LISTENING_ON=
@@ -186,21 +200,25 @@ else {
     del $SERVER_TOKENFILE
   }
 
-  $SERVER_CONNECTION_TOKEN="%%SERVER_CONNECTION_TOKEN%%"
+  $SERVER_CONNECTION_TOKEN=%%SERVER_CONNECTION_TOKEN%%
   [System.IO.File]::WriteAllLines($SERVER_TOKENFILE, $SERVER_CONNECTION_TOKEN)
 
-  $SCRIPT_ARGUMENTS="--start-server --host=127.0.0.1 $SERVER_LISTEN_FLAG $SERVER_DATA_DIR_FLAG $SERVER_VALIDATION_FLAG $SERVER_INITIAL_EXTENSIONS --connection-token-file '$SERVER_TOKENFILE' --telemetry-level off --enable-remote-auto-shutdown --accept-server-license-terms *> '$SERVER_LOGFILE'"
+  # psQuote (not a bare '…') on the two paths: they are built from
+  # $SERVER_DATA_DIR, so a `'` in the configured install path would otherwise
+  # close the quote inside the nested `powershell -c` string below.
+  $SCRIPT_ARGUMENTS="--start-server --host=127.0.0.1 $SERVER_LISTEN_FLAG $SERVER_DATA_DIR_FLAG $SERVER_VALIDATION_FLAG $SERVER_INITIAL_EXTENSIONS --connection-token-file $(psQuote $SERVER_TOKENFILE) --telemetry-level off --enable-remote-auto-shutdown --accept-server-license-terms *> $(psQuote $SERVER_LOGFILE)"
 
   $START_ARGUMENTS = @{
     FilePath = "powershell.exe"
     WindowStyle = "hidden"
     ArgumentList = @(
-      # `& '<path>'` (call operator + single-quoted path), not a bare token -
+      # `& <quoted path>` (call operator + psQuote'd path), not a bare token -
       # otherwise a space in $SERVER_SCRIPT (e.g. "C:\Users\John Doe\...")
       # makes the nested powershell -c parser split it into two commands,
       # which fails "not recognized" while this outer script still reports
       # success (Start-Process only checks that powershell.exe itself launched).
-      "-ExecutionPolicy", "Unrestricted", "-NoLogo", "-NoProfile", "-NonInteractive", "-c", "& '$SERVER_SCRIPT' $SCRIPT_ARGUMENTS"
+      # psQuote rather than a literal '…' so a `'` in the path can't break out.
+      "-ExecutionPolicy", "Unrestricted", "-NoLogo", "-NoProfile", "-NonInteractive", "-c", "& $(psQuote $SERVER_SCRIPT) $SCRIPT_ARGUMENTS"
     )
     PassThru = $True
   }

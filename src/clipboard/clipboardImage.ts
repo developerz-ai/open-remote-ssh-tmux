@@ -21,11 +21,14 @@
 // As with `tmuxSession.ts`, this module is the ONLY place these command lines are built,
 // so quoting and path construction are auditable in one file.
 
-/** Root under which every uploaded image lives, before the per-user suffix. */
-const REMOTE_ROOT = '/tmp/open-remote-ssh-tmux';
+/** Directory, relative to the remote user's `$HOME`, under which every uploaded image
+ * lives. `.cache` is the XDG-conventional home for regenerable data, so nothing here is
+ * worth backing up or syncing — see {@link remoteImageDir} for why this is no longer
+ * anywhere near `/tmp`. */
+const REMOTE_DIR_NAME = '.cache/open-remote-ssh-tmux';
 
-/** Accepted shape for a remote user id / image id: no separators, no whitespace, no dots.
- * Anything outside this cannot traverse a path or break out of a quoted shell word. */
+/** Accepted shape for an image id: no separators, no whitespace, no dots. Anything outside
+ * this cannot traverse a path or break out of a quoted shell word. */
 const SAFE_TOKEN = /^[A-Za-z0-9_-]+$/;
 
 /** One way to get the clipboard's image off this machine. `output` says where the bytes
@@ -185,43 +188,86 @@ function asQuote(value: string): string {
 }
 
 /**
- * Directory holding this remote user's uploaded images.
+ * Directory holding this remote user's uploaded images, under their own `$HOME`.
  *
- * The user id is part of the path on purpose. `/tmp` is world-writable, so a single shared
- * directory lets any other account on that box pre-create it (or plant a symlink) and read
- * every screenshot dropped in — and screenshots routinely carry session cookies, tokens and
- * customer data. This mirrors the reasoning that moved `server-setup.sh`'s install lock out
- * of the shared `$TMP_DIR` into a per-user location.
+ * This lived in `/tmp/open-remote-ssh-tmux-<uid>/images` for two releases, with the uid
+ * documented as the thing that stopped another account on the box pre-creating the
+ * directory or planting a symlink. It did not, and the comment asserting it was the bug:
+ * a uid is public (`/etc/passwd`, `ps`), so the full path is guessable *before* the victim
+ * ever pastes, and `/tmp`'s sticky bit prevents deletion, not creation. Two attacks worked:
  *
- * @throws if `remoteUserId` is not a plain safe token — a traversal or a shell metacharacter
- *   here would otherwise reach a command line.
+ *   * pre-create it world-readable. `mkdir -p -m 700` applies its mode ONLY to directories
+ *     it actually creates — against an existing one it is a silent no-op, no error and no
+ *     chmod — so every screenshot then landed in an attacker-readable directory. Screenshots
+ *     are exactly the payload that carries session cookies, tokens and customer data;
+ *   * plant `/tmp/open-remote-ssh-tmux-<uid>` as a symlink to a directory of the victim's.
+ *     `mkdir -p` follows symlinks for intermediate components, so the images were written
+ *     inside the victim's own tree and the 48h `find … -delete` sweep then ran there too —
+ *     attacker-directed deletion of the victim's `*.png` files.
+ *
+ * `$HOME` is not world-writable, which removes the ground both attacks stood on, and with
+ * it the reason to put a uid in the path at all. `.cache` is the conventional home for
+ * regenerable data (XDG), so nothing here is worth backing up or syncing.
+ *
+ * @param remoteHome the remote user's `$HOME`, resolved on the remote (see `pasteImage.ts`).
+ * @throws if `remoteHome` is not a plain absolute POSIX path. A relative path would resolve
+ *   against an unknown cwd, and `..` or a NUL/newline has no business in a path that becomes
+ *   both a shell word and a `vscode-remote` URI.
  */
-export function remoteImageDir(remoteUserId: string): string {
-    if (!SAFE_TOKEN.test(remoteUserId)) {
-        throw new Error(`unsafe remote user id for image directory: ${JSON.stringify(remoteUserId)}`);
+export function remoteImageDir(remoteHome: string): string {
+    if (!isAbsolutePosixPath(remoteHome)) {
+        throw new Error(`unsafe remote home for image directory: ${JSON.stringify(remoteHome)}`);
     }
-    return `${REMOTE_ROOT}-${remoteUserId}/images`;
+    // Root's home is `/`, and a trailing slash is legal in `$HOME` generally — strip it so
+    // the join never produces a `//` that would read oddly in logs and URIs alike.
+    const home = remoteHome.replace(/\/+$/, '');
+    return `${home}/${REMOTE_DIR_NAME}/images`;
 }
 
 /**
  * Full remote path for one image. `imageId` is injected (not generated here) so naming stays
- * deterministic under test; it is validated for the same reason as the user id.
+ * deterministic under test; it is validated so no traversal or shell metacharacter can reach
+ * a command line or a URI.
  */
-export function remoteImagePath(remoteUserId: string, imageId: string): string {
+export function remoteImagePath(remoteHome: string, imageId: string): string {
     if (!SAFE_TOKEN.test(imageId)) {
         throw new Error(`unsafe image id: ${JSON.stringify(imageId)}`);
     }
-    return `${remoteImageDir(remoteUserId)}/${imageId}.png`;
+    return `${remoteImageDir(remoteHome)}/${imageId}.png`;
 }
 
+/** Printed by {@link buildRemoteMkdirCommand} on success, and required by the caller. See
+ * there for why an explicit marker is the only reliable signal available. */
+export const MKDIR_OK_MARKER = 'orst-mkdir-ok';
+
 /**
- * Create the image directory private *before* the first byte lands.
+ * Create the image directory private *before* the first byte lands, and prove it.
+ *
  * `vscode.workspace.fs.writeFile` cannot set a mode, so if the directory were created
  * world-readable the image would be exposed for the window between write and any later
- * `chmod`. `mkdir -p -m 700` closes that window.
+ * `chmod`. `mkdir -p -m 700` closes that window — but only for a directory it actually
+ * creates; an existing one silently keeps whatever mode it had, so the mode is asserted
+ * with an explicit `chmod` rather than assumed.
+ *
+ * The marker exists because `SSHConnection#exec` surfaces no exit code — it resolves on
+ * channel close whatever the command did. Without it, a `mkdir` that failed (read-only
+ * home, a plain file already at that path, no `mkdir` at all on a Windows remote) was
+ * indistinguishable from success, and the upload walked straight into `writeFile` leaving
+ * the user a generic "could not paste" with nothing in the log to explain it. `&&` chaining
+ * means the marker cannot appear unless every step succeeded.
  */
 export function buildRemoteMkdirCommand(dir: string): string {
-    return `mkdir -p -m 700 ${quote(dir)}`;
+    const path = quote(dir);
+    return `mkdir -p -m 700 ${path} && chmod 700 ${path} && echo ${MKDIR_OK_MARKER}`;
+}
+
+/** A plain absolute POSIX path: rooted, no `..` segment, and free of the characters that
+ * have no meaning in a path but plenty in a shell command or a URI. */
+function isAbsolutePosixPath(value: string): boolean {
+    if (!value.startsWith('/') || /[\0\n\r]/.test(value)) {
+        return false;
+    }
+    return !value.split('/').includes('..');
 }
 
 /**

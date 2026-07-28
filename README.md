@@ -108,10 +108,11 @@ needs the image — Claude Code, say, being asked to fix a visual bug in a webap
 runs on the server. Nothing bridges the two. So the image is written to the
 remote and its **path** is pasted, which is all a CLI tool needs.
 
-- Images land in `/tmp/open-remote-ssh-tmux-<uid>/images/`, created `0700`
-  *before* the first byte is written. Screenshots routinely contain tokens and
-  session cookies, and `/tmp` is world-readable — the uid in the path keeps other
-  accounts on the box out.
+- Images land in `~/.cache/open-remote-ssh-tmux/images/` on the remote, created
+  and verified `0700` *before* the first byte is written. Screenshots routinely
+  contain tokens and session cookies, so they are kept inside the user's own
+  home rather than anywhere under world-writable `/tmp` (which through 1.1.3
+  they were — see the 1.2.0 entry in [CHANGELOG.md](CHANGELOG.md)).
 - Transfer goes over the **already-open** remote connection
   (`vscode.workspace.fs`) — no `scp`, no second channel, no daemon.
 - The path is sent as a **bracketed paste** (`ESC[200~ … ESC[201~`), so a TUI

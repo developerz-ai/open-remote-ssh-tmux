@@ -7,16 +7,26 @@ DISTRO_COMMIT="%%DISTRO_COMMIT%%"
 DISTRO_QUALITY="%%DISTRO_QUALITY%%"
 DISTRO_VSCODIUM_RELEASE="%%DISTRO_VSCODIUM_RELEASE%%"
 
-SERVER_APP_NAME="%%SERVER_APP_NAME%%"
-SERVER_INITIAL_EXTENSIONS="%%SERVER_INITIAL_EXTENSIONS%%"
-SERVER_LISTEN_FLAG="%%SERVER_LISTEN_FLAG%%"
+# Unquoted: serverSetup.ts single-quotes this (`remote.SSH.serverBinaryName` is
+# user-configurable, and bash evaluates `$( )`/backticks inside double quotes).
+SERVER_APP_NAME=%%SERVER_APP_NAME%%
+# The four *_FLAG/EXTENSIONS values below are arrays, not strings: they are
+# expanded as `"${NAME[@]}"` when the server is launched, so each element stays
+# exactly one argv entry. As plain strings they had to be expanded *unquoted*
+# to word-split into separate flags, which also word-split (and glob-expanded)
+# any path containing a space or a `*` — e.g. a `remote.SSH.serverInstallPath`
+# of `/opt/my dir` started the server with `--server-data-dir=/opt/my` plus a
+# stray `dir` positional. serverSetup.ts fills each slot with already-quoted
+# array elements.
+SERVER_INITIAL_EXTENSIONS=(%%SERVER_INITIAL_EXTENSIONS%%)
+SERVER_LISTEN_FLAG=(%%SERVER_LISTEN_FLAG%%)
 # Unquoted: serverSetup.ts's escapeCustomInstallPath already emits a fully
 # shell-safe expression here (a single-quoted literal, optionally prefixed
 # with a raw, still-expandable `$HOME`) — wrapping it in another layer of
 # double quotes would turn its escaping single-quotes into literal
 # characters in the resulting path instead of quoting them away.
 SERVER_DATA_DIR=%%SERVER_DATA_DIR%%
-SERVER_DATA_DIR_FLAG="%%SERVER_DATA_DIR_FLAG%%"
+SERVER_DATA_DIR_FLAG=(%%SERVER_DATA_DIR_FLAG%%)
 SERVER_DIR="$SERVER_DATA_DIR/bin/$DISTRO_COMMIT"
 SERVER_SCRIPT="$SERVER_DIR/bin/$SERVER_APP_NAME"
 SERVER_LOGFILE="$SERVER_DATA_DIR/.$DISTRO_COMMIT.log"
@@ -25,7 +35,7 @@ SERVER_TOKENFILE="$SERVER_DATA_DIR/.$DISTRO_COMMIT.token"
 SERVER_ARCH=
 SERVER_CONNECTION_TOKEN=
 SERVER_DOWNLOAD_URL=
-SERVER_VALIDATION_FLAG="%%SERVER_VALIDATION_FLAG%%"
+SERVER_VALIDATION_FLAG=(%%SERVER_VALIDATION_FLAG%%)
 
 LISTENING_ON=
 OS_RELEASE_ID=
@@ -254,7 +264,7 @@ if [[ -z $SERVER_RUNNING_PROCESS ]]; then
   SERVER_CONNECTION_TOKEN="%%SERVER_CONNECTION_TOKEN%%"
   echo "$SERVER_CONNECTION_TOKEN" > "$SERVER_TOKENFILE"
 
-  "$SERVER_SCRIPT" --start-server --host=127.0.0.1 $SERVER_LISTEN_FLAG $SERVER_DATA_DIR_FLAG $SERVER_VALIDATION_FLAG $SERVER_INITIAL_EXTENSIONS --connection-token-file "$SERVER_TOKENFILE" --telemetry-level off --enable-remote-auto-shutdown --accept-server-license-terms &> "$SERVER_LOGFILE" &
+  "$SERVER_SCRIPT" --start-server --host=127.0.0.1 "${SERVER_LISTEN_FLAG[@]}" "${SERVER_DATA_DIR_FLAG[@]}" "${SERVER_VALIDATION_FLAG[@]}" "${SERVER_INITIAL_EXTENSIONS[@]}" --connection-token-file "$SERVER_TOKENFILE" --telemetry-level off --enable-remote-auto-shutdown --accept-server-license-terms &> "$SERVER_LOGFILE" &
   echo $! > "$SERVER_PIDFILE"
 else
   echo "Server script is already running $SERVER_SCRIPT"

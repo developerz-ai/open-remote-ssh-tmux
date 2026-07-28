@@ -144,11 +144,22 @@ export default class SSHConnection extends EventEmitter {
                     let stdout = '';
                     let stderr = '';
                     let resolved = false;
+                    // Once `tester` has matched, the caller has its answer and everything
+                    // after it is dead weight. The remote channel stays open regardless —
+                    // `serverSetup` waits here for "Extension host agent listening on …"
+                    // from a script that keeps running — so without this guard `stdout` grew
+                    // without bound for the channel's whole life and `tester` was re-run
+                    // over an ever-longer string on every chunk (quadratic work for an
+                    // answer already given). The stream is deliberately NOT closed here:
+                    // that would cut the remote script off mid-run.
                     stream.on('close', function () {
                         if (!resolved) {
                             return resolve({ stdout, stderr });
                         }
                     }).on('data', function (data: Buffer | string) {
+                        if (resolved) {
+                            return;
+                        }
                         stdout += data.toString();
 
                         if (tester(stdout, stderr)) {
@@ -157,6 +168,9 @@ export default class SSHConnection extends EventEmitter {
                             return resolve({ stdout, stderr });
                         }
                     }).stderr.on('data', function (data: Buffer | string) {
+                        if (resolved) {
+                            return;
+                        }
                         stderr += data.toString();
 
                         if (tester(stdout, stderr)) {

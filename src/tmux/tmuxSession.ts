@@ -29,8 +29,15 @@ const DEFAULT_HISTORY_LIMIT = 50000;
 /** Session name shape this extension produces and is allowed to reap:
  * `code-<sha1_12>-<slot>`. Hex + digits only — no `.`/`:` (both forbidden by
  * tmux in session names). Matching this, not a bare `code-` prefix, keeps the
- * reaper conservative: a foreign `code`, `codex-x`, or `code-notes` is ignored. */
-const OWNED_SESSION_RE = new RegExp(`^${SESSION_PREFIX}[0-9a-f]+-\\d+$`);
+ * reaper conservative: a foreign `code`, `codex-x`, or `code-notes` is ignored.
+ *
+ * The hash length is pinned to exactly {@link HASH_LENGTH} and the slot may not carry
+ * leading zeros, so this admits only names this extension could actually have MINTED.
+ * A loose `[0-9a-f]+-\d+` also matched `code-a-0` and `code-<hash>-007` — shapes we
+ * never produce, i.e. someone else's sessions — and this regex is the reaper's kill
+ * permit (`shouldReap`). Erring wide there means killing a stranger's session; erring
+ * narrow means leaving one corpse for the next connect. Only one of those is recoverable. */
+const OWNED_SESSION_RE = new RegExp(`^${SESSION_PREFIX}[0-9a-f]{${HASH_LENGTH}}-(?:0|[1-9]\\d*)$`);
 
 /**
  * The `if-shell -F` predicate guarding the PageUp/PageDown bindings below: expands to
@@ -125,7 +132,20 @@ export function sessionSlot(name: string, hostKey: string, workspaceKey: string)
         return undefined;
     }
     const suffix = name.slice(prefix.length);
-    return /^\d+$/.test(suffix) ? parseInt(suffix, 10) : undefined;
+    if (!/^\d+$/.test(suffix)) {
+        return undefined;
+    }
+    const slot = parseInt(suffix, 10);
+    // Enforce the round trip the doc comment promises, rather than trusting `\d+`.
+    // `parseInt` is lossy in two ways that both break `name === sessionName(…, slot)`:
+    // a zero-padded `007` decodes to 7, and a suffix past 2^53 (`9999…`) rounds to a
+    // value that is still `Number.isInteger`, so it would sail straight through
+    // `sessionName`. Either way the caller re-derives a DIFFERENT name from the slot —
+    // `TmuxTerminalProvider` does exactly that when it adopts a remote session or claims
+    // a restore — and attaches a brand-new empty session while the real one is left on
+    // the remote with nothing pointing at it. That is the zombie this fork exists to
+    // prevent, so a name we could not have minted is simply not ours.
+    return String(slot) === suffix ? slot : undefined;
 }
 
 /** True iff the name matches the `code-<hash>-<slot>` namespace this extension owns. */

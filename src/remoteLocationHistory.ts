@@ -147,5 +147,13 @@ function remoteLocationFromUri(uri: vscode.Uri): [string, string] | undefined {
 
     const encodedHost = uri.authority.substring(prefix.length);
     const sshDest = SSHDestination.parseEncoded(encodedHost);
+    if (!sshDest.hostname) {
+        // History is keyed by hostname, so an undecodable/empty payload wrote an entry under
+        // `''` — which "SSH Targets" then rendered as a blank root node the user could see
+        // but never remove, because removal is keyed by that same empty string. There is no
+        // useful identity here, so record nothing. `deriveTmuxSessionContext` already refuses
+        // this case for the same reason; the history path did not.
+        return undefined;
+    }
     return [sshDest.hostname, uri.path];
 }

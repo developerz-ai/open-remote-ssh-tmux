@@ -278,4 +278,19 @@ describe('getRemoteWorkspaceLocationData', () => {
         workspace.workspaceFolders = [{ uri: remoteUri(authority, '/home/user/proj') }];
         expect(getRemoteWorkspaceLocationData()).toEqual(['example.com', '/home/user/proj']);
     });
+
+    // An undecodable payload yields an empty hostname, and history is keyed by hostname —
+    // so this wrote an entry under `''`, which "SSH Targets" then rendered as a blank root
+    // node the user could see but never remove (removal is keyed by that same host string).
+    // `deriveTmuxSessionContext` guards exactly this case before forming a session identity;
+    // the history path did not.
+    it('returns undefined when the authority decodes to an empty hostname', () => {
+        workspace.workspaceFolders = [{ uri: remoteUri('ssh-remote+', '/home/user/proj') }];
+        expect(getRemoteWorkspaceLocationData()).toBeUndefined();
+    });
+
+    it('returns undefined when the encoded payload names no host', () => {
+        workspace.workspaceFolders = [{ uri: remoteUri(`ssh-remote+${encode({ hostName: '' })}`, '/p') }];
+        expect(getRemoteWorkspaceLocationData()).toBeUndefined();
+    });
 });

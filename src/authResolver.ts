@@ -11,7 +11,7 @@ import SSHDestination from './ssh/sshDestination';
 import SSHConnection, { SSHTunnelConfig } from './ssh/sshConnection';
 import SSHConfiguration from './ssh/sshConfig';
 import { gatherIdentityFiles } from './ssh/identityFiles';
-import { verifyKnownHost, hostKeyIdentity } from './ssh/hostfile';
+import { verifyKnownHost, hostKeyIdentity, type HostKeyVerdict } from './ssh/hostfile';
 import { untildify, exists as fileExists } from './common/files';
 import { findRandomPort } from './common/ports';
 import { disposeAll } from './common/disposable';
@@ -30,6 +30,46 @@ export const REMOTE_SSH_AUTHORITY = 'ssh-remote';
 
 export function getRemoteAuthority(host: string) {
     return `${REMOTE_SSH_AUTHORITY}+${host}`;
+}
+
+/**
+ * Split `ssh-remote+<encoded-host>` into its type and its destination.
+ *
+ * The authority has exactly one separator — the *first* `+`; everything after it
+ * belongs to the destination. `authority.split('+')` (what this replaces)
+ * destructured only the first two segments, so a Host alias containing a `+`
+ * (legal in ssh_config, and passed through verbatim by VS Code) was truncated:
+ * `ssh-remote+my+host` resolved `dest === 'my'` and we connected to the wrong
+ * host, or more often to none at all.
+ */
+export function parseAuthority(authority: string): { type: string; dest: string } {
+    const separator = authority.indexOf('+');
+    return separator === -1
+        ? { type: authority, dest: '' }
+        : { type: authority.slice(0, separator), dest: authority.slice(separator + 1) };
+}
+
+/**
+ * Whether a `ProxyJump`/`ProxyCommand` value means "do not proxy" — either unset
+ * or the literal `none`.
+ *
+ * `none` is the documented OpenSSH way to *cancel* a proxy inherited from an
+ * earlier or wildcard block (ssh_config(5)), and ssh-config's first-seen-wins
+ * `compute()` faithfully hands it back to us. `'none'` is truthy, so a plain
+ * `if (sshHostConfig['ProxyCommand'])` took the proxy branch anyway and spawned a
+ * binary literally called `none` → ENOENT → "Could not establish connection";
+ * `ProxyJump none` likewise tried to resolve a host named `none`. Folding the
+ * unset case in here too keeps the call site a single check per branch.
+ *
+ * OpenSSH compares case-insensitively (`strcasecmp(*arg, "none")`), so we do too.
+ * The array shape is the same defensive ssh-config-version compatibility path
+ * {@link splitProxyCommand} carries.
+ */
+export function isProxyDisabled(value: string | string[] | undefined): boolean {
+    // A whitespace-only value counts as unset: `splitProxyCommand` yields no
+    // tokens for it, so the old truthiness check spawned `undefined` (ENOENT).
+    const text = (Array.isArray(value) ? value.join(' ') : value ?? '').trim();
+    return !text || text.toLowerCase() === 'none';
 }
 
 class TunnelInfo implements vscode.Disposable {
@@ -68,15 +108,32 @@ interface SSHKey {
  * https://github.com/jeanp413/open-remote-ssh/issues/271 and
  * https://github.com/jeanp413/open-remote-ssh/issues/273.
  *
- * This helper mirrors OpenSSH's own ProxyCommand tokenization:
- * - whitespace separates tokens (outside quotes)
- * - double quotes group a single token
- * - backslash escapes the next character
+ * OpenSSH itself does no tokenization at all — it hands the string to a shell —
+ * so this approximates what that shell would do, which is platform-dependent:
+ * - whitespace separates tokens (outside quotes), on both platforms
+ * - double quotes group a single token, on both platforms
+ * - a backslash escapes the next character only on a POSIX client (`/bin/sh`),
+ *   and even there only `"` and `\` are escapes *inside* double quotes — sh
+ *   leaves every other backslash in a quoted span alone.
+ *
+ * The unconditional "backslash escapes anything, anywhere" rule this replaces
+ * silently destroyed Windows ProxyCommands: `C:\Users\me\proxy.exe -H %h` came
+ * out as `C:Usersmeproxy.exe` and spawned as ENOENT, and even a *quoted*
+ * `"C:\Program Files\nc.exe"` came out as `C:Program Filesnc.exe` — despite the
+ * `isWindows && /\.(bat|cmd)$/` branch at the call site showing Windows
+ * ProxyCommands are a supported path. Trade-off: on Windows we lose shell-style
+ * escaping entirely, so `\ ` no longer joins a path around a space — that path
+ * must be double-quoted (which now works on both platforms). `\` is the path
+ * separator in practically every Windows ProxyCommand and an escape in almost
+ * none, so that is the cheaper half.
+ *
+ * `windows` is a parameter (not read straight from `isWindows`) so both
+ * behaviours are unit-testable on either CI platform.
  *
  * Array inputs are passed through for defensive compatibility with older
  * ssh-config versions.
  */
-export function splitProxyCommand(value: string | string[]): string[] {
+export function splitProxyCommand(value: string | string[], windows: boolean = isWindows): string[] {
     if (Array.isArray(value)) {return value.slice();}
     const out: string[] = [];
     let cur = '';
@@ -85,7 +142,7 @@ export function splitProxyCommand(value: string | string[]): string[] {
     let hasToken = false;
     while (i < value.length) {
         const ch = value[i];
-        if (ch === '\\' && i + 1 < value.length) {
+        if (!windows && ch === '\\' && i + 1 < value.length && (!quoted || value[i + 1] === '"' || value[i + 1] === '\\')) {
             cur += value[i + 1];
             i += 2;
             hasToken = true;
@@ -177,17 +234,197 @@ export function buildKeyboardInteractiveFinish(promptCount: number, responses: s
     return { finishWith: padded, retriesExhausted: true };
 }
 
+/** Longest unterminated stderr run we buffer before flushing it anyway — see
+ * {@link drainProxyCommandStderr}. Generous enough for any real diagnostic line,
+ * small enough that a proxy spewing newline-free binary can't grow our heap. */
+const MAX_STDERR_LINE = 8192;
+
 /**
- * Which SSHConnection instances `dispose()` must close. A ProxyJump chain
- * connects hop[0] for real (TCP); each later hop, and the destination
+ * Consume a ProxyCommand child's stderr, handing complete lines to `onLine`.
+ *
+ * `cp.spawn` pipes all three stdio streams by default, but only `stdout`/`stdin`
+ * are wired up (into the ssh2 `sock`). Nothing read `stderr`, so as soon as the
+ * proxy had written one pipe buffer (~64KB on Linux) to it the child blocked on
+ * write *forever*: the connect then hung until `readyTimeout` with nothing in the
+ * log to explain it. Verbose proxies (`ssh -v -W …`, `cloudflared`) reach that
+ * routinely, and below the threshold every diagnostic they emitted was thrown
+ * away. Draining fixes the hang; logging what we drained is the diagnostic that
+ * was missing.
+ *
+ * Line-buffered so a chunk boundary mid-message doesn't produce two garbled log
+ * entries, and defensive on every edge: `onLine` failures and stream `error`s are
+ * swallowed (the point is to keep *reading*, and an unhandled stream 'error'
+ * would take down the extension host), and an over-long unterminated run is
+ * flushed rather than buffered without limit.
+ *
+ * Caller's responsibility: log this at trace level only. Proxy stderr is
+ * attacker-influenced third-party output and may echo prompts; it is never
+ * credentials we hold, but it does not belong in the default-visible log.
+ */
+export function drainProxyCommandStderr(stderr: stream.Readable | null | undefined, onLine: (line: string) => void): void {
+    if (!stderr) {
+        return;
+    }
+    let buffered = '';
+    const emit = (line: string) => {
+        const trimmed = line.replace(/\r$/, '');
+        if (!trimmed.trim()) {
+            return;
+        }
+        try {
+            onLine(trimmed);
+        } catch {
+            // A failing logger must never stop us draining the pipe — that would
+            // reinstate the very hang this function exists to prevent. It also
+            // must not escape: we're inside a stream 'data' emit.
+        }
+    };
+    stderr.setEncoding('utf8');
+    stderr.on('data', (chunk: string) => {
+        buffered += chunk;
+        let newline = buffered.indexOf('\n');
+        while (newline !== -1) {
+            emit(buffered.slice(0, newline));
+            buffered = buffered.slice(newline + 1);
+            newline = buffered.indexOf('\n');
+        }
+        while (buffered.length > MAX_STDERR_LINE) {
+            emit(buffered.slice(0, MAX_STDERR_LINE));
+            buffered = buffered.slice(MAX_STDERR_LINE);
+        }
+    });
+    const flush = () => {
+        if (buffered) {
+            emit(buffered);
+            buffered = '';
+        }
+    };
+    stderr.on('end', flush);
+    stderr.on('close', flush);
+    stderr.on('error', () => {
+        // The child died mid-write (EPIPE/ECONNRESET on the pipe). Nothing to do
+        // but stop; the resolver already surfaces the failure through the child's
+        // own 'error' handler and the destroyed sock.
+    });
+}
+
+/** The one thing teardown needs of an `SSHConnection`. */
+export interface ClosableConnection {
+    close(): Promise<void>;
+}
+
+/**
+ * Which connections `dispose()` (and a retry's teardown) must close. A ProxyJump
+ * chain connects hop[0] for real (TCP); each later hop, and the destination
  * connection sitting on top of the chain, is layered on via a forwarded-out
  * stream (`sock:` in the ssh2 config) — ending hop[0] tends to cascade down
  * through those interrupted streams, but that's an implicit transport side
  * effect, not something this resolver should rely on to close connections it
  * created. Close every one of them explicitly instead of only hop[0].
+ *
+ * Typed structurally (not as `SSHConnection`) so {@link teardownAttempt} — its
+ * only consumer besides `dispose()` — stays unit-testable without ssh2.
  */
-export function connectionsToClose(sshConnection: SSHConnection | undefined, proxyConnections: SSHConnection[]): SSHConnection[] {
-    return [sshConnection, ...proxyConnections].filter((connection): connection is SSHConnection => connection !== undefined);
+export function connectionsToClose(sshConnection: ClosableConnection | undefined, proxyConnections: readonly ClosableConnection[]): ClosableConnection[] {
+    return [sshConnection, ...proxyConnections].filter((connection): connection is ClosableConnection => connection !== undefined);
+}
+
+/**
+ * One resolve attempt's disposable state, structurally typed — no ssh2, no
+ * `child_process` — so the release order and failure-isolation below are unit
+ * tested rather than only reachable through a live connection.
+ */
+export interface AttemptTeardown {
+    /** Open tunnels. Emptied in place by `disposeAll`, so a retry neither
+     * re-disposes them nor keeps growing the array. */
+    readonly tunnels: vscode.Disposable[];
+    /** The destination connection, if the attempt got that far. */
+    readonly sshConnection: ClosableConnection | undefined;
+    /** Every ProxyJump hop, in the order they were dialled. */
+    readonly proxyConnections: readonly ClosableConnection[];
+    /** The ProxyCommand child, if one was spawned. */
+    readonly proxyCommandProcess: { kill(): unknown } | undefined;
+}
+
+/**
+ * Release everything one resolve attempt allocated: tunnels first (they sit on
+ * top of the connections), then every connection, then the ProxyCommand child
+ * whose stdio the connections were riding on — outermost first, RAII order.
+ *
+ * Shared by `dispose()` and by the *start* of `resolve()`: one resolver instance
+ * lives for the extension's lifetime and `resolve()` is re-entered on every
+ * retry/reconnect, so without this each attempt silently abandoned the previous
+ * attempt's authenticated connection, its listening local forwarding/SOCKS
+ * servers, and its ProxyCommand child (`dispose()` only ever saw the *latest* of
+ * each). A transient `installCodeServer` failure — TemporarilyNotAvailable, which
+ * VS Code retries — leaked one full set per attempt, for the window's lifetime.
+ *
+ * Nothing here is allowed to throw: on the retry path a failure while releasing
+ * attempt N-1 must neither abort attempt N nor strand the rest of attempt N-1's
+ * handles. Every failure is reported through `onError` instead — which is also
+ * why this doesn't let `disposeAll`'s deliberate rethrow escape.
+ */
+export function teardownAttempt(state: AttemptTeardown, onError: (message: string, err: unknown) => void): void {
+    try {
+        disposeAll(state.tunnels);
+    } catch (err) {
+        onError('Error disposing SSH tunnels', err);
+    }
+    for (const connection of connectionsToClose(state.sshConnection, state.proxyConnections)) {
+        try {
+            connection.close().catch((err) => onError('Error closing SSH connection', err));
+        } catch (err) {
+            onError('Error closing SSH connection', err);
+        }
+    }
+    if (state.proxyCommandProcess) {
+        try {
+            state.proxyCommandProcess.kill();
+        } catch (err) {
+            onError('Error killing ProxyCommand process', err);
+        }
+    }
+}
+
+/** What the user and the log are told when a host key is refused. Message only —
+ * there is deliberately no action/override field for a caller to wire a button to. */
+export interface HostKeyRejectionNotice {
+    readonly logMessage: string;
+    readonly message: string;
+}
+
+/**
+ * The operator-facing explanation for a refused host key, per verdict — the only
+ * part of `buildHostVerifier`'s reaction that isn't already `verifyKnownHost`'s
+ * (tested) decision, extracted so the wording itself is pinned by a test.
+ *
+ * `known` and `unknown` produce nothing: the first is a plain accept, the second
+ * is handled by the first-connect consent prompt, not by an error.
+ *
+ * `mismatch` and `revoked` must never share wording. Mismatch means the key
+ * changed — the honest remediation is "if that was legitimate, drop the stale
+ * known_hosts entry and reconnect". Applying that advice to a `@revoked` record
+ * (which `hostfile.ts` parses since it learned OpenSSH's markers — before that a
+ * revoked key surfaced as `unknown` and the user was offered the ordinary
+ * first-connect prompt for a key the admin had explicitly revoked) would be
+ * telling the user to delete the revocation and then trust the revoked key.
+ * OpenSSH hard-refuses a revoked key; so do we — no bypass, and no hint at one.
+ */
+export function hostKeyRejectionNotice(verdict: HostKeyVerdict, identity: string): HostKeyRejectionNotice | undefined {
+    switch (verdict) {
+        case 'mismatch':
+            return {
+                logMessage: `Host key verification failed for ${identity}: presented key does not match known_hosts`,
+                message: `Host key verification failed for '${identity}': the key does not match the one recorded in known_hosts. This may indicate a man-in-the-middle attack, so the connection was refused. If the host key legitimately changed, remove the stale entry from your known_hosts file and reconnect.`,
+            };
+        case 'revoked':
+            return {
+                logMessage: `Host key verification failed for ${identity}: presented key is marked @revoked`,
+                message: `The host key for '${identity}' has been revoked. Whoever administers this host marked the key as no longer valid, so the connection was refused. Ask them for the host's current key.`,
+            };
+        default:
+            return undefined;
+    }
 }
 
 export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode.Disposable {
@@ -252,8 +489,41 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
     ) {
     }
 
+    /**
+     * Release whatever the *previous* resolve attempt allocated, before this one
+     * allocates its own.
+     *
+     * Ordering matters and is deliberate: this runs at the very top of the resolve
+     * body, before a single new connection/tunnel/child is assigned to a field, so
+     * it can only ever see state from an earlier attempt — it can never tear down
+     * what the current attempt is building. The one case it does cut short is a
+     * *still-in-flight* earlier attempt (VS Code awaits our promise before
+     * retrying, so this needs a caller that re-enters concurrently): that attempt's
+     * connection dies under it and it fails fast into the catch below. Newest
+     * attempt wins, deliberately — the alternative is the leak this exists to fix.
+     */
+    private teardownPreviousAttempt(): void {
+        teardownAttempt(
+            {
+                tunnels: this.tunnels,
+                sshConnection: this.sshConnection,
+                proxyConnections: this.proxyConnections,
+                proxyCommandProcess: this.proxyCommandProcess,
+            },
+            (message, err) => this.logger.trace(`${message}: ${err instanceof Error ? err.message : String(err)}`)
+        );
+        this.sshConnection = undefined;
+        this.proxyConnections = [];
+        this.proxyCommandProcess = undefined;
+        // Not closed explicitly: the SOCKS tunnel belongs to `sshConnection` and
+        // went down with it (`SSHConnection#close` closes its tunnels). Dropping
+        // the reference stops `openTunnel` routing the next attempt's traffic
+        // through a dead tunnel's port.
+        this.socksTunnel = undefined;
+    }
+
     resolve(authority: string, context: vscode.RemoteAuthorityResolverContext): Thenable<vscode.ResolverResult> {
-        const [type, dest] = authority.split('+');
+        const { type, dest } = parseAuthority(authority);
         if (type !== REMOTE_SSH_AUTHORITY) {
             throw new Error(`Invalid authority type for SSH resolver: ${type}`);
         }
@@ -287,6 +557,9 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
             cancellable: false
         }, async () => {
             try {
+                // Every attempt starts from a clean slate — see teardownPreviousAttempt().
+                this.teardownPreviousAttempt();
+
                 const sshconfig = await SSHConfiguration.loadFromFS();
                 const sshHostConfig = sshconfig.getHostConfiguration(sshDest.hostname);
                 const sshHostName = sshHostConfig['HostName'] ? expandTokens(sshHostConfig['HostName'], { h: sshDest.hostname }) : sshDest.hostname;
@@ -304,9 +577,10 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                 const identitiesOnly = (sshHostConfig['IdentitiesOnly'] || 'no').toLowerCase() === 'yes';
                 const identityKeys = await gatherIdentityFiles(identityFiles, this.sshAgentSock, identitiesOnly, this.logger);
 
-                // Create proxy jump connections if any
+                // Create proxy jump connections if any. `none` cancels an inherited
+                // proxy and must not be treated as a host/command — see isProxyDisabled().
                 let proxyStream: ssh2.ClientChannel | stream.Duplex | undefined;
-                if (sshHostConfig['ProxyJump']) {
+                if (!isProxyDisabled(sshHostConfig['ProxyJump'])) {
                     const proxyJumps = sshHostConfig['ProxyJump'].split(',').filter(i => !!i.trim())
                         .map(i => {
                             const proxy = SSHDestination.parse(i);
@@ -346,7 +620,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                         const destPort = nextProxyJump ? resolveHopPort(nextProxyJump[1]['Port'], nextProxyJump[0].port) : sshPort;
                         proxyStream = await proxyConnection.forwardOut('127.0.0.1', 0, destIP, destPort);
                     }
-                } else if (sshHostConfig['ProxyCommand']) {
+                } else if (!isProxyDisabled(sshHostConfig['ProxyCommand'] as unknown as string | string[] | undefined)) {
                     let proxyArgs = splitProxyCommand(sshHostConfig['ProxyCommand'] as unknown as string | string[])
                         .map((arg) => expandTokens(arg, { h: sshHostName, n: sshDest.hostname, p: sshPort.toString(), r: sshUser }));
                     let proxyCommand = proxyArgs.shift()!;
@@ -376,6 +650,11 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                     proxyStream.on('error', (err) => {
                         this.logger.trace(`ProxyCommand stream error: ${err instanceof Error ? err.message : String(err)}`);
                     });
+                    // stdio is piped (spawn's default) but only stdout/stdin are wired
+                    // up above; an unread stderr pipe fills at ~64KB and blocks the
+                    // child forever. Drain it — at trace level, since it's third-party
+                    // output — see drainProxyCommandStderr().
+                    drainProxyCommandStderr(child.stderr, (line) => this.logger.trace(`ProxyCommand stderr: ${line}`));
                     this.proxyCommandProcess = child;
                 }
 
@@ -546,7 +825,12 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                             socket.pipe(socksConn.socket);
                             socksConn.socket.pipe(socket);
                         } catch (error) {
+                            // The SOCKS handshake failed, so this already-accepted client
+                            // socket was never wired to anything — nothing else owns it. Left
+                            // alone it stays open forever and the client just hangs. Destroy
+                            // it, same as the equivalent path in `sshConnection.addTunnel`.
                             this.logger.error(`Error while creating SOCKS connection`, error);
+                            socket.destroy();
                         }
                     })
                     .on('listening', () => resolve(server))
@@ -600,12 +884,13 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                 promptForUnknownHost: (id, fingerprint) => this.promptNewHostKey(id, fingerprint),
             }).then(
                 ({ verdict, verified }) => {
-                    if (verdict === 'mismatch') {
-                        this.logger.error(`Host key verification failed for ${identity}: presented key does not match known_hosts`);
-                        void vscode.window.showErrorMessage(
-                            `Host key verification failed for '${identity}': the key does not match the one recorded in known_hosts. This may indicate a man-in-the-middle attack, so the connection was refused. If the host key legitimately changed, remove the stale entry from your known_hosts file and reconnect.`,
-                            { modal: true },
-                        );
+                    // A refusal is otherwise silent — ssh2 just fails the connect and the
+                    // user sees "Could not establish connection" with no reason. Each
+                    // refusing verdict gets its own wording; see hostKeyRejectionNotice().
+                    const notice = hostKeyRejectionNotice(verdict, identity);
+                    if (notice) {
+                        this.logger.error(notice.logMessage);
+                        void vscode.window.showErrorMessage(notice.message, { modal: true });
                     }
                     callback(verified);
                 },
@@ -792,13 +1077,8 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
     }
 
     dispose() {
-        disposeAll(this.tunnels);
-        for (const connection of connectionsToClose(this.sshConnection, this.proxyConnections)) {
-            connection.close().catch((err) => {
-                this.logger.trace(`Error closing SSH connection during dispose: ${err instanceof Error ? err.message : String(err)}`);
-            });
-        }
-        this.proxyCommandProcess?.kill();
+        // Same release step a retry performs, so the two can't drift apart.
+        this.teardownPreviousAttempt();
         this.labelFormatterDisposable?.dispose();
     }
 }

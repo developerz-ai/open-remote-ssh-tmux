@@ -77,7 +77,12 @@ export function applyEnvCollection(
     }
 
     for (const key of [...applied.keys()]) {
-        const value = wanted[key];
+        // `hasOwnProperty`, not a bare `wanted[key]`: a variable named `toString` (or
+        // `constructor`, `valueOf`, …) that was applied earlier and is absent now would
+        // otherwise resolve to the inherited `Object.prototype` member, read as truthy, and
+        // skip its own withdrawal — leaving a stale value contributed to every terminal for
+        // the life of the window.
+        const value = Object.prototype.hasOwnProperty.call(wanted, key) ? wanted[key] : undefined;
         if (!value) {
             sink.delete(key);
             applied.delete(key);

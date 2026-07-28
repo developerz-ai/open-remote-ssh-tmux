@@ -3,6 +3,7 @@ import {
     buildCleanupCommand,
     buildLocalCaptureCandidates,
     buildRemoteMkdirCommand,
+    MKDIR_OK_MARKER,
     bracketedPaste,
     remoteImageDir,
     remoteImagePath,
@@ -170,45 +171,88 @@ describe('buildLocalCaptureCandidates: read the LOCAL clipboard (extension runs 
     });
 });
 
-describe('remoteImageDir / remoteImagePath: per-user, non-colliding, predictable', () => {
-    // /tmp is world-writable, so a shared fixed path lets any other local user pre-create
-    // (or symlink) the directory and read every screenshot we drop in it — screenshots
-    // routinely contain tokens, session cookies and customer data. The remote user id goes
-    // in the directory name for the same reason server-setup.sh moved its install lock out
-    // of the shared $TMP_DIR.
-    it('scopes the directory to the remote user', () => {
-        expect(remoteImageDir('1001')).toBe('/tmp/open-remote-ssh-tmux-1001/images');
-        expect(remoteImageDir('1001')).not.toBe(remoteImageDir('1002'));
+describe('remoteImageDir / remoteImagePath: under the user\'s own home, never world-writable /tmp', () => {
+    // This used to be `/tmp/open-remote-ssh-tmux-<uid>/images`, and the uid was documented as
+    // the thing that stopped another account pre-creating the directory or planting a
+    // symlink. It did not. The uid is public (`/etc/passwd`, `ps`), so the whole path is
+    // guessable before the victim ever pastes, and `/tmp`'s sticky bit prevents DELETION,
+    // not creation. Two working attacks on a shared box:
+    //
+    //   * `mkdir -m 777 -p /tmp/open-remote-ssh-tmux-1000/images` up front. `mkdir -p -m 700`
+    //     applies its mode ONLY to directories it actually creates — on an existing one it is
+    //     a silent no-op, no error, no chmod. Every screenshot then lands in an attacker-
+    //     readable directory, and screenshots routinely carry tokens and session cookies.
+    //   * `ln -s /home/victim/.ssh /tmp/open-remote-ssh-tmux-1000`. `mkdir -p` follows the
+    //     symlink for intermediate components, so images are written inside the victim's
+    //     directory and the 48h `find … -delete` sweep runs there too.
+    //
+    // `$HOME` is not world-writable, so neither attack has anywhere to stand. That also
+    // removes the need to put a uid in the path at all.
+    it('places the directory under the remote user\'s home, not /tmp', () => {
+        expect(remoteImageDir('/home/alice')).toBe('/home/alice/.cache/open-remote-ssh-tmux/images');
+        expect(remoteImageDir('/home/alice')).not.toContain('/tmp');
+        expect(remoteImageDir('/home/alice')).not.toBe(remoteImageDir('/home/bob'));
     });
 
-    it('rejects a user id that could escape the path', () => {
-        expect(() => remoteImageDir('../../etc')).toThrow();
-        expect(() => remoteImageDir('a b')).toThrow();
+    it('tolerates a home path with a trailing slash (root\'s home is "/")', () => {
+        expect(remoteImageDir('/')).toBe('/.cache/open-remote-ssh-tmux/images');
+        expect(remoteImageDir('/home/alice/')).toBe('/home/alice/.cache/open-remote-ssh-tmux/images');
+    });
+
+    it('rejects a home path that is not absolute, or that could escape', () => {
+        expect(() => remoteImageDir('relative/path')).toThrow();
         expect(() => remoteImageDir('')).toThrow();
+        expect(() => remoteImageDir('/home/../etc')).toThrow();
+        expect(() => remoteImageDir('/home/alice/..')).toThrow();
     });
 
-    it('builds a .png path under the user dir from an injected id', () => {
-        expect(remoteImagePath('1001', 'ab12cd34')).toBe('/tmp/open-remote-ssh-tmux-1001/images/ab12cd34.png');
+    it('rejects a home path carrying a NUL or a newline', () => {
+        expect(() => remoteImageDir('/home/a\0b')).toThrow();
+        expect(() => remoteImageDir('/home/a\nb')).toThrow();
+    });
+
+    it('builds a .png path under the image dir from an injected id', () => {
+        expect(remoteImagePath('/home/alice', 'ab12cd34'))
+            .toBe('/home/alice/.cache/open-remote-ssh-tmux/images/ab12cd34.png');
     });
 
     it('rejects an id that is not plain hex/alphanumeric (no traversal, no spaces)', () => {
-        expect(() => remoteImagePath('1001', '../../../etc/passwd')).toThrow();
-        expect(() => remoteImagePath('1001', 'a;rm -rf /')).toThrow();
+        expect(() => remoteImagePath('/home/alice', '../../../etc/passwd')).toThrow();
+        expect(() => remoteImagePath('/home/alice', 'a;rm -rf /')).toThrow();
+        expect(() => remoteImagePath('/home/alice', '')).toThrow();
     });
 });
 
-describe('buildRemoteMkdirCommand: 0700 before the first byte lands', () => {
+describe('buildRemoteMkdirCommand: 0700 before the first byte lands, and provably so', () => {
     // `vscode.workspace.fs.writeFile` cannot set a mode, so the directory must already be
     // private when the file is created — otherwise the image is briefly world-readable.
     it('creates the directory with mode 700', () => {
-        const cmd = buildRemoteMkdirCommand('/tmp/open-remote-ssh-tmux-1001/images');
+        const cmd = buildRemoteMkdirCommand('/home/alice/.cache/open-remote-ssh-tmux/images');
         expect(cmd).toContain('mkdir -p -m 700');
-        expect(cmd).toContain('\'/tmp/open-remote-ssh-tmux-1001/images\'');
+        expect(cmd).toContain('\'/home/alice/.cache/open-remote-ssh-tmux/images\'');
+    });
+
+    // `-m` is honoured only for directories mkdir actually CREATES. An existing directory
+    // keeps whatever mode it already had, silently — so the mode has to be asserted, not
+    // assumed, every time.
+    it('also chmods an already-existing directory rather than trusting -m', () => {
+        expect(buildRemoteMkdirCommand('/home/alice/x')).toContain('chmod 700');
+    });
+
+    // `SSHConnection#exec` surfaces no exit code — it resolves on channel close whatever the
+    // command did. So a `mkdir` that failed (read-only home, a plain FILE already at that
+    // path, no `mkdir` on a Windows remote) used to be indistinguishable from success, and
+    // the upload proceeded straight into `writeFile` with only a generic error to show for
+    // it. An explicit success marker on stdout is the only reliable signal available here.
+    it('emits a success marker the caller can require on stdout', () => {
+        expect(buildRemoteMkdirCommand('/home/alice/x')).toContain(MKDIR_OK_MARKER);
+        // Chained with && so the marker cannot print unless every step succeeded.
+        expect(buildRemoteMkdirCommand('/home/alice/x')).toMatch(/mkdir[^&]*&&[^&]*chmod[^&]*&&.*echo/);
     });
 
     it('quotes a path containing a single quote rather than breaking out of the command', () => {
-        const cmd = buildRemoteMkdirCommand('/tmp/it\'s/images');
-        expect(cmd).not.toMatch(/[^\\]'\/tmp\/it's/); // the inner quote is escaped, not raw
+        const cmd = buildRemoteMkdirCommand('/home/it\'s/images');
+        expect(cmd).not.toMatch(/[^\\]'\/home\/it's/); // the inner quote is escaped, not raw
         expect(cmd.startsWith('mkdir -p -m 700 ')).toBe(true);
     });
 });
@@ -218,8 +262,8 @@ describe('buildCleanupCommand: the 48h sweep', () => {
     // construction. Scoped with -maxdepth so it can never wander outside our own directory,
     // and restricted to regular .png files so a stray subdirectory is not deleted.
     it('deletes only regular .png files older than the given age, inside our dir only', () => {
-        const cmd = buildCleanupCommand('/tmp/open-remote-ssh-tmux-1001/images', 48);
-        expect(cmd).toContain('\'/tmp/open-remote-ssh-tmux-1001/images\'');
+        const cmd = buildCleanupCommand('/home/alice/.cache/open-remote-ssh-tmux/images', 48);
+        expect(cmd).toContain('\'/home/alice/.cache/open-remote-ssh-tmux/images\'');
         expect(cmd).toContain('-maxdepth 1');
         expect(cmd).toContain('-type f');
         expect(cmd).toContain('-name \'*.png\'');
@@ -233,7 +277,7 @@ describe('buildCleanupCommand: the 48h sweep', () => {
     });
 
     it('never emits a bare recursive delete', () => {
-        const cmd = buildCleanupCommand('/tmp/open-remote-ssh-tmux-1001/images', 48);
+        const cmd = buildCleanupCommand('/home/alice/.cache/open-remote-ssh-tmux/images', 48);
         expect(cmd).not.toContain('rm -rf');
     });
 

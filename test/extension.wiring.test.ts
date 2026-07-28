@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { decideDefaultProfile, decideTmuxWiring, defaultProfileSettingKey, deriveTmuxSessionContext, idempotentResolveHandler, lazyExec, readTmuxSettings, reconcileDefaultTerminalProfile, TMUX_PROFILE_TITLE } from '../src/extension';
+import { decideDefaultProfile, decideTmuxWiring, defaultProfileSettingKey, deriveTmuxSessionContext, idempotentResolveHandler, lazyExec, onceOnly, readTmuxSettings, reconcileDefaultTerminalProfile, TMUX_PROFILE_TITLE } from '../src/extension';
 import type { RemoteSSHResolver } from '../src/authResolver';
 import type Log from '../src/common/logger';
 import { ConfigurationTarget, configOverrides, inspectOverrides, TerminalProfile, updateCalls } from './mocks/vscode';
@@ -88,6 +88,41 @@ describe('idempotentResolveHandler: wire once, refresh on reconnect', () => {
 
         expect(wire).toHaveBeenCalledTimes(2);
         expect(refresh).toHaveBeenCalledTimes(1);
+    });
+});
+
+// The connect-time image sweep used to live inside `wireTmuxTerminalLayer`, which tied
+// housekeeping for pasted screenshots to a gate that has nothing to do with it: pasting
+// needs only a remote authority, but the sweep ran only when the tmux layer wired. With
+// `remote.SSH.tmux.enabled: "off"`, a remote without tmux, or an empty remote window,
+// images uploaded fine and nothing ever deleted them. It is now composed into the
+// resolve-success callback alongside the wiring, and must run exactly once per window.
+describe('onceOnly: connect-time housekeeping that must not repeat on reconnect', () => {
+    it('runs on the first call and never again', () => {
+        const action = vi.fn();
+        const once = onceOnly(action);
+
+        once();
+        once();
+        once();
+
+        expect(action).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not run until it is called', () => {
+        const action = vi.fn();
+        onceOnly(action);
+        expect(action).not.toHaveBeenCalled();
+    });
+
+    it('stays spent even when the action throws', () => {
+        const action = vi.fn(() => { throw new Error('sweep exploded'); });
+        const once = onceOnly(action);
+
+        // A throwing sweep must not arm itself to be retried on every later reconnect.
+        expect(() => once()).toThrow('sweep exploded');
+        expect(() => once()).not.toThrow();
+        expect(action).toHaveBeenCalledTimes(1);
     });
 });
 

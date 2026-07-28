@@ -9,6 +9,7 @@ import {
     buildCleanupCommand,
     buildLocalCaptureCandidates,
     buildRemoteMkdirCommand,
+    MKDIR_OK_MARKER,
     remoteImageDir,
     remoteImagePath,
     type CaptureCandidate,
@@ -112,14 +113,23 @@ export async function pasteClipboardImage(deps: PasteImageDeps): Promise<boolean
         return false;
     }
 
-    // Text on the clipboard means the user is very likely pasting text — that decides only
-    // whether the *visible* reader may run (see {@link captureAttempts}); the silent native
-    // readers run either way, because a browser's "copy image" puts a URL on the text
-    // clipboard alongside the bitmap and the image is still the thing worth pasting.
-    const hasText = (await vscode.env.clipboard.readText()).length > 0;
-
     const localPath = join(tmpdir(), `orst-clip-${randomBytes(8).toString('hex')}.png`);
     try {
+        // Text on the clipboard means the user is very likely pasting text — that decides only
+        // whether the *visible* reader may run (see {@link captureAttempts}); the silent native
+        // readers run either way, because a browser's "copy image" puts a URL on the text
+        // clipboard alongside the bitmap and the image is still the thing worth pasting.
+        //
+        // Inside the try, because this read can genuinely fail: on Windows another process
+        // holding an OLE clipboard lock rejects it, as does a flaky X11/Wayland selection
+        // owner. Outside, that rejection escaped `pasteClipboardImage` entirely, so the
+        // caller's `if (!handled) → workbench.action.terminal.paste` fallback never ran and
+        // VS Code showed "Running the contributed command failed" — the user pressed the
+        // paste key and their text paste simply vanished, which is the one outcome every
+        // comment in this file promises cannot happen. An unreadable text clipboard is not
+        // an error worth failing on either: it just means "no text", which at worst offers
+        // the webview reader when it was not strictly needed.
+        const hasText = await clipboardHasText(deps);
         const capture = await decideCapturePlan(captureAttempts(deps, terminal, localPath, hasText));
         if (!capture.bytes) {
             // The line the silent version owed the user: what ran, so "no image on the
@@ -132,15 +142,16 @@ export async function pasteClipboardImage(deps: PasteImageDeps): Promise<boolean
             return true;
         }
 
-        const remoteUserId = await resolveRemoteUserId(deps.exec);
-        const dir = remoteImageDir(remoteUserId);
-        const target = remoteImagePath(remoteUserId, randomBytes(8).toString('hex'));
+        const remoteHome = await resolveRemoteHome(deps.exec);
+        const dir = remoteImageDir(remoteHome);
+        const target = remoteImagePath(remoteHome, randomBytes(8).toString('hex'));
 
         await withDelayedProgress(PROGRESS_DELAY_MS, 'Uploading image…', async () => {
             // Create the directory private BEFORE writing: `workspace.fs.writeFile` cannot
             // set a mode, so a world-readable directory would expose the screenshot for the
             // window between write and any later chmod. Screenshots routinely carry tokens.
-            await deps.exec(buildRemoteMkdirCommand(dir));
+            // Verified rather than assumed — `exec` reports no exit code.
+            await ensureRemoteImageDir(deps.exec, dir);
             await vscode.workspace.fs.writeFile(remoteUri(deps.authority, target), capture.bytes!);
         });
 
@@ -168,7 +179,7 @@ export async function pasteClipboardImage(deps: PasteImageDeps): Promise<boolean
  */
 export async function sweepOldImages(deps: Pick<PasteImageDeps, 'exec' | 'log'>): Promise<void> {
     try {
-        const dir = remoteImageDir(await resolveRemoteUserId(deps.exec));
+        const dir = remoteImageDir(await resolveRemoteHome(deps.exec));
         await deps.exec(buildCleanupCommand(dir, IMAGE_MAX_AGE_HOURS));
         deps.log.trace(`clipboard images: swept anything older than ${IMAGE_MAX_AGE_HOURS}h in ${dir}`);
     } catch (err) {
@@ -236,13 +247,57 @@ function runCaptureCandidate(candidate: CaptureCandidate, outPath: string): Prom
     });
 }
 
-/** The remote's numeric uid, used to keep the image directory per-user in world-writable
- * `/tmp`. Falls back to a constant only if the probe returns something unusable, in which
- * case the path builders' validation still rejects anything unsafe. */
-async function resolveRemoteUserId(exec: RemoteExec): Promise<string> {
-    const { stdout } = await exec('id -u');
-    const id = stdout.trim();
-    return /^[0-9]+$/.test(id) ? id : 'shared';
+/**
+ * The remote user's `$HOME`, which is where uploaded images live (see `remoteImageDir`).
+ *
+ * Deliberately has NO fallback. The previous version probed `id -u` and fell back to the
+ * literal `'shared'` when the output was not numeric, which produced
+ * `/tmp/open-remote-ssh-tmux-shared/images` — one world-known directory shared by every
+ * user on the host, i.e. precisely the exposure the per-user path was there to prevent, on
+ * exactly the hosts where the probe was least reliable (a login shell printing a banner to
+ * stdout, a restricted shell, `id` off PATH, a Windows remote). Since `SSHConnection#exec`
+ * surfaces no exit code, a failed probe is indistinguishable from an odd one, so the only
+ * safe answer to "I could not determine where this user's home is" is to refuse the upload.
+ *
+ * `printf` rather than `echo` because `echo` mangles a home path containing a backslash on
+ * some shells; the result is validated as a plain absolute path before it is used.
+ */
+async function resolveRemoteHome(exec: RemoteExec): Promise<string> {
+    const { stdout } = await exec('printf %s "$HOME"');
+    // A login shell can print a banner before the value, so take the last non-empty line
+    // rather than the whole of stdout.
+    const home = stdout.split('\n').map(line => line.trim()).filter(Boolean).pop() ?? '';
+    if (!home.startsWith('/')) {
+        throw new Error(`could not resolve the remote home directory (got ${JSON.stringify(home.slice(0, 64))})`);
+    }
+    return home;
+}
+
+/**
+ * Create the remote image directory, and verify it actually happened.
+ *
+ * `exec` resolves on channel close whatever the command's exit code was, so the command
+ * prints {@link MKDIR_OK_MARKER} on success and its absence is the failure signal. Without
+ * this the upload proceeded into `writeFile` after a `mkdir` that had failed (read-only
+ * home, a plain file at that path, a Windows remote with no `mkdir`), and all the user got
+ * was a generic "could not paste" with nothing in the log naming the real cause.
+ */
+async function ensureRemoteImageDir(exec: RemoteExec, dir: string): Promise<void> {
+    const { stdout, stderr } = await exec(buildRemoteMkdirCommand(dir));
+    if (!stdout.includes(MKDIR_OK_MARKER)) {
+        throw new Error(`could not create the remote image directory ${dir}: ${stderr.trim() || 'no such directory and mkdir reported nothing'}`);
+    }
+}
+
+/** Whether the local clipboard holds any text, treating an unreadable clipboard as "no
+ * text" rather than as a failure — see the call site for why this must not throw. */
+async function clipboardHasText(deps: Pick<PasteImageDeps, 'log'>): Promise<boolean> {
+    try {
+        return (await vscode.env.clipboard.readText()).length > 0;
+    } catch (err) {
+        deps.log.trace(`clipboard image: could not read the text clipboard: ${errorText(err)}`);
+        return false;
+    }
 }
 
 /** Address a remote absolute path through the already-mounted remote filesystem, so the
