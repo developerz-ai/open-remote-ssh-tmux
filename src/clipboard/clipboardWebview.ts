@@ -144,8 +144,19 @@ const PAGE = `<!DOCTYPE html>
       for (const item of items) {
         if (item.type.startsWith('image/')) {
           e.preventDefault();
+          // getAsFile() is specified to return null when the item is not a file, and it
+          // does so in practice for some synthetic clipboard payloads. Passing that null on
+          // made readAsDataURL(null) throw inside this listener, so no message was ever
+          // posted and the panel sat on "Got it" for the full read timeout before the
+          // extension gave up — a 30-second freeze for what is simply "no image here".
+          // (No backticks in this comment: it lives inside a template literal.)
+          const file = item.getAsFile();
+          if (!file) {
+            send('none');
+            return;
+          }
           msg.textContent = 'Got it';
-          sendBlob(item.getAsFile());
+          sendBlob(file);
           return;
         }
       }

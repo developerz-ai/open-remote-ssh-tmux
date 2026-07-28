@@ -341,6 +341,34 @@ describe('sessionSlot', () => {
             expect(sessionSlot(name, 'example.com', '/home/user/proj')).toBeUndefined();
         }
     });
+
+    // The documented contract is `name === sessionName(host, ws, slot)`, and the callers
+    // depend on it literally: `terminalProvider` decodes a slot from an observed remote
+    // name and then re-derives the session name from that slot (adoption, restore-claim).
+    // A suffix that decodes to a slot whose `sessionName` is a DIFFERENT string breaks the
+    // round trip, and the provider ends up attaching a brand-new empty session while the
+    // real one is stranded on the remote with nothing pointing at it — a zombie.
+    it('rejects a suffix that does not round-trip back to the same name', () => {
+        // Zero-padded: `parseInt('007')` is 7, but `sessionName(..., 7)` ends in `-7`.
+        expect(sessionSlot(`code-${HASH_PROJ}-007`, 'example.com', '/home/user/proj')).toBeUndefined();
+        expect(sessionSlot(`code-${HASH_PROJ}-00`, 'example.com', '/home/user/proj')).toBeUndefined();
+    });
+
+    it('rejects a slot beyond the safe-integer range (parseInt would round it)', () => {
+        // `parseInt('99999999999999999999')` is 1e20 — an integer by `Number.isInteger`,
+        // so it would sail through `sessionName` and produce a different name again.
+        expect(sessionSlot(`code-${HASH_PROJ}-99999999999999999999`, 'example.com', '/home/user/proj'))
+            .toBeUndefined();
+    });
+
+    it('still accepts every slot we actually mint, round trip included', () => {
+        for (const slot of [0, 1, 9, 10, 12, 1234]) {
+            const name = sessionName('example.com', '/home/user/proj', slot);
+            const decoded = sessionSlot(name, 'example.com', '/home/user/proj');
+            expect(decoded).toBe(slot);
+            expect(sessionName('example.com', '/home/user/proj', decoded!)).toBe(name);
+        }
+    });
 });
 
 describe('parseListSessions', () => {
@@ -397,6 +425,21 @@ describe('isOurSession', () => {
         for (const name of ['main', 'code', 'codex-x', 'code-XYZ-0', 'code-abc', 'vscode-1']) {
             expect(isOurSession(name)).toBe(false);
         }
+    });
+
+    // `isOurSession` is the reaper's kill permit, so it must admit only names this
+    // extension could actually have MINTED — not merely names of a similar shape. A
+    // wrong hash length or a zero-padded slot is a session someone else created; the
+    // conservative rule is to leave it alone.
+    it('rejects a hash that is not exactly the length we mint', () => {
+        expect(isOurSession('code-a-0')).toBe(false);
+        expect(isOurSession(`code-${HASH_PROJ}a-0`)).toBe(false);
+        expect(isOurSession(`code-${HASH_PROJ.slice(0, 11)}-0`)).toBe(false);
+    });
+
+    it('rejects a zero-padded slot we would never mint', () => {
+        expect(isOurSession(`code-${HASH_PROJ}-007`)).toBe(false);
+        expect(isOurSession(`code-${HASH_PROJ}-00`)).toBe(false);
     });
 });
 

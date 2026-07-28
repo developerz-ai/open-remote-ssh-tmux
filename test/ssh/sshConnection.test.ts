@@ -192,6 +192,37 @@ describe('exec()/execPartial(): shell-quote params so each lands as one remote t
         expect(client.execCalls).toEqual([`echo 'a; rm -rf /' '$(id)'`]);
     });
 
+    // `execPartial` resolves as soon as `tester` matches, but the remote channel stays open
+    // — `serverSetup` uses it to wait for "Extension host agent listening on …" from a
+    // script that goes on running afterwards. Every later chunk was still being appended to
+    // `stdout` and re-fed to `tester`, so the buffer grew without bound for the channel's
+    // whole life and the tester's regex was re-run over an ever-longer string (quadratic).
+    // Once the answer is known there is nothing left to test and nothing left to keep.
+    it('stops buffering and stops re-testing after the tester has matched', async () => {
+        const { conn, client } = await connectedFakeClient();
+
+        let testerCalls = 0;
+        const result = conn.execPartial('run', (stdout) => {
+            testerCalls++;
+            return stdout.includes('READY');
+        });
+        await vi.waitFor(() => expect(client.execStreams).toHaveLength(1));
+        const stream = client.execStreams[0];
+
+        stream.emit('data', Buffer.from('READY'));
+        const settled = await result;
+        expect(settled.stdout).toBe('READY');
+
+        const callsAtMatch = testerCalls;
+        // The script keeps talking long after we stopped caring.
+        stream.emit('data', Buffer.from('x'.repeat(1024)));
+        stream.stderr.emit('data', Buffer.from('y'.repeat(1024)));
+
+        expect(testerCalls).toBe(callsAtMatch);
+        // And the value already handed to the caller is not mutated behind their back.
+        expect(settled.stdout).toBe('READY');
+    });
+
     it('leaves a command with no params untouched', async () => {
         const { conn, client } = await connectedFakeClient();
 

@@ -36,6 +36,16 @@ function isHostSection(line: Line): line is Section {
     return isDirective(line) && line.param === 'Host' && !!line.value && !!(line as Section).config;
 }
 
+// `Host` *and* `Match` open a nested block, and anything that walks the tree
+// (name normalization, Include expansion) must descend into both. Keyed on the
+// presence of `config` rather than on `param` because `Match` sections are the
+// case we kept missing: ssh-config copies a sub-directive's `param` through
+// `compute()` verbatim, so a `Match` block we skipped surfaced as lowercase
+// `hostname`/`user`/`port` and every caller reading `HostName` saw `undefined`.
+function isNestedSection(line: Line): line is Section {
+    return isDirective(line) && !!(line as Section).config;
+}
+
 function isIncludeDirective(line: Line): line is Section {
     return isDirective(line) && line.param === 'Include' && !!line.value;
 }
@@ -64,7 +74,7 @@ function normalizeSSHConfig(config: SSHConfig) {
         if (isDirective(line)) {
             normalizeProp(line);
         }
-        if (isHostSection(line)) {
+        if (isNestedSection(line)) {
             normalizeSSHConfig(line.config);
         }
     }
@@ -85,7 +95,19 @@ async function resolveIncludes(config: SSHConfig, userConfig: boolean, visited: 
     for (let i = 0; i < config.length; i++) {
         const line = config[i];
         if (isIncludeDirective(line)) {
-            const values = (line.value as string).split(',').map(s => s.trim());
+            // OpenSSH's Include takes *whitespace*-separated pathnames, and
+            // ssh-config doesn't array-split this directive — so `Include a b`
+            // arrives as one string and splitting on ',' alone globbed it as
+            // the single literal pattern "a b", which matched nothing and made
+            // every host in both files disappear without any error. Commas stay
+            // accepted: they were the only separator we used to honour.
+            // A quoted value is left whole, because that's the only way a
+            // pathname containing spaces can still be expressed — ssh-config
+            // strips the quote characters before we see the value and leaves
+            // just a per-line `quoted` flag, so a *mixed* quoted/unquoted list
+            // is unrecoverable (it stays broken, exactly as it is today).
+            const rawValue = line.value as string;
+            const values = (line.quoted ? [rawValue] : rawValue.split(/[\s,]+/)).map(s => s.trim()).filter(s => !!s);
             const configs: SSHConfig[] = [];
             for (const value of values) {
                 const includePaths = await glob(normalizeToSlash(untildify(value)), {
@@ -97,7 +119,7 @@ async function resolveIncludes(config: SSHConfig, userConfig: boolean, visited: 
                 }
             }
             includedConfigs.push([i, configs]);
-        } else if (isHostSection(line)) {
+        } else if (isNestedSection(line)) {
             await resolveIncludes(line.config, userConfig, visited);
         }
     }

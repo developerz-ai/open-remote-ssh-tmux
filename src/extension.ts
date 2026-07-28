@@ -11,6 +11,7 @@ import { TerminalProfileRegistration } from './tmux/profileRegistration';
 import { pasteClipboardImage, sweepOldImages } from './clipboard/pasteImage';
 import { SessionReaper } from './tmux/sessionReaper';
 import { prepareEnvCollection } from './common/envCollection';
+import { disposeAll } from './common/disposable';
 
 export async function activate(context: vscode.ExtensionContext) {
     const logger = new Log('Remote - SSH');
@@ -46,14 +47,37 @@ export async function activate(context: vscode.ExtensionContext) {
     // including reconnects — so it wires the layer exactly once and only refreshes it
     // thereafter (idempotentResolveHandler): re-swapping the terminal profile provider
     // per reconnect would needlessly churn the registration and orphan the live one.
-    remoteSSHResolver.onResolveSuccessfullyCompleted(
-        idempotentResolveHandler(() => wireTmuxTerminalLayer(context, remoteSSHResolver, profileRegistration, logger))
+    const wireOnResolve = idempotentResolveHandler(
+        () => wireTmuxTerminalLayer(context, remoteSSHResolver, profileRegistration, logger)
     );
+    // The image sweep is deliberately NOT inside `wireTmuxTerminalLayer`. It used to be, and
+    // that tied housekeeping for pasted screenshots to a gate it has nothing to do with:
+    // pasting only needs a remote authority, but the sweep only ran when the tmux layer wired.
+    // Turn `remote.SSH.tmux.enabled` off, connect to a remote without tmux, or open an empty
+    // remote window (no folder → no session context) and images uploaded fine while nothing
+    // ever deleted them — the 48h retention promise quietly became "forever".
+    const sweepImages = onceOnly(() => {
+        void sweepOldImages({ exec: lazyExec(remoteSSHResolver), log: logger });
+    });
+    // `onResolveSuccessfullyCompleted` holds a single callback, so the two are composed here
+    // rather than registered separately.
+    remoteSSHResolver.onResolveSuccessfullyCompleted(() => {
+        sweepImages();
+        wireOnResolve();
+    });
 
     const locationHistory = new RemoteLocationHistory(context);
     const locationData = getRemoteWorkspaceLocationData();
     if (locationData) {
-        await locationHistory.addLocation(locationData[0], locationData[1]);
+        // Never `await` this bare. It is a `globalState` write, and every command
+        // registration and the tree view below come AFTER it — so one rejected write
+        // (storage failure, corrupt state) rejected `activate()` and left the user with a
+        // window that connects but whose every command reports "not found". That is the
+        // exact failure `remoteLocationHistory.ts` was hardened against internally,
+        // reintroduced here at the call site. Remembering a folder is the least important
+        // thing this function does; it must not be able to take the rest of it down.
+        await locationHistory.addLocation(locationData[0], locationData[1])
+            .then(undefined, (err: unknown) => logger.trace(`Could not remember this remote folder: ${errorMessage(err)}`));
     }
 
     const hostTreeDataProvider = new HostTreeDataProvider(locationHistory);
@@ -78,7 +102,15 @@ export async function activate(context: vscode.ExtensionContext) {
         const authority = vscode.workspace.workspaceFolders?.[0]?.uri.authority
             ?? remoteSSHResolver.getAuthority();
         let handled = false;
-        if (authority) {
+        if (remoteSSHResolver.getRemotePlatform() === 'windows') {
+            // Same graceful-degradation contract the tmux layer honours (CLAUDE.md: Windows
+            // remotes degrade, they never break). Everything downstream of the upload is
+            // POSIX — `printf %s "$HOME"`, `mkdir -p -m 700`, `find -mmin -delete` — so on a
+            // Windows remote the paste got as far as producing a generic error toast and,
+            // because a failed upload counts as "handled", swallowed the text paste with it.
+            // Falling through here gives the user their ordinary paste back.
+            logger.info('clipboard image: the remote is Windows — pasting as text');
+        } else if (authority) {
             handled = await pasteClipboardImage({
                 exec: lazyExec(remoteSSHResolver),
                 log: logger,
@@ -115,6 +147,10 @@ function wireTmuxTerminalLayer(
     profileRegistration: TerminalProfileRegistration,
     logger: Log
 ): TmuxTerminalLayer | undefined {
+    // Disposables this attempt has registered but not yet handed to the extension's
+    // lifetime. Declared out here so the catch can roll them back — see where it is
+    // filled below for why a retried attempt must not inherit the previous one's.
+    const wired: vscode.Disposable[] = [];
     try {
         // Read the three remote.SSH.tmux.* settings once, up front. `enabled` is read
         // BEFORE the capability probe so an explicit `'on'` ("require tmux") can surface
@@ -189,18 +225,28 @@ function wireTmuxTerminalLayer(
             historyLimit: settings.historyLimit,
         });
 
+        // These go into `wired`, not straight onto `context.subscriptions`, and are handed
+        // over only once every fallible step below has succeeded. The two looked equivalent,
+        // but this function is *retried*: `idempotentResolveHandler` re-wires on the next
+        // resolve whenever this one returns undefined, and the catch turns any throw past
+        // this point into exactly that. Listeners pushed onto the context outlive the failed
+        // attempt, so the retry stacks a SECOND pair pointing at a SECOND provider — two
+        // providers allocating slots against the same workspaceState and both reacting to
+        // every open/close, i.e. duplicated tabs and a kill-session for a slot the surviving
+        // provider still holds. The rollback in the catch releases them instead.
+        //
         // Subscribe BEFORE initialize(). VS Code revives its persisted terminals around the
         // same moment reconcile runs (both wait on the server connection), and a revived
         // terminal that lands while reconcile is still awaiting a probe would otherwise go
         // unseen — leaving two tabs attached to one session. Subscribed first, it is caught
         // either by the reconcile-time sweep or by the duplicate guard in the handler.
-        context.subscriptions.push(vscode.window.onDidOpenTerminal(t => terminalProvider.handleTerminalOpened(t)));
+        wired.push(vscode.window.onDidOpenTerminal(t => terminalProvider.handleTerminalOpened(t)));
         // Free a terminal's slot when it actually closes — the counterpart to
         // provideTerminalProfile()/reopen() allocating one. Without this a slot is
         // never released within a live window: every "New Terminal" after a close
         // mints a brand-new, ever-growing remote session instead of reattaching the
         // one just detached (found live in the 09 acceptance matrix's churn row).
-        context.subscriptions.push(vscode.window.onDidCloseTerminal(t => terminalProvider.handleTerminalClosed(t)));
+        wired.push(vscode.window.onDidCloseTerminal(t => terminalProvider.handleTerminalClosed(t)));
 
         // Initialize the provider (restore + adopt sessions from previous clients).
         terminalProvider.initialize()
@@ -251,18 +297,11 @@ function wireTmuxTerminalLayer(
         // Run reaper immediately on connect (cleanup leftover sessions).
         reapIfEnabled('Session reaper failed');
 
-        // Same connect-time housekeeping shape for pasted screenshots: sweep anything older
-        // than 48h out of this user's image directory. Best-effort and never awaited — an
-        // image sweep must not delay or fail the (already-succeeded) connection.
-        void sweepOldImages({ exec, log: logger });
-
-        // Create a disposable for the reaper (so it can be cleaned up, though
-        // it has no resources to free — reaper is stateless).
-        context.subscriptions.push({
-            dispose: () => {
-                // No-op; reaper is stateless.
-            },
-        });
+        // Every fallible step is behind us, so this attempt is the one that keeps the
+        // listeners: hand them to the extension's lifetime. Until this point they belong to
+        // `wired` and the catch below releases them (see the comment where `wired` is
+        // declared for why a retry must not inherit them).
+        context.subscriptions.push(...wired.splice(0));
 
         logger.trace('Tmux terminal layer wired successfully');
 
@@ -283,7 +322,16 @@ function wireTmuxTerminalLayer(
         };
     } catch (err) {
         // Wiring failure must never break the connection; log and continue. No layer
-        // is returned, so idempotentResolveHandler retries wiring on the next resolve.
+        // is returned, so idempotentResolveHandler retries wiring on the next resolve —
+        // which is exactly why anything this attempt registered has to go first. `wired`
+        // is empty on the success path (handed to `context.subscriptions` above), so this
+        // only ever releases a half-built layer. `disposeAll` rethrows the first failing
+        // dispose, and that must not escape and mask `err`.
+        try {
+            disposeAll(wired);
+        } catch (rollbackErr) {
+            logger.trace(`Tmux wiring rollback failed: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`);
+        }
         logger.trace(`Tmux wiring failed: ${err instanceof Error ? err.message : String(err)}`);
         return undefined;
     }
@@ -306,6 +354,25 @@ interface TmuxTerminalLayer {
  * idempotency is unit-testable without the VS Code terminal surface; it returns
  * `undefined` while a gate is unmet, in which case wiring is retried next resolve.
  */
+/** Run `action` on the first call and never again. Used for the connect-time image sweep,
+ * which is housekeeping for the whole window rather than per-connection work — running it
+ * again on every reconnect would be pure noise. */
+export function onceOnly(action: () => void): () => void {
+    let ran = false;
+    return () => {
+        if (ran) {
+            return;
+        }
+        ran = true;
+        action();
+    };
+}
+
+/** Best-effort message from an unknown thrown value, for log lines only. */
+function errorMessage(err: unknown): string {
+    return err instanceof Error ? err.message : String(err);
+}
+
 export function idempotentResolveHandler(wire: () => TmuxTerminalLayer | undefined): () => void {
     let layer: TmuxTerminalLayer | undefined;
     return () => {

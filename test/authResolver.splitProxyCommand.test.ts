@@ -1,11 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import { splitProxyCommand } from '../src/authResolver';
 
-// Characterisation tests for `splitProxyCommand` (exported for testability only,
-// no logic change). It mirrors OpenSSH's own ProxyCommand tokenization: OpenSSH
-// splits on unquoted whitespace, groups a double-quoted span into one token, and
-// treats backslash as an escape for the next character. See the docstring on
-// `splitProxyCommand` in `src/authResolver.ts` for the upstream issues this fixes.
+// Characterisation tests for `splitProxyCommand` (exported for testability only).
+// It approximates the tokenization the shell OpenSSH hands the ProxyCommand to
+// would perform: split on unquoted whitespace, group a double-quoted span into one
+// token, and — on a POSIX client only — honour backslash escapes the way `/bin/sh`
+// does. See the docstring on `splitProxyCommand` in `src/authResolver.ts` for the
+// upstream issues this fixes and for why the client platform is a parameter.
+//
+// Every backslash-sensitive case below passes the platform explicitly, so the suite
+// asserts both behaviours regardless of which OS it runs on.
 describe('splitProxyCommand', () => {
     it('splits a plain space-separated command into argv tokens', () => {
         expect(splitProxyCommand('ssh -W %h:%p bastion')).toEqual(['ssh', '-W', '%h:%p', 'bastion']);
@@ -15,21 +19,44 @@ describe('splitProxyCommand', () => {
         expect(splitProxyCommand('ssh   -W  %h:%p')).toEqual(['ssh', '-W', '%h:%p']);
     });
 
-    it('groups a double-quoted span (with embedded spaces) into a single token', () => {
-        expect(splitProxyCommand('ssh -W %h:%p "C:\\Program Files\\nc.exe"')).toEqual([
-            'ssh', '-W', '%h:%p', 'C:Program Filesnc.exe',
+    it('groups a double-quoted span (with embedded spaces) into a single token, keeping its backslashes', () => {
+        // `/bin/sh` does NOT strip backslashes inside double quotes (only `\"`,
+        // `\\`, `` \` ``, `\$` and `\<newline>` are special there), so a quoted
+        // Windows path survives intact on either platform. The old tokenizer
+        // stripped them unconditionally and produced `C:Program Filesnc.exe`,
+        // which spawns as ENOENT.
+        for (const windows of [false, true]) {
+            expect(splitProxyCommand('ssh -W %h:%p "C:\\Program Files\\nc.exe"', windows)).toEqual([
+                'ssh', '-W', '%h:%p', 'C:\\Program Files\\nc.exe',
+            ]);
+        }
+    });
+
+    it('honours a POSIX backslash escape outside quotes, consuming the backslash itself', () => {
+        expect(splitProxyCommand('ssh -o Foo=bar\\ baz', false)).toEqual(['ssh', '-o', 'Foo=bar baz']);
+    });
+
+    it('keeps an unquoted Windows path intact on a Windows client', () => {
+        // The reason the platform is a parameter at all: `\` is the path separator
+        // on Windows and never an escape, so `C:\Users\me\proxy.exe` must survive
+        // verbatim. Treating it as an escape yielded `C:Usersmeproxy.exe` → spawn
+        // ENOENT, i.e. every unquoted Windows ProxyCommand was broken — even though
+        // the `isWindows && /\.(bat|cmd)$/` branch right below the call site shows
+        // Windows ProxyCommands are an intended, supported path.
+        expect(splitProxyCommand('C:\\Users\\me\\proxy.exe -H %h', true)).toEqual([
+            'C:\\Users\\me\\proxy.exe', '-H', '%h',
         ]);
     });
 
-    it('treats a backslash as an escape for the next character, consuming the backslash itself', () => {
-        expect(splitProxyCommand('ssh -o Foo=bar\\ baz')).toEqual(['ssh', '-o', 'Foo=bar baz']);
+    it('a doubled backslash inside quotes escapes down to a single literal backslash on POSIX', () => {
+        // JS source '\\\\' is two literal backslashes in the actual ProxyCommand
+        // text. `\\` is one of the few escapes `/bin/sh` still honours inside double
+        // quotes, so the pair collapses to a single literal backslash.
+        expect(splitProxyCommand('ssh "C:\\\\nc.exe"', false)).toEqual(['ssh', 'C:\\nc.exe']);
     });
 
-    it('a doubled backslash escapes down to a single literal backslash', () => {
-        // JS source '\\\\' is two literal backslashes in the actual ProxyCommand
-        // text; each backslash escapes the one after it, so the pair collapses
-        // to a single literal backslash in the output token.
-        expect(splitProxyCommand('ssh "C:\\\\nc.exe"')).toEqual(['ssh', 'C:\\nc.exe']);
+    it('leaves a doubled backslash alone on Windows, so a UNC path survives', () => {
+        expect(splitProxyCommand('"\\\\server\\share\\nc.exe" %h', true)).toEqual(['\\\\server\\share\\nc.exe', '%h']);
     });
 
     it('allows a quoted token adjacent to unquoted text with no separating space', () => {
@@ -74,11 +101,25 @@ describe('splitProxyCommand', () => {
         // The escape branch only fires when there's a next character to consume
         // (`i + 1 < value.length`); a backslash as the very last byte falls through
         // to the default case and is appended to the current token as-is, rather
-        // than being silently dropped or throwing.
-        expect(splitProxyCommand('ssh bastion\\')).toEqual(['ssh', 'bastion\\']);
+        // than being silently dropped or throwing. Same on both platforms.
+        expect(splitProxyCommand('ssh bastion\\', false)).toEqual(['ssh', 'bastion\\']);
+        expect(splitProxyCommand('ssh bastion\\', true)).toEqual(['ssh', 'bastion\\']);
     });
 
     it('a trailing lone backslash as the entire input yields a single-backslash token', () => {
-        expect(splitProxyCommand('\\')).toEqual(['\\']);
+        expect(splitProxyCommand('\\', false)).toEqual(['\\']);
+        expect(splitProxyCommand('\\', true)).toEqual(['\\']);
+    });
+
+    it('an unquoted backslash-space is a token separator on Windows (the documented trade-off)', () => {
+        // A Windows client gets no `\` escapes at all, so `\ ` does not join the two
+        // halves of a path with a space — that path has to be quoted (which works on
+        // both platforms, see above). Losing shell-style escaping on Windows is the
+        // cheaper half of the trade: `\` appears in essentially every Windows path
+        // and only rarely as an escape, and quoting is the documented Windows way to
+        // carry a space anyway.
+        expect(splitProxyCommand('C:\\with\\ space\\nc.exe %h', true)).toEqual([
+            'C:\\with\\', 'space\\nc.exe', '%h',
+        ]);
     });
 });

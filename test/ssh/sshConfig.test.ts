@@ -179,6 +179,74 @@ describe('SSHConfiguration.loadFromFS', () => {
         expect(hostConfig['IdentityFile']).toEqual(['~/.ssh/id_rsa']);
     });
 
+    // `Match` opens a nested block exactly like `Host` does, and ssh-config's
+    // `compute()` copies each sub-directive's `param` through verbatim — so a
+    // block we fail to normalize surfaces as `hostname`/`user`/`port` and every
+    // caller reading `sshHostConfig['HostName']` silently sees `undefined`
+    // (connect to the literal alias, as the local user, on port 22). The bug was
+    // casing-dependent — spelling the same block `HostName`/`User`/`Port` worked
+    // — which is exactly the kind of silent inconsistency a test must pin down.
+    it('normalizes lowercase directive names inside a Match block', async () => {
+        const config = await loadFromContent('Match host build*\n    hostname 10.0.0.5\n    user builder\n    port 2222\n');
+        const hostConfig = config.getHostConfiguration('build01');
+        expect(hostConfig['HostName']).toBe('10.0.0.5');
+        expect(hostConfig['User']).toBe('builder');
+        expect(hostConfig['Port']).toBe('2222');
+    });
+
+    it('applies an Include directive nested inside a Match block', async () => {
+        tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ssh-config-test-'));
+        const includedPath = path.join(tmpDir, 'included.conf');
+        await fs.promises.writeFile(includedPath, 'HostName included.example.com\n    User included-user\n');
+        const configPath = path.join(tmpDir, 'config');
+        await fs.promises.writeFile(configPath, `Match host build*\n    Include ${includedPath}\n    Port 2222\n`);
+        configOverrides.set('remote.SSH.configFile', configPath);
+
+        const config = await SSHConfiguration.loadFromFS();
+        const hostConfig = config.getHostConfiguration('build01');
+        expect(hostConfig['HostName']).toBe('included.example.com');
+        expect(hostConfig['User']).toBe('included-user');
+        expect(hostConfig['Port']).toBe('2222');
+    });
+
+    // OpenSSH documents Include as taking *whitespace*-separated pathnames;
+    // ssh-config hands the whole list over as one string, so splitting on ','
+    // alone globbed `a.conf b.conf` as a single literal pattern that matched
+    // nothing — every host in both files vanished with no error at all.
+    it('expands a whitespace-separated Include value as multiple independent patterns', async () => {
+        tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ssh-config-test-'));
+        const includeDir = path.join(tmpDir, 'conf.d');
+        await fs.promises.mkdir(includeDir, { recursive: true });
+        await fs.promises.writeFile(path.join(includeDir, 'a.conf'), 'Host ws-glob\n    HostName ws-glob.example.com\n');
+        const other = path.join(tmpDir, 'other.conf');
+        await fs.promises.writeFile(other, 'Host ws-other\n    HostName ws-other.example.com\n');
+        const configPath = path.join(tmpDir, 'config');
+        await fs.promises.writeFile(configPath, `Include ${path.join(includeDir, '*.conf')} ${other}\n`);
+        configOverrides.set('remote.SSH.configFile', configPath);
+
+        const config = await SSHConfiguration.loadFromFS();
+        expect(config.getHostConfiguration('ws-glob')['HostName']).toBe('ws-glob.example.com');
+        expect(config.getHostConfiguration('ws-other')['HostName']).toBe('ws-other.example.com');
+    });
+
+    // The flip side of splitting on whitespace: a quoted pathname that contains
+    // spaces must NOT be torn apart. ssh-config strips the quote characters
+    // before we see the value and only leaves a per-line `quoted` flag, so this
+    // is the one quoting case we can still honour.
+    it('keeps a quoted Include path containing spaces intact', async () => {
+        tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ssh-config-test-'));
+        const includeDir = path.join(tmpDir, 'quoted dir');
+        await fs.promises.mkdir(includeDir, { recursive: true });
+        const includedPath = path.join(includeDir, 'a.conf');
+        await fs.promises.writeFile(includedPath, 'Host quoted-host\n    HostName quoted.example.com\n');
+        const configPath = path.join(tmpDir, 'config');
+        await fs.promises.writeFile(configPath, `Include "${includedPath}"\n`);
+        configOverrides.set('remote.SSH.configFile', configPath);
+
+        const config = await SSHConfiguration.loadFromFS();
+        expect(config.getHostConfiguration('quoted-host')['HostName']).toBe('quoted.example.com');
+    });
+
     it('applies an Include directive nested inside a Host block', async () => {
         tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ssh-config-test-'));
         const includedPath = path.join(tmpDir, 'included.conf');

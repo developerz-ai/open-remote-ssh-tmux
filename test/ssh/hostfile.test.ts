@@ -86,6 +86,17 @@ describe('checkNewHostInHostkeys', () => {
         const missing = path.join(tmpDir, 'no-such-dir', 'known_hosts');
         expect(await checkNewHostInHostkeys('example.com', missing)).toBe(true);
     });
+
+    it('does not treat a @revoked or @cert-authority record as a recorded host key', async () => {
+        // Neither marker records "this is the host's key": @revoked says the opposite,
+        // and a CA line holds the CA's key, not the host's. So the host is still new.
+        const file = await withKnownHosts([
+            '@revoked revoked.com ssh-ed25519 AAAAKEY',
+            '@cert-authority ca.com ssh-ed25519 AAAAKEY',
+        ].join('\n') + '\n');
+        expect(await checkNewHostInHostkeys('revoked.com', file)).toBe(true);
+        expect(await checkNewHostInHostkeys('ca.com', file)).toBe(true);
+    });
 });
 
 describe('addHostToHostFile', () => {
@@ -117,6 +128,49 @@ describe('addHostToHostFile', () => {
             expect(stat.mode & 0o777).toBe(0o700);
         }
         expect(await checkNewHostInHostkeys('example.com', file)).toBe(false);
+    });
+
+    it('separates the new record from a file with no trailing newline (no glued line)', async () => {
+        // A known_hosts whose last line has no '\n' is legal (OpenSSH's own hostfile.c
+        // guards against exactly this on append). Without the guard the new record is
+        // glued onto the old one, which both hides the new host *and* corrupts the
+        // pre-existing entry's key field → that host then reads as 'mismatch' forever.
+        tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'hostfile-test-'));
+        const file = path.join(tmpDir, 'known_hosts');
+        const oldKey = Buffer.from('the-old-host-key');
+        await fs.promises.writeFile(file, `old.example ssh-ed25519 ${oldKey.toString('base64')}`);
+
+        await addHostToHostFile('new.example', Buffer.from('the-new-host-key'), 'ssh-ed25519', file);
+
+        const content = await fs.promises.readFile(file, 'utf8');
+        expect(content.split('\n').filter((l) => l.trim()).length).toBe(2);
+        expect(content.startsWith(`old.example ssh-ed25519 ${oldKey.toString('base64')}\n`)).toBe(true);
+        // The untouched neighbour still verifies, and the new host is now on file.
+        expect(verifyHostKey('old.example', oldKey, content)).toBe('known');
+        expect(await checkNewHostInHostkeys('new.example', file)).toBe(false);
+    });
+
+    it('does not insert a blank line when the file already ends in a newline', async () => {
+        tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'hostfile-test-'));
+        const file = path.join(tmpDir, 'known_hosts');
+        await fs.promises.writeFile(file, 'old.example ssh-ed25519 AAAAOLD\n');
+
+        await addHostToHostFile('new.example', Buffer.from('the-new-host-key'), 'ssh-ed25519', file);
+
+        expect(await fs.promises.readFile(file, 'utf8')).not.toContain('\n\n');
+    });
+
+    it('does not start a brand-new or empty known_hosts with a blank line', async () => {
+        tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'hostfile-test-'));
+        const created = path.join(tmpDir, 'created', 'known_hosts');
+        const empty = path.join(tmpDir, 'known_hosts');
+        await fs.promises.writeFile(empty, '');
+
+        await addHostToHostFile('a.example', Buffer.from('key-bytes'), 'ssh-ed25519', created);
+        await addHostToHostFile('b.example', Buffer.from('key-bytes'), 'ssh-ed25519', empty);
+
+        expect((await fs.promises.readFile(created, 'utf8')).startsWith('\n')).toBe(false);
+        expect((await fs.promises.readFile(empty, 'utf8')).startsWith('\n')).toBe(false);
     });
 });
 
@@ -204,6 +258,43 @@ describe('verifyHostKey', () => {
         // A malformed host-only record must not flip a first connect into a hard
         // mismatch failure — it is not a valid recorded key.
         expect(verifyHostKey('example.com', keyA, 'example.com\n')).toBe('unknown');
+    });
+
+    it('hard-refuses a key an admin marked @revoked, plaintext or hashed', () => {
+        // OpenSSH never accepts a revoked key — before this the marker made fields[0]
+        // '@revoked', so the host never matched and the user got the ordinary
+        // first-connect prompt for a key that was explicitly revoked.
+        expect(verifyHostKey('example.com', keyA, `@revoked ${khLine('example.com', keyA)}\n`)).toBe('revoked');
+        expect(verifyHostKey('example.com', keyA, `@revoked ${khLine('example.com', keyA, true)}\n`)).toBe('revoked');
+    });
+
+    it('lets a revocation win over an ordinary entry for the same key, in either order', () => {
+        const revoked = `@revoked ${khLine('example.com', keyA)}`;
+        const trusted = khLine('example.com', keyA);
+        expect(verifyHostKey('example.com', keyA, [trusted, revoked].join('\n'))).toBe('revoked');
+        expect(verifyHostKey('example.com', keyA, [revoked, trusted].join('\n'))).toBe('revoked');
+    });
+
+    it('does not let a revocation of some other key affect this one', () => {
+        // Revoking the host's *old* key says nothing about the key it presents now:
+        // it must not read as a recorded key (mismatch) — that would be a hard fail
+        // with no override for a host whose new key is simply not on file yet.
+        const revokedOther = `@revoked ${khLine('example.com', keyB)}`;
+        expect(verifyHostKey('example.com', keyA, revokedOther + '\n')).toBe('unknown');
+        expect(verifyHostKey('example.com', keyA, [revokedOther, khLine('example.com', keyA)].join('\n'))).toBe('known');
+    });
+
+    it('never treats a @cert-authority line as the host key itself', () => {
+        // The blob on a CA line is the CA's key, not the host's; we do not implement
+        // certificate verification, so such a line is neither a match nor evidence
+        // that the host is on file.
+        const ca = `@cert-authority ${khLine('example.com', keyA)}`;
+        expect(verifyHostKey('example.com', keyA, ca + '\n')).toBe('unknown');
+        expect(verifyHostKey('example.com', keyB, ca + '\n')).toBe('unknown');
+    });
+
+    it('ignores a line with an unrecognised @marker', () => {
+        expect(verifyHostKey('example.com', keyA, `@bogus ${khLine('example.com', keyA)}\n`)).toBe('unknown');
     });
 
     it('finds the host among multiple valid entries', () => {
@@ -306,6 +397,18 @@ describe('verifyKnownHost', () => {
         const result = await verifyKnownHost({ host: 'h.example', key: keyB, promptForUnknownHost: spy.prompt }, file);
 
         expect(result).toEqual({ verdict: 'mismatch', verified: false });
+        expect(spy.calls).toHaveLength(0);
+        expect(await fs.promises.readFile(file, 'utf8')).toBe(before);
+    });
+
+    it('refuses a revoked key without prompting or writing — no click-through', async () => {
+        const file = await withKnownHosts(`@revoked ${khLine('h.example', keyA, true)}\n`);
+        const before = await fs.promises.readFile(file, 'utf8');
+        const spy = spyPrompt(true); // a "yes" prompt must never be reachable here
+
+        const result = await verifyKnownHost({ host: 'h.example', key: keyA, promptForUnknownHost: spy.prompt }, file);
+
+        expect(result).toEqual({ verdict: 'revoked', verified: false });
         expect(spy.calls).toHaveLength(0);
         expect(await fs.promises.readFile(file, 'utf8')).toBe(before);
     });
