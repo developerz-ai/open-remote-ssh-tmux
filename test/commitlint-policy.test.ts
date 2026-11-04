@@ -152,6 +152,20 @@ tokens, cached input at its cached rate)
 
 Co-authored-by: developerz-ai[bot] <286432749+developerz-ai[bot]@users.noreply.github.com>`;
 
+// The message the platform's follow-up lane writes when it lands a review fix
+// on a pull request branch — the shape this repository's own `commit-msg` hook
+// refused with "type must be one of [...] [type-enum]":
+//
+//   chore(babysit): land test/package-manifest.test.ts
+//
+// Its type is machine-chosen, so it cannot satisfy `type-enum`; the config
+// exempts exactly that subject shape (commitlint.config.js, `ignores`).
+const AUTOMATED_LAND_MESSAGE = `chore(babysit): land test/package-manifest.test.ts
+
+Follow-up intent: Address review findings on developerz-ai/open-remote-ssh-tmux#43
+
+Dz-Task-Id: tsk_83bc432ad69aca4295e79b1d567e92c1`;
+
 // The repo's real policy, applied the way the 'Lint commit' step applies it:
 // the declared @commitlint/cli binary reads the message from stdin and
 // resolves commitlint.config.js from the repo root. Exit code 0 = accepted,
@@ -220,6 +234,24 @@ describe('commit-message policy', () => {
     it('keeps the release-shaped exemptions', async () => {
         expect((await verdict('v1.2.0\n')).status).toBe(0);
         expect((await verdict('chore: version 1.2.0\n')).status).toBe(0);
+    }, 30_000);
+
+    it('accepts the automated land commit the follow-up lane produces', async () => {
+        const result = await verdict(AUTOMATED_LAND_MESSAGE + '\n');
+        expect(result.status).toBe(0);
+        expect(result.stdout).toBe('');
+    }, 30_000);
+
+    it('still rejects a scoped chore commit that is not an automated land commit', async () => {
+        const result = await verdict('chore(babysit): drop the notes file\n');
+        expect(result.status).toBe(1);
+        expect(result.stdout).toContain('[type-enum]');
+    }, 30_000);
+
+    it('still rejects an unscoped chore commit outside the release exemption', async () => {
+        const result = await verdict('chore: land the notes file\n');
+        expect(result.status).toBe(1);
+        expect(result.stdout).toContain('[type-enum]');
     }, 30_000);
 
     it('still judges a typed merge subject by the type policy', async () => {

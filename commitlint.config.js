@@ -33,6 +33,15 @@ module.exports = {
             const subject = message.split('\n')[0].trim();
             return !TYPED_SUBJECT.test(subject) && PR_REFERENCE.test(subject);
         },
+        // The automated "land" commits the platform's follow-up lane writes on a
+        // pull request branch: `chore(<lane>): land <files>`. Their type is
+        // chosen by the machine that writes them, not by anyone in this
+        // repository, so `type-enum` refuses a message nobody here could have
+        // written — the hook then blocks every automated follow-up commit.
+        // Same class as the two shapes above: exempt that one subject shape
+        // (a scope is required) and leave every other `chore…` subject to the
+        // type policy.
+        (message) => /^chore\([^)]*\): land\b/.test(message.split('\n')[0].trim()),
     ],
     rules: {
         'body-max-line-length': [2, 'always', 200],
