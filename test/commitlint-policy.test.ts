@@ -152,19 +152,41 @@ tokens, cached input at its cached rate)
 
 Co-authored-by: developerz-ai[bot] <286432749+developerz-ai[bot]@users.noreply.github.com>`;
 
-// The message the platform's follow-up lane writes when it lands a review fix
-// on a pull request branch — the shape this repository's own `commit-msg` hook
-// refused with "type must be one of [...] [type-enum]":
+// The message the platform's follow-up lane writes when it lands this round's
+// changes on a pull request branch:
 //
-//   chore(babysit): land test/package-manifest.test.ts
+//   chore(babysit): land commitlint.config.js (+1 more)
 //
-// Its type is machine-chosen, so it cannot satisfy `type-enum`; the config
-// exempts exactly that subject shape (commitlint.config.js, `ignores`).
-const AUTOMATED_LAND_MESSAGE = `chore(babysit): land test/package-manifest.test.ts
+// The type is machine-chosen — the lane reads no setting from this repository —
+// so the repository's policy has to say what that type may be: `chore` is one of
+// the ALLOWED types (`build`, `chore`, `ci`, …) like every other commit. The
+// config waives no rule for machine-written subjects — the type policy and the
+// body-length limit apply to them too.
+const AUTOMATED_LAND_MESSAGE = `chore(babysit): land commitlint.config.js (+1 more)
 
 Follow-up intent: Address review findings on developerz-ai/open-remote-ssh-tmux#43
 
-Dz-Task-Id: tsk_83bc432ad69aca4295e79b1d567e92c1`;
+Dz-Task-Id: tsk_582df6d71f80ef4ff6fc04293f28839f`;
+
+// The same land commit written with a type outside the allowed list. It has to
+// be rejected: the land shape gets no waiver, so its type is judged by
+// `type-enum` exactly like a hand-written commit's.
+const AUTOMATED_LAND_MESSAGE_WITH_DISALLOWED_TYPE = `wip(babysit): land commitlint.config.js (+1 more)
+
+Follow-up intent: Address review findings on developerz-ai/open-remote-ssh-tmux#43
+
+Dz-Task-Id: tsk_582df6d71f80ef4ff6fc04293f28839f`;
+
+// The same land commit with one body line over the limit. No rule is waived for
+// the land shape, so the body-length limit applies to it as well.
+const AUTOMATED_LAND_MESSAGE_WITH_OVERLONG_BODY = `chore(babysit): land commitlint.config.js (+1 more)
+
+${'x'.repeat(201)}`;
+
+// The land commit with an empty subject. The type policy does not exempt the
+// land shape from the subject rules either.
+const AUTOMATED_LAND_MESSAGE_WITH_EMPTY_SUBJECT = `chore(babysit): 
+`;
 
 // The repo's real policy, applied the way the 'Lint commit' step applies it:
 // the declared @commitlint/cli binary reads the message from stdin and
@@ -213,13 +235,13 @@ describe('commit-message policy', () => {
     }, 30_000);
 
     it('still rejects a commit whose type is outside the allowed list', async () => {
-        const result = await verdict('chore: drop the notes file\n');
+        const result = await verdict('wip: drop the notes file\n');
         expect(result.status).toBe(1);
         expect(result.stdout).toContain('[type-enum]');
     }, 30_000);
 
     it('still rejects a disallowed type when the subject ends in a PR reference', async () => {
-        const result = await verdict('chore: bump dependencies (#36)\n');
+        const result = await verdict('wip: bump dependencies (#36)\n');
         expect(result.status).toBe(1);
         expect(result.stdout).toContain('[type-enum]');
     }, 30_000);
@@ -236,20 +258,50 @@ describe('commit-message policy', () => {
         expect((await verdict('chore: version 1.2.0\n')).status).toBe(0);
     }, 30_000);
 
+    // The land commit the platform's follow-up lane actually writes. `chore` is
+    // an allowed type, so the message is accepted — and judged by every rule,
+    // like a hand-written commit.
     it('accepts the automated land commit the follow-up lane produces', async () => {
         const result = await verdict(AUTOMATED_LAND_MESSAGE + '\n');
         expect(result.status).toBe(0);
         expect(result.stdout).toBe('');
     }, 30_000);
 
-    it('still rejects a scoped chore commit that is not an automated land commit', async () => {
-        const result = await verdict('chore(babysit): drop the notes file\n');
+    // `chore` is one of the allowed types — the land commit's type is allowed
+    // by the policy, not waived by an `ignores` entry.
+    it('accepts a chore commit — `chore` is one of the allowed types', async () => {
+        const result = await verdict('chore: tidy the notes file\n');
+        expect(result.status).toBe(0);
+        expect(result.stdout).toBe('');
+    }, 30_000);
+
+    // The land commit is machine-written, not exempt: a type outside the
+    // allowed list is rejected exactly like a hand-written one. A blanket
+    // `ignores` entry for the land subject shape would swallow every rule
+    // (the body-length limit included) — there is no such entry.
+    it('still rejects an automated land commit whose type is outside the allowed list', async () => {
+        const result = await verdict(AUTOMATED_LAND_MESSAGE_WITH_DISALLOWED_TYPE + '\n');
         expect(result.status).toBe(1);
         expect(result.stdout).toContain('[type-enum]');
     }, 30_000);
 
-    it('still rejects an unscoped chore commit outside the release exemption', async () => {
-        const result = await verdict('chore: land the notes file\n');
+    // The other half of the same guard: no rule is waived for the land shape.
+    // A body line over the limit fails the land commit too.
+    it('still enforces the body-length limit on an automated land commit', async () => {
+        const result = await verdict(AUTOMATED_LAND_MESSAGE_WITH_OVERLONG_BODY + '\n');
+        expect(result.status).toBe(1);
+        expect(result.stdout).toContain('[body-max-line-length]');
+    }, 30_000);
+
+    // …and the subject rules apply to it as well.
+    it('still enforces the subject rules on an automated land commit', async () => {
+        const result = await verdict(AUTOMATED_LAND_MESSAGE_WITH_EMPTY_SUBJECT);
+        expect(result.status).toBe(1);
+        expect(result.stdout).toContain('[subject-empty]');
+    }, 30_000);
+
+    it('still rejects a scoped commit whose type is outside the allowed list', async () => {
+        const result = await verdict('wip(babysit): drop the notes file\n');
         expect(result.status).toBe(1);
         expect(result.stdout).toContain('[type-enum]');
     }, 30_000);
