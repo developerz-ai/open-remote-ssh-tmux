@@ -328,6 +328,8 @@ describe('package.json manifest drift guard', () => {
         const scripts = pkg.scripts as Record<string, string>;
         const devDependencies = pkg.devDependencies as Record<string, string>;
         const dependencies = pkg.dependencies as Record<string, string>;
+        // [bot] These smoke tests require /bin/sh and Unix executable semantics (Linux/macOS tooling only).
+        const supportsMaintenanceTools = process.platform === 'linux' || process.platform === 'darwin';
 
         it('pins artifact exactly as a developer tool, not a runtime dependency', () => {
             expect(devDependencies['@zokugun/artifact']).toBe('0.13.1');
@@ -389,7 +391,7 @@ describe('package.json manifest drift guard', () => {
             expect(text).toContain('Neither update target runs automatically during installation');
         });
 
-        it.each([0, 23])('passes arguments and cooldown through npm to a pinact stub (exit %i, not real pinact)', (exitCode) => {
+        it.runIf(supportsMaintenanceTools).each([0, 23])('passes arguments and cooldown through npm to a pinact stub (exit %i, not real pinact)', (exitCode) => {
             const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'pinact-npm-'));
             try {
                 const binDir = path.join(fixture, 'bin');
@@ -426,7 +428,7 @@ describe('package.json manifest drift guard', () => {
             }
         }, 20000);
 
-        it('runs update:artifacts help using the installed local executable', () => {
+        it.runIf(supportsMaintenanceTools)('runs update:artifacts help using the installed local executable', () => {
             const binDir = path.join(repoRoot, 'node_modules', '.bin');
             const artifact = path.join(binDir, 'artifact');
             const entry = path.join(repoRoot, 'node_modules', '@zokugun', 'artifact', 'bin', 'artifact');
