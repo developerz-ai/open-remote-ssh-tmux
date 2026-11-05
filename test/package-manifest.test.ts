@@ -330,7 +330,7 @@ describe('package.json manifest drift guard', () => {
         const dependencies = pkg.dependencies as Record<string, string>;
 
         it('pins artifact exactly as a developer tool, not a runtime dependency', () => {
-            expect(devDependencies['@zokugun/artifact']).toBe('0.12.0');
+            expect(devDependencies['@zokugun/artifact']).toBe('0.13.1');
             expect(dependencies['@zokugun/artifact']).toBeUndefined();
         });
 
@@ -338,15 +338,27 @@ describe('package.json manifest drift guard', () => {
             const packages = readPackageLockJson().packages as Record<string, JsonObject>;
             const root = packages[''];
             const installed = packages['node_modules/@zokugun/artifact'];
-            expect((root.devDependencies as Record<string, string>)['@zokugun/artifact']).toBe('0.12.0');
+            expect((root.devDependencies as Record<string, string>)['@zokugun/artifact']).toBe('0.13.1');
             expect((root.dependencies as Record<string, string>)['@zokugun/artifact']).toBeUndefined();
             expect(installed).toMatchObject({
                 version: devDependencies['@zokugun/artifact'],
                 dev: true,
                 bin: { artifact: 'bin/artifact' },
             });
-            expect(installed.resolved).toBe('https://registry.npmjs.org/@zokugun/artifact/-/artifact-0.12.0.tgz');
+            expect(installed.resolved).toBe('https://registry.npmjs.org/@zokugun/artifact/-/artifact-0.13.1.tgz');
             expect(installed.integrity).toMatch(/^sha512-[A-Za-z0-9+/]+={0,2}$/);
+        });
+
+        it('keeps every pacote resolution above the GHSA-w4pp-8pjf-rmxw advisory floor', () => {
+            // [bot] Check nested copies too: a safe hoisted version must not hide an affected copy.
+            const packages = readPackageLockJson().packages as Record<string, JsonObject>;
+            const copies = Object.entries(packages).filter(([location]) =>
+                location === 'node_modules/pacote' || location.endsWith('/node_modules/pacote'));
+            expect(copies.length).toBeGreaterThan(0);
+            for (const [location, installed] of copies) {
+                expect(typeof installed.version, location).toBe('string');
+                expect(satisfies(installed.version as string, '>=21.5.1'), `${location}: ${installed.version}`).toBe(true);
+            }
         });
 
         it('preserves maintenance commands and the seven-day pinact cooldown', () => {
