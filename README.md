@@ -224,15 +224,17 @@ pipx-less box.
 invalid representative TS/workflows, standalone workflow lint, and the full
 repository gate were not run by the editor. Stub hook tests do not prove any
 of those checks. The harness must record their real statuses separately.
-Fixpack, ESLint and zizmor remain enabled and enforced in the hook. `npm audit
+Fixpack, ESLint and zizmor remain enabled and enforced in the hook. `npm audit`
 audits the whole resolved dependency tree, not the staged `package.json`, so it
-deliberately does not gate per-file commits: previous runs measured it refusing
-every commit on 38 pre-existing dev-dependency advisories (release-it/undici,
-vite) that no staged change causes. It is not silenced — `npm run lint:all`
-still runs it, CI executes `lint:all` on pushes to `main` and on pull requests
-into it, skipped only when every changed file is markdown, and `npm run
-audit:fix` is the remediation path. No audit result was measured by this
-focused run.
+deliberately does not gate per-file commits: its verdict depends on the
+advisory database at the moment it runs, not on anything a staged change
+causes. It is not silenced — `npm run lint:all` still runs it, CI executes
+`lint:all` on pushes to `main` and on pull requests into it, skipped only when
+every changed file is markdown, and `npm run audit:fix` is the remediation
+path. Measured on 2026-11-09 (UTC, 13:10) with `npm audit` on the unchanged
+tree: exit code 0, printed `found 0 vulnerabilities` (no advisories, so no
+severity breakdown or ids). That is a point-in-time result; the earlier
+recorded figure of 38 advisories no longer reproduces.
 
 ## Requirements
 
