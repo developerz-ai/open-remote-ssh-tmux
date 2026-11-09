@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import * as vscode from 'vscode';
+import { window as mockWindow } from './mocks/vscode';
 
 // Smoke test for the vitest harness itself: proves the runner executes and that
 // the `vscode` bare import resolves to `test/mocks/vscode.ts` via the config
@@ -18,7 +19,9 @@ describe('test harness', () => {
     });
 
     it('createOutputChannel returns a channel that records appended lines', () => {
-        const channel = vscode.window.createOutputChannel('open-remote-ssh');
+        // Use the mock's own `window` so the channel's recorded `lines` are typed;
+        // the real vscode.d.ts OutputChannel does not declare them.
+        const channel = mockWindow.createOutputChannel('open-remote-ssh');
         channel.appendLine('hello');
         expect(channel.lines).toEqual(['hello']);
     });

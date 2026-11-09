@@ -96,7 +96,10 @@ function makeProvider(over: {
         ctx: { hostKey: HOST, workspaceKey: WS, cwd: CWD },
         exec,
         state,
-        openTerminal: (options: LaunchOptions): number => opened.push(options),
+        // LaunchOptions is the subset this provider produces; narrow back to it for recording.
+        openTerminal: (options: import('vscode').TerminalOptions): void => {
+            opened.push(options as LaunchOptions);
+        },
         listTerminals: over.listTerminals,
         reviveGraceMs: over.reviveGraceMs ?? 0,
         // Defaults to the grace so the existing waiting tests stay as quick as they were;
