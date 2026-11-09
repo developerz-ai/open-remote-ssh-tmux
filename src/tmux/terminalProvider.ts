@@ -11,8 +11,9 @@ import {
 import { decideSlotAction, describeSlot, type SlotInput } from './slotState';
 
 // The VS Code-facing heart of the fork: a terminal-profile provider that backs
-// each integrated terminal with a tmux session (`tmuxSession.ts` — the ONLY place
-// tmux command lines are built; this module never concatenates a tmux string).
+// each integrated terminal with a tmux session (`tmuxSession.ts` builds the
+// session command lines; this module only supplies the tmux binary as shellPath
+// and never concatenates a tmux string).
 // Its whole job is deciding *which slot* a terminal maps to, so the two hard
 // invariants hold:
 //
