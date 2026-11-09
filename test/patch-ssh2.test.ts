@@ -137,7 +137,9 @@ describe('scripts/patch-ssh2.js', () => {
         expect(patched).toContain('const sMpint = convertToMpint(s);');
         expect(patched).toContain('\n  convertToMpint,\n};');
         // The patch lands after the truncated-signature check, never before it.
-        expect(patched.indexOf('return;')).toBeLessThan(patched.indexOf('const rMpint'));
+        const guardAt = patched.indexOf('if (r === undefined || s === undefined)');
+        expect(guardAt).toBeGreaterThan(-1);
+        expect(patched.indexOf('return;', guardAt)).toBeLessThan(patched.indexOf('const rMpint'));
         // No temp file is left behind by the atomic write.
         expect(fs.existsSync(`${fixture.utilsPath}.patching`)).toBe(false);
     });

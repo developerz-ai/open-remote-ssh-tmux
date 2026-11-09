@@ -44,13 +44,18 @@
 //         sigSSHToASN1 (the ECDSA branch)
 //     3/3 'convertToMpint export'  the tail of `module.exports`
 //         (`proto._cipher.encrypt(packet); return true; }, };`)
-//   1. Install the new ssh2, then diff its lib/protocol/utils.js
-//      (sigSSHToASN1 and the module.exports tail) against the old version.
-//      If upstream fixed sigSSHToASN1 itself, delete the patch instead.
+//   1. Install the new ssh2 WITHOUT running this script as postinstall —
+//      `npm install ssh2@x.y.z --ignore-scripts` — since the pin guard above
+//      will exit 1 on a plain `npm install` until step 2/3 below are done.
+//      Then diff its lib/protocol/utils.js (sigSSHToASN1 and the
+//      module.exports tail) against the old version. If upstream fixed
+//      sigSSHToASN1 itself, delete the patch instead.
 //   2. Update the three anchors here to the new bytes, and TARGET_SSH2_VERSION.
 //   3. Update the package.json pin (exact x.y.z), package-lock.json, and the
 //      version pins in test/package-ssh2.test.ts and test/patch-ssh2.test.ts.
-//   4. Run `npm install` and `npx vitest run test/patch-ssh2.test.ts
+//   4. Re-run a plain `npm install` (now that the anchors and
+//      TARGET_SSH2_VERSION match the pin, the postinstall patch applies
+//      cleanly) and `npx vitest run test/patch-ssh2.test.ts
 //      test/package-ssh2.test.ts test/ssh/ssh2.security.test.ts`.
 //   A mismatch or a missing anchor always exits 1 with nothing written.
 
