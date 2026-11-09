@@ -49,14 +49,15 @@ explicitly rather than shipping a leaky abstraction.
 
 ## Architecture — one responsibility per module (SRP)
 
-The codebase is small (~2.3k LOC, `src/`) and already organised by
-responsibility. Preserve that; each file below owns exactly one concern.
+The codebase is roughly 7k lines of TypeScript (`src/`, plus ~0.6k lines of
+remote install scripts) and is organised by responsibility. Preserve that; each file below owns exactly one concern.
 
 | File | Single responsibility |
 |------|----------------------|
-| `src/extension.ts` | Activation wiring only — construct collaborators, register with VS Code, push disposables. No logic. |
-| `src/authResolver.ts` | Resolve the remote authority: auth handshake → ensure server → produce the connection VS Code connects to. Upstream's core; **we leave it alone** (terminals-only scope). |
-| `src/tmux/*` *(new)* | **The fork's addition.** `tmuxSession.ts` (pure session-naming/attach-or-create/reap-decision logic, the only place tmux command lines are built), `tmuxBootstrap.ts` (capability probe), `terminalProvider.ts` (VS Code `TerminalProfileProvider` wiring, multi-client slot allocation), `sessionReaper.ts` (connect-time cleanup of dead/empty sessions). The heart of open-remote-ssh-tmux. |
+| `src/extension.ts` | Activation wiring plus a little glue logic: `idempotentResolveHandler` / `onceOnly` (wire the tmux layer once per resolve, retry if it was not ready), `wireTmuxTerminalLayer` (gated on the tmux capability probe and the `remote.SSH.tmux.enabled` setting), `lazyExec` (resolves the *current* connection per call, so a reconnect is picked up), the kill-workspace-sessions command, and `TMUX_PROFILE_ID`. Anything bigger belongs in a collaborator, not here. |
+| `src/authResolver.ts` | Resolve the remote authority: auth handshake → ensure server → produce the connection VS Code connects to. Upstream's core, kept as close to upstream as possible (terminals-only scope), but **not untouched**: it imports `probeTmux` from `src/tmux/tmuxBootstrap` and runs it after connecting to record the remote's tmux capability, and it applies the terminal environment via `common/envCollection`. |
+| `src/tmux/*` *(new)* | **The fork's addition.** `tmuxSession.ts` (pure session-naming/attach-or-create/reap-decision logic; its builders are where the tmux command lines are built, alongside `tmuxBootstrap`'s `PROBE_COMMAND` and the `TMUX_BIN` `shellPath` in `terminalProvider.ts`), `tmuxBootstrap.ts` (capability probe), `terminalProvider.ts` (VS Code `TerminalProfileProvider` wiring, multi-client slot allocation), `slotState.ts` (pure slot-lifecycle decision: reclaim our own stale client, never steal another machine's), `profileRegistration.ts` (sole owner of the single `tmux` terminal-profile id; dispose-then-register swap), `fallbackTerminalProvider.ts` (plain-shell provider on that id when tmux is unavailable or disabled), `sessionReaper.ts` (connect-time cleanup of dead/empty sessions). The heart of open-remote-ssh-tmux. |
+| `src/clipboard/*` *(new)* | Clipboard→remote image bridge, independent of `src/tmux/*` (no imports either way). `clipboardImage.ts` (pure command/path builders, the only place the clipboard's own capture/mkdir/cleanup command lines are built), `clipboardWebview.ts` (last-resort local clipboard reader via a webview), `pasteImage.ts` (orchestration: read local clipboard → write to remote → bracketed-paste the path). |
 | `src/serverSetup.ts` | Install / locate the VS Code server on the remote (script templating, path resolution, release fetch). |
 | `src/serverConfig.ts` | Compute the wanted server version/quality/commit + validation policy. |
 | `src/fetchRelease.ts` | Fetch release metadata (network I/O, no policy). |
@@ -68,7 +69,7 @@ responsibility. Preserve that; each file below owns exactly one concern.
 | `src/ssh/sshDestination.ts` | Parse/format a `user@host:port` destination. |
 | `src/ssh/identityFiles.ts` | Discover & load identity/key files. |
 | `src/ssh/hostfile.ts` | known_hosts handling. |
-| `src/common/*` | Cross-cutting leaf utilities: `logger`, `ports`, `files`, `platform`, `disposable`. Depend on nothing in the project. |
+| `src/common/*` | Cross-cutting leaf utilities: `logger`, `ports`, `files`, `platform`, `disposable`, `shellQuote` (`escapeShellArg` and the PowerShell counterpart — the one shell-quoting implementation, re-exported by `tmuxSession.ts`), `envCollection` (diff-before-write of the terminal environment so reconnects do not prompt to relaunch live terminals). Depend on nothing in the project. |
 | `src/scripts/*.sh \| *.ps1` | Remote-side install scripts (templated by `serverSetup`). |
 
 Dependency direction: `extension` → feature modules → `ssh/*` / `serverSetup`

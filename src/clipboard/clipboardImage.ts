@@ -18,8 +18,9 @@
 // concern, not a terminal-lifetime one, and keeping it separable means it can be lifted
 // into its own extension without untangling anything.
 //
-// As with `tmuxSession.ts`, this module is the ONLY place these command lines are built,
-// so quoting and path construction are auditable in one file.
+// This module is the ONLY place the clipboard bridge's own command lines are built, so
+// quoting and path construction are auditable in one file (tmux's are built separately
+// in `src/tmux/*`).
 
 /** Directory, relative to the remote user's `$HOME`, under which every uploaded image
  * lives. `.cache` is the XDG-conventional home for regenerable data, so nothing here is
@@ -296,8 +297,8 @@ export function bracketedPaste(payload: string): string {
     return `[200~${payload}[201~`;
 }
 
-/** POSIX single-quote quoting — identical rule to `tmuxSession.ts`'s `escapeShellArg`,
- * restated here rather than imported so this module keeps no dependency on the tmux layer. */
+/** POSIX single-quote quoting — identical rule to `escapeShellArg` in `common/shellQuote.ts`,
+ * restated here rather than imported so this module stays import-free and liftable. */
 function quote(value: string): string {
     return `'${value.replace(/'/g, `'\\''`)}'`;
 }

@@ -7,8 +7,10 @@ import { escapeShellArg } from '../common/shellQuote';
 // by) can share it without a tmux→ssh dependency inversion.
 export { escapeShellArg };
 
-// The session model — pure logic, the heart of the "no zombies" guarantee and
-// the ONLY place tmux command lines are built. No `vscode`/`ssh2`/`ssh` imports
+// The session model — pure logic, the heart of the "no zombies" guarantee. It
+// owns the session/list/has/kill/new-session command-line builders; the only
+// other tmux command sites are `tmuxBootstrap.ts`'s PROBE_COMMAND and the
+// `TMUX_BIN` shellPath in `terminalProvider.ts`. No `vscode`/`ssh2`/`ssh` imports
 // so it is fully unit-testable. Every user-influenced string routed into a
 // command goes through `escapeShellArg` (these command lines run on the remote
 // via a shell; unescaped a hostile workspace path would be arbitrary code
