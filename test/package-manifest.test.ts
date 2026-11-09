@@ -1064,10 +1064,26 @@ describe('test type-check project', () => {
         expect(steps).toContain('npm run compile:src');
     });
 
-    it('tsconfig.test.json does not suppress errors to get green', () => {
-        const raw = fs.readFileSync(path.resolve(repoRoot, 'tsconfig.test.json'), 'utf8');
+    it('the test type-check project does not suppress errors to get green', () => {
         const cfg = readTsconfig('tsconfig.test.json');
-        expect(raw).not.toMatch(/@ts-ignore|@ts-nocheck/);
+        // `@ts-ignore` / `@ts-nocheck` only exist in TypeScript sources — a JSON config
+        // cannot carry one, so scanning tsconfig.test.json alone is a guard that can
+        // never fail. Scan the repo-owned sources this project type-checks instead:
+        // the test tree plus vitest.config.ts (the downloaded vscode *.d.ts files are
+        // upstream artifacts, not this repo's code). This file is skipped because the
+        // pattern is spelled out here.
+        const suppression = /@ts-ignore|@ts-nocheck/;
+        const self = path.resolve(__filename);
+        const ownedSources = [
+            ...collectTsFiles(path.resolve(repoRoot, 'test')),
+            path.resolve(repoRoot, 'vitest.config.ts'),
+        ];
+        for (const file of ownedSources) {
+            if (path.resolve(file) === self) {
+                continue;
+            }
+            expect(fs.readFileSync(file, 'utf8'), file).not.toMatch(suppression);
+        }
         const opts = cfg.compilerOptions as JsonObject;
         expect(opts.skipLibCheck).not.toBe(true);
         // The project mirrors tsconfig.json's strictness; relaxing it here is the same
