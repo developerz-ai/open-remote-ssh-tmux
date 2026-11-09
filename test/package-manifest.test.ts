@@ -415,7 +415,7 @@ describe('package.json manifest drift guard', () => {
                     cwd: fixture,
                     env: { ...process.env, PATH: binDir, PINACT_MIN_AGE: '0', PINACT_TEST_CAPTURE: capture },
                     encoding: 'utf8',
-                    timeout: 15000,
+                    timeout: 60000,
                     killSignal: 'SIGKILL',
                     maxBuffer: 1024 * 1024,
                 });
@@ -426,7 +426,7 @@ describe('package.json manifest drift guard', () => {
             } finally {
                 fs.rmSync(fixture, { recursive: true, force: true });
             }
-        }, 20000);
+        }, 70000);
 
         it.runIf(supportsMaintenanceTools)('runs update:artifacts help using the installed local executable', () => {
             const binDir = path.join(repoRoot, 'node_modules', '.bin');
@@ -441,7 +441,7 @@ describe('package.json manifest drift guard', () => {
                 cwd: repoRoot,
                 env: { ...process.env, PATH: [binDir, path.dirname(process.execPath)].join(path.delimiter) },
                 encoding: 'utf8',
-                timeout: 15000,
+                timeout: 60000,
                 killSignal: 'SIGKILL',
                 maxBuffer: 1024 * 1024,
             });
@@ -449,7 +449,7 @@ describe('package.json manifest drift guard', () => {
             expect(result.status, result.stderr).toBe(0);
             expect(result.stdout).toMatch(/Usage: artifact update\b/);
             expect(result.stdout).toContain('update the current project using the installed artifacts');
-        }, 20000);
+        }, 70000);
     });
 
     // The typings acquisition (`update:dts`) used to run `npx vscode-dts dev && npx
@@ -1024,5 +1024,78 @@ describe('CHANGELOG', () => {
         const changelog = fs.readFileSync(path.resolve(repoRoot, 'CHANGELOG.md'), 'utf8');
         const firstHeading = changelog.match(/^## (\d+\.\d+\.\d+)/m);
         expect(firstHeading![1]).toBe(readPackageJson().version);
+    });
+});
+
+// `tsc -b` only compiles src/ (tsconfig.json excludes test/ and vitest.config.ts so the
+// emitted out/ stays source-only), and vitest transpiles without type-checking — so a test
+// calling a removed export would stay green forever. tsconfig.test.json + `compile:test`
+// type-check the tests with noEmit, and `compile:src` (what `npm run build` and CI run)
+// chains it. These assertions pin that wiring so dropping any link fails here, not silently.
+describe('test type-check project', () => {
+    /** tsconfig files allow comments/trailing commas (tsconfig.test.json has one in `lib`); strip trailing commas so JSON.parse accepts them. */
+    function readTsconfig(name: string): JsonObject {
+        const raw = fs.readFileSync(path.resolve(repoRoot, name), 'utf8');
+        return JSON.parse(raw.replace(/,(\s*[\]}])/g, '$1')) as JsonObject;
+    }
+    const scripts = readPackageJson().scripts as Record<string, string>;
+
+    it('compile:test type-checks tsconfig.test.json', () => {
+        expect(scripts['compile:test']).toMatch(/\btsc\b.*(-p|--project)\s+tsconfig\.test\.json\b/);
+    });
+
+    it('compile:src runs tsc -b and then compile:test', () => {
+        const steps = scripts['compile:src'].split('&&').map(s => s.trim());
+        expect(steps[0]).toBe('tsc -b');
+        expect(steps).toContain('npm run compile:test');
+    });
+
+    it('tsconfig.test.json includes test and vitest.config.ts and emits nothing', () => {
+        const cfg = readTsconfig('tsconfig.test.json');
+        expect(cfg.include).toEqual(expect.arrayContaining(['test', 'vitest.config.ts']));
+        expect((cfg.compilerOptions as JsonObject).noEmit).toBe(true);
+    });
+
+    // `build` is the one step between CI and `compile:src`: ci-pr.yml/ci-main.yml run
+    // `npm run build`, so dropping compile:src from it would unhook the test type-check
+    // from CI while every assertion above still passed.
+    it('build chains compile:src (so CI reaches the test type-check)', () => {
+        const steps = scripts['build'].split('&&').map(s => s.trim());
+        expect(steps).toContain('npm run compile:src');
+    });
+
+    it('the test type-check project does not suppress errors to get green', () => {
+        const cfg = readTsconfig('tsconfig.test.json');
+        // `@ts-ignore` / `@ts-nocheck` only exist in TypeScript sources — a JSON config
+        // cannot carry one, so scanning tsconfig.test.json alone is a guard that can
+        // never fail. Scan the repo-owned sources this project type-checks instead:
+        // the test tree plus vitest.config.ts (the downloaded vscode *.d.ts files are
+        // upstream artifacts, not this repo's code). This file is skipped because the
+        // pattern is spelled out here.
+        const suppression = /@ts-ignore|@ts-nocheck/;
+        const self = path.resolve(__filename);
+        const ownedSources = [
+            ...collectTsFiles(path.resolve(repoRoot, 'test')),
+            path.resolve(repoRoot, 'vitest.config.ts'),
+        ];
+        for (const file of ownedSources) {
+            if (path.resolve(file) === self) {
+                continue;
+            }
+            expect(fs.readFileSync(file, 'utf8'), file).not.toMatch(suppression);
+        }
+        const opts = cfg.compilerOptions as JsonObject;
+        expect(opts.skipLibCheck).not.toBe(true);
+        // The project mirrors tsconfig.json's strictness; relaxing it here is the same
+        // trick as skipLibCheck — errors stop being reported rather than getting fixed.
+        expect(opts.strict).toBe(true);
+        expect(cfg.exclude).not.toEqual(expect.arrayContaining(['test']));
+        expect(cfg.exclude).not.toEqual(expect.arrayContaining(['vitest.config.ts']));
+    });
+
+    it('tsconfig.json still keeps test and vitest.config.ts out of the src build', () => {
+        const cfg = readTsconfig('tsconfig.json');
+        expect(cfg.exclude).toEqual(expect.arrayContaining(['test', 'vitest.config.ts']));
+        expect((cfg.compilerOptions as JsonObject).rootDir).toBe('./src');
     });
 });

@@ -51,7 +51,7 @@ describe('getVSCodeServerConfig', () => {
             return { ...actual, version: '1.70.2-insider' };
         });
 
-        const freshVscode = await import('vscode') as typeof import('./mocks/vscode');
+        const freshVscode = await import('./mocks/vscode');
         freshVscode.env.appRoot = appRoot;
         const { getVSCodeServerConfig: freshGetConfig } = await import('../src/serverConfig');
 
@@ -82,7 +82,7 @@ describe('getVSCodeServerConfig', () => {
                 // serverDownloadUrlTemplate intentionally omitted.
             }));
 
-            const freshVscode = await import('vscode') as typeof import('./mocks/vscode');
+            const freshVscode = await import('./mocks/vscode');
             freshVscode.env.appRoot = freshAppRoot;
             freshVscode.configOverrides.set('remote.SSH.serverValidation', 'force');
 

@@ -137,7 +137,8 @@ and [`../ai-task-master/`](../ai-task-master/CLAUDE.md).
 
 ```bash
 npm install            # postinstall pulls vscode dts
-npm run compile:src    # tsc -b  → out/   (fast typecheck)
+npm run compile:src    # tsc -b (src only → out/), then compile:test: type-checks
+                       # test/ + vitest.config.ts via tsconfig.test.json (noEmit)
 npm run watch:src      # tsc-watch + dev bundle
 npm run bundle         # webpack production → lib/extension.js
 npm run build          # clean + compile + bundle (what vsce:prepublish runs)
