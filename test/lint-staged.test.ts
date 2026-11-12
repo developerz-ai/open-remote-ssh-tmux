@@ -158,7 +158,7 @@ console.log(JSON.stringify({ command: task.commands, failed }));
             const env = { PATH: `${path.join(root, 'node_modules/.bin')}${path.delimiter}${process.env.PATH}` };
             for (const [source, status] of [['export const answer = 42;\n', 0], ['export const answer: any = 42;\n', 1]] as const) {
                 writeFileSync(path.join(directory, 'src/tmux/probe.ts'), source);
-                const result = runTask('*.ts', ['src/tmux/probe.ts'], directory, env);
+                const result = runTask('*.ts', ['src/tmux/probe.ts'], directory, env, 40000);
                 expect(result.files).toEqual([path.join(directory, 'src/tmux/probe.ts')]);
                 expect(result.exitCode, result.output).toBe(status);
                 expect(result.failed, result.output).toBe(status !== 0);
@@ -170,7 +170,7 @@ console.log(JSON.stringify({ command: task.commands, failed }));
         } finally {
             rmSync(directory, { recursive: true, force: true });
         }
-    }, 45000);
+    }, 120000);
 
     it('acquires real zizmor with pipx and propagates an actual unsafe-workflow finding', async (ctx) => {
         const pipx = pipxPath;

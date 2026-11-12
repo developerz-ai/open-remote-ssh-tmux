@@ -224,15 +224,22 @@ pipx-less box.
 invalid representative TS/workflows, standalone workflow lint, and the full
 repository gate were not run by the editor. Stub hook tests do not prove any
 of those checks. The harness must record their real statuses separately.
-Fixpack, ESLint and zizmor remain enabled and enforced in the hook. `npm audit
+Fixpack, ESLint and zizmor remain enabled and enforced in the hook. `npm audit`
 audits the whole resolved dependency tree, not the staged `package.json`, so it
-deliberately does not gate per-file commits: previous runs measured it refusing
-every commit on 38 pre-existing dev-dependency advisories (release-it/undici,
-vite) that no staged change causes. It is not silenced — `npm run lint:all`
-still runs it, CI executes `lint:all` on pushes to `main` and on pull requests
-into it, skipped only when every changed file is markdown, and `npm run
-audit:fix` is the remediation path. No audit result was measured by this
-focused run.
+deliberately does not gate per-file commits. It is not silenced — `npm run
+lint:all` still runs it (`package.json` script `lint:all`), CI executes
+`lint:all` on pushes to `main` and on pull requests into it, skipped only when
+every changed file is markdown, and `npm run audit:fix` is the remediation path.
+
+**Measured audit result (2026-11-12, 23:55 UTC, `date -u`):** `npm audit`
+(the exact command in `lint:all`) against the current tree exited `0` and
+printed `found 0 vulnerabilities`. `npm audit --json` agrees: 0 advisories in
+total (info 0, low 0, moderate 0, high 0, critical 0), so there are no advisory
+ids to list, across 939 resolved dependencies (27 prod, 910 dev, 68 optional,
+1 peer). At this measurement the audit step neither refuses a commit nor reds
+CI. `package.json`, `package-lock.json`, the overrides and any audit
+configuration were not changed to get this result; the count is a point-in-time
+reading and moves as new advisories are published.
 
 ## Requirements
 
