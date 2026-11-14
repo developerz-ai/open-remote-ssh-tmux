@@ -318,3 +318,14 @@ describe('check-vsix-contents.js', () => {
         expect(vsixGuard.compareEntries(entries, patterns)).toEqual({ unexpected: [], missing: ['lib/extension.js'] });
     });
 });
+
+// The README tells users to run `sha256sum -c <vsix>.sha256`. That only works when the file
+// is in sha256sum's own `<hash>  <file>` format — a bare hash ("no properly formatted checksum
+// lines found") shipped with v1.3.0 and v1.4.0.
+describe('release checksum file', () => {
+    it.each(['publish.yml', 'preview.yml'])('%s writes `<hash>  <file>` so sha256sum -c verifies it', (name) => {
+        const contents = readWorkflow(name);
+        expect(contents).toMatch(/sha256sum "?\$VSIX_NAME"? > "\$VSIX_NAME\.sha256"/);
+        expect(contents).not.toMatch(/echo "\$CHECKSUM" > "\$VSIX_NAME\.sha256"/);
+    });
+});
