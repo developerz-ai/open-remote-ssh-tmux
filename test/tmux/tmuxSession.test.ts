@@ -1,15 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import {
     buildAttachOrCreateArgv,
+    buildDetachClientsCommand,
     buildHasSession,
     buildHasSessionsCommand,
     buildKillSession,
+    buildListClientsCommand,
     buildListSessions,
     clampHistoryLimit,
     classifyTmuxFailure,
     escapeShellArg,
     isOurSession,
     parseHasSessions,
+    parseListClients,
     parseListSessions,
     readListSessionsResult,
     sessionName,
@@ -102,7 +105,7 @@ describe('buildListSessions', () => {
         // `#{session_windows}` alone can never be 0 for a live session, so it is not it.
         expect(buildListSessions()).toBe(
             `'tmux' list-sessions -F `
-            + `'#{session_name} #{session_attached} #{session_windows} #{session_created} #{pane_dead}'`,
+            + `'#{session_name} #{session_attached} #{session_windows} #{session_created} #{pane_dead} o:#{@orst_owner}'`,
         );
     });
 
@@ -609,5 +612,108 @@ describe('shouldReap', () => {
     it('respects a minimum-age grace window (guards create/list races)', () => {
         expect(shouldReap(corpse({ createdEpoch: 1000 }), 1005, { minAgeSeconds: 10 })).toBe(false);
         expect(shouldReap(corpse({ createdEpoch: 1000 }), 1020, { minAgeSeconds: 10 })).toBe(true);
+    });
+});
+
+describe('owner tag (slice 03: who holds a session)', () => {
+    const NAME = `code-${HASH_PROJ}-0`;
+    const OWNER = '1a2b3c4d-0011aabb';
+
+    // Every attach writes this window's client id into the session, so another machine can
+    // tell our stale pty from its own live one. Session-scoped (`=name:`), right after the
+    // create, so it is set before anything later in the chain can fail.
+    it('sets @orst_owner on our session right after new-session', () => {
+        const argv = buildAttachOrCreateArgv(NAME, '/home/user/proj', undefined, { owner: OWNER });
+        const create = argv.indexOf('new-session');
+        const tag = argv.indexOf('@orst_owner');
+        expect(argv.slice(tag - 3, tag + 2)).toEqual(['set-option', '-t', `=${NAME}:`, '@orst_owner', OWNER]);
+        expect(tag).toBeGreaterThan(create);
+        expect(argv.slice(create, tag).filter(token => token === ';')).toHaveLength(1);
+    });
+
+    it('sets it after the history-limit restore on the legacy chain', () => {
+        const argv = buildAttachOrCreateArgv(NAME, '/p', undefined, { owner: OWNER, tmuxVersion: '2.6' });
+        expect(argv.indexOf('@orst_owner')).toBeGreaterThan(argv.indexOf('-gF'));
+    });
+
+    it('omits the tag when no owner is given', () => {
+        expect(buildAttachOrCreateArgv(NAME, '/p')).not.toContain('@orst_owner');
+    });
+
+    it.each(['x;', 'a b', '#{session_name}', ''])('refuses a malformed owner %j (it is a tmux argv element)', owner => {
+        expect(() => buildAttachOrCreateArgv(NAME, '/p', undefined, { owner })).toThrow();
+    });
+});
+
+describe('parseListSessions with the owner field', () => {
+    it('reads the owner tag', () => {
+        expect(parseListSessions('code-x-0 1 1 1700000000 0 o:1a2b3c4d-0011aabb')[0]).toEqual({
+            name: 'code-x-0', attached: true, windows: 1, paneDead: false, createdEpoch: 1700000000, owner: '1a2b3c4d-0011aabb',
+        });
+    });
+
+    it('reads an untagged session (created before tags) as owner unknown', () => {
+        expect(parseListSessions('code-x-0 1 1 1700000000 0 o:')[0].owner).toBeUndefined();
+    });
+
+    it('still parses the old five-field shape (owner unknown)', () => {
+        expect(parseListSessions('code-x-0 1 1 1700000000 0')[0]).toMatchObject({ name: 'code-x-0', owner: undefined });
+    });
+
+    it('keeps a name with spaces intact alongside the owner', () => {
+        expect(parseListSessions('my session 0 1 1700000000 0 o:')[0].name).toBe('my session');
+    });
+});
+
+describe('buildListClientsCommand / parseListClients (staleness evidence)', () => {
+    it('prints the remote clock, then every client\'s session and last input time', () => {
+        expect(buildListClientsCommand()).toBe(
+            `printf '__now %s\\n' "$(date +%s)"; 'tmux' list-clients -F '#{client_session} #{client_activity}'`,
+        );
+    });
+
+    it('runs the given tmux binary, quoted', () => {
+        expect(buildListClientsCommand('/home/a b/tmux')).toContain(`'/home/a b/tmux' list-clients`);
+    });
+
+    it('parses the clock and the clients (session names read from the left of the epoch)', () => {
+        expect(parseListClients('__now 1800000100\ncode-x-0 1800000000\nmy session 1799999000\n')).toEqual({
+            now: 1800000100,
+            clients: [
+                { session: 'code-x-0', activity: 1800000000 },
+                { session: 'my session', activity: 1799999000 },
+            ],
+        });
+    });
+
+    it('skips noise and reports a missing clock as undefined', () => {
+        expect(parseListClients('banner\nno server running on /tmp/x\n')).toEqual({ now: undefined, clients: [] });
+    });
+});
+
+describe('buildDetachClientsCommand (explicit detach on window close)', () => {
+    const OWNER = '1a2b3c4d-0011aabb';
+    const A = `code-${HASH_PROJ}-0`;
+    const B = `code-${HASH_PROJ}-1`;
+
+    // Only detach where the owner tag is still ours: if another machine took the session over
+    // a moment ago, its client is the one on it now, and `detach-client -s` would evict it.
+    it('detaches each session only while its owner tag is ours, with exact = targets', () => {
+        const command = buildDetachClientsCommand([A, B], OWNER);
+        for (const name of [A, B]) {
+            expect(command).toContain(
+                `[ "$('tmux' display-message -p -t ='${name}': '#{@orst_owner}' 2>/dev/null)" = '${OWNER}' ] `
+                + `&& 'tmux' detach-client -s ='${name}' 2>/dev/null`,
+            );
+        }
+        expect(command.split('; ')).toHaveLength(2);
+    });
+
+    it('runs the given tmux binary, quoted', () => {
+        expect(buildDetachClientsCommand([A], OWNER, '/opt/my tmux')).toContain(`'/opt/my tmux' detach-client`);
+    });
+
+    it('refuses a malformed owner', () => {
+        expect(() => buildDetachClientsCommand([A], 'x;y')).toThrow();
     });
 });

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SLOT_MAPPING_STATE_KEY, TmuxTerminalProvider } from '../../src/tmux/terminalProvider';
 import { createRemoteExec } from '../../src/tmux/remoteExec';
-import { buildAttachOrCreateArgv, buildKillSession, sessionName } from '../../src/tmux/tmuxSession';
+import { buildAttachOrCreateArgv, buildDetachClientsCommand, buildKillSession, sessionName } from '../../src/tmux/tmuxSession';
 
 // The terminal provider is the user-facing heart of the fork: it decides which
 // tmux session (slot) each VS Code terminal maps to. Both hard invariants live
@@ -50,9 +50,18 @@ function fakeState(initial: Record<string, unknown> = {}) {
     };
 }
 
-/** A `list-sessions` stdout line: `<name> <attached> <windows> <created> <paneDead>`. */
-const row = (sessionId: string, attached: boolean, windows = 1, created = 1700000000, paneDead = false): string =>
-    `${sessionId} ${attached ? 1 : 0} ${windows} ${created} ${paneDead ? 1 : 0}`;
+/** This test window's client id (the owner tag its attaches write). */
+const ME = '1a2b3c4d-0011aabb';
+/** Another machine's client id. */
+const OTHER = '9f8e7d6c-ffeeddcc';
+
+/** A `list-sessions` stdout line: `<name> <attached> <windows> <created> <paneDead> o:<owner>`.
+ * No owner → an untagged session (owner unknown). */
+const row = (sessionId: string, attached: boolean, windows = 1, created = 1700000000, paneDead = false, owner = ''): string =>
+    `${sessionId} ${attached ? 1 : 0} ${windows} ${created} ${paneDead ? 1 : 0} o:${owner}`;
+
+/** A row for a session whose owner tag names `owner`. */
+const owned = (sessionId: string, attached: boolean, owner: string): string => row(sessionId, attached, 1, 1700000000, false, owner);
 
 /** The session names a batched `has-session` command asks about, in order. Matched on the
  * EXACT `-t =<name>` target the real tmux uses, not a loose substring: a bare `includes(name)`
@@ -80,12 +89,15 @@ function hasReply(command: string, answer: (target: string) => { code: number; m
  * `has-session` against a set of existing names (exit 0 = present; exit 1 + tmux's own
  * "can't find session" = absent), mirroring what the real tmux CLI reports.
  */
-function fakeExec(opts: { list?: string[]; existing?: string[] } = {}) {
+function fakeExec(opts: { list?: string[]; existing?: string[]; clients?: string } = {}) {
     const listOut = (opts.list ?? []).join('\n');
     const existing = new Set(opts.existing ?? []);
     return vi.fn(async (command: string): Promise<ExecResult> => {
         if (command.includes('list-sessions')) {
             return { stdout: listOut, stderr: '', code: 0 };
+        }
+        if (command.includes('list-clients')) {
+            return { stdout: opts.clients ?? '', stderr: '', code: 0 };
         }
         if (command.includes('has-session')) {
             return hasReply(command, target => existing.has(target)
@@ -117,6 +129,9 @@ function makeProvider(over: {
     reviveGraceMs?: number;
     reviveDeadlineMs?: number;
     reviveQuietMs?: number;
+    handOff?: import('../../src/tmux/slotState').HandOffPolicy;
+    offerTakeOver?: () => Promise<boolean>;
+    staleClientSeconds?: number;
 } = {}) {
     const opened = over.opened ?? [];
     const exec = over.exec ?? fakeExec();
@@ -141,6 +156,10 @@ function makeProvider(over: {
         historyLimit: over.historyLimit,
         tmuxPath: over.tmuxPath,
         tmuxVersion: over.tmuxVersion,
+        clientId: ME,
+        handOff: over.handOff,
+        offerTakeOver: over.offerTakeOver,
+        staleClientSeconds: over.staleClientSeconds,
     });
     return { provider, opened, exec, state, log };
 }
@@ -414,18 +433,16 @@ describe('restore mapping (per client, on reload)', () => {
         expect(state.get(SLOT_MAPPING_STATE_KEY)).toEqual({ '0': name(0) });
     });
 
-    // THE FIELD BUG (fixed): "mapped AND attached" was read as "another machine holds
-    // this", so restore was skipped and the user got a brand-new empty terminal while
-    // their real work sat in a session they could no longer see. It is not another
-    // machine: VS Code keeps a closed window's pty alive for its reconnection grace (3h
-    // by default), so OUR OWN tmux client stays attached long after the window is gone.
-    // The mapping is client-local, so anything in it was created by this machine —
-    // reclaiming it with `-D` (which evicts the stale client and leaves the pane's
-    // process running) is taking back what is ours. Observed live as session
-    // `code-8282129a2247-0` running htop, orphan client stale by 158s.
-    it('reclaims a mapped slot reported attached (our own stale pty, not another machine)', async () => {
+    // THE FIELD BUG (fixed): "attached" was read as "another machine holds this", so
+    // restore was skipped and the user got a brand-new empty terminal while their real work
+    // sat in a session they could no longer see. VS Code keeps a closed window's pty alive
+    // for its reconnection grace (3h by default), so OUR OWN tmux client stays attached long
+    // after the window is gone. The owner tag says so — reclaiming it with `-D` (which evicts
+    // the stale client and leaves the pane's process running) is taking back what is ours.
+    // Observed live as session `code-8282129a2247-0` running htop, orphan client stale by 158s.
+    it('reclaims a slot our own (stale) client holds', async () => {
         const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
-        const exec = fakeExec({ list: [row(name(0), true)], existing: [name(0)] });
+        const exec = fakeExec({ list: [owned(name(0), true, ME)], existing: [name(0)] });
         const opened: LaunchOptions[] = [];
         const { provider } = makeProvider({ state, exec, opened });
 
@@ -657,7 +674,7 @@ describe('profile options (invisible + argv, no injection surface)', () => {
         const options = optionsOf(await provider.provideTerminalProfile());
         expect(options.shellPath).toBe('tmux');
         expect(options.shellArgs).toEqual(
-            buildAttachOrCreateArgv(name(0), CWD, undefined, { historyLimit: 50000 }),
+            buildAttachOrCreateArgv(name(0), CWD, undefined, { historyLimit: 50000, owner: ME }),
         );
         expect(options.cwd).toBe(CWD);
     });
@@ -710,7 +727,7 @@ describe('profile options (invisible + argv, no injection surface)', () => {
         const { provider } = makeProvider({ tmuxPath, tmuxVersion: '3.4', historyLimit: 777 });
         const options = optionsOf(await provider.provideTerminalProfile());
         expect(options.shellArgs).toEqual(
-            buildAttachOrCreateArgv(name(0), CWD, undefined, { historyLimit: 777, tmuxPath, tmuxVersion: '3.4' }),
+            buildAttachOrCreateArgv(name(0), CWD, undefined, { historyLimit: 777, tmuxPath, tmuxVersion: '3.4', owner: ME }),
         );
     });
 
@@ -742,7 +759,7 @@ describe('profile options (invisible + argv, no injection surface)', () => {
     it('defaults the history limit through to the 02 builder when unset', async () => {
         const { provider } = makeProvider();
         const options = optionsOf(await provider.provideTerminalProfile());
-        expect(options.shellArgs).toEqual(buildAttachOrCreateArgv(name(0), CWD));
+        expect(options.shellArgs).toEqual(buildAttachOrCreateArgv(name(0), CWD, undefined, { owner: ME }));
     });
 
     it('titles the tab like a shell (workspace folder), never "tmux" (invisible UX)', async () => {
@@ -940,6 +957,7 @@ describe('folderName (tab title from a remote cwd, edge inputs)', () => {
             state: fakeState(),
             openTerminal: () => { /* not exercised */ },
             log: { info: vi.fn(), trace: vi.fn() },
+            clientId: ME,
         });
         const options = optionsOf(await provider.provideTerminalProfile());
         expect(options.name).toBe(expected);
@@ -1161,7 +1179,7 @@ describe('revive grace (letting VS Code go first, deterministically)', () => {
         const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0), '1': name(1) } });
         const exec = fakeExec({
             // Attached, because the closed window's pty outlives it — hence "to reclaim".
-            list: [row(name(0), true), row(name(1), true)],
+            list: [owned(name(0), true, ME), owned(name(1), true, ME)],
             existing: [name(0), name(1)],
         });
         const opened: LaunchOptions[] = [];
@@ -1252,7 +1270,7 @@ describe('revive grace (letting VS Code go first, deterministically)', () => {
     // while their sessions sit alive on the remote.
     it('gives up on the revive at the deadline and opens the queue itself', async () => {
         const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
-        const exec = fakeExec({ list: [row(name(0), true)], existing: [name(0)] });
+        const exec = fakeExec({ list: [owned(name(0), true, ME)], existing: [name(0)] });
         const opened: LaunchOptions[] = [];
         const { provider } = makeProvider({ state, exec, opened, reviveGraceMs: 5, reviveDeadlineMs: 30 });
 
@@ -1678,11 +1696,11 @@ describe('hand-off across machines (PC -> laptop -> PC)', () => {
         expect(provider.mappedSlots()).toEqual([0, 1, 2, 3]);
     });
 
-    // The honest limit of the above. Closing a laptop LID does not close its window: the
-    // remote pty (and the tmux client inside it) survives for VSCODE_RECONNECTION_GRACE_TIME,
-    // 3h by default, so those sessions still read as attached. Adopting them anyway would be
-    // stealing from a machine that may be seconds from waking up, so they are left alone
-    // until that grace expires and their clients actually die.
+    // Closing a laptop LID does not close its window: the remote pty (and the tmux client
+    // inside it) survives for VSCODE_RECONNECTION_GRACE_TIME, 3h by default, so those
+    // sessions still read as attached. While their clients are live (typed into within the
+    // staleness threshold) they are not taken — only offered; see the ownership suite below
+    // for the idle case.
     it('leaves the other machine\'s sessions alone while its clients are still attached', async () => {
         const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0), '1': name(1) } });
         const exec = fakeExec({
@@ -1712,5 +1730,299 @@ describe('hand-off across machines (PC -> laptop -> PC)', () => {
 
         expect(opened.map(targetSession)).toContain(name(2));
         expect(opened.map(targetSession)).toContain(name(3));
+    });
+});
+
+describe('hand-off ownership (03: owner tag, staleness, offer)', () => {
+    const NOW = 1_800_000_000;
+    /** `list-clients` output: the remote clock, then one `<session> <activity>` per client. */
+    const clients = (...rows: Array<[string, number]>): string =>
+        [`__now ${NOW}`, ...rows.map(([session, activity]) => `${session} ${activity}`)].join('\n');
+    const flush = (): Promise<void> => new Promise<void>(res => setTimeout(res, 0));
+    const anyTakeOver = (exec: ReturnType<typeof fakeExec>, opened: LaunchOptions[]): boolean =>
+        opened.some(o => (o.shellArgs ?? []).includes('-D'))
+        || exec.mock.calls.some(([command]) => command.includes('detach-client'));
+
+    // THE REGRESSION. PC mapped slot 0; the laptop adopted it and is typing in it. PC's
+    // reconnect used to read "mapped + attached" as its own stale pty and evict the laptop.
+    it('never evicts a live client of another machine from a session we once mapped', async () => {
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const exec = fakeExec({ list: [owned(name(0), true, OTHER)], existing: [name(0)], clients: clients([name(0), NOW - 5]) });
+        const opened: LaunchOptions[] = [];
+        const offerTakeOver = vi.fn(async () => false);
+        const { provider } = makeProvider({ state, exec, opened, offerTakeOver });
+
+        await provider.initialize();
+        await flush();
+
+        expect(opened).toEqual([]);
+        expect(anyTakeOver(exec, opened)).toBe(false);
+        expect(offerTakeOver).toHaveBeenCalledTimes(1);
+        // Mapping hygiene: the session is the laptop's now.
+        expect(provider.mappedSlots()).toEqual([]);
+        expect(state.get(SLOT_MAPPING_STATE_KEY)).toEqual({});
+    });
+
+    it('takes the session over with -D once the user accepts the offer', async () => {
+        const exec = fakeExec({ list: [owned(name(0), true, OTHER)], existing: [name(0)], clients: clients([name(0), NOW - 5]) });
+        const opened: LaunchOptions[] = [];
+        const { provider, log } = makeProvider({ exec, opened, offerTakeOver: async () => true });
+
+        await provider.initialize();
+        await flush();
+
+        expect(opened.map(targetSession)).toEqual([name(0)]);
+        expect(opened[0].shellArgs).toContain('-D');
+        expect(provider.mappedSlots()).toEqual([0]);
+        expect(log.info.mock.calls.map(c => String(c[0])).some(line => /took over 1 session/.test(line))).toBe(true);
+    });
+
+    it('re-reads the remote after the answer: a session that went away is not recreated', async () => {
+        let lists = 0;
+        const exec = vi.fn(async (command: string): Promise<ExecResult> => {
+            if (command.includes('list-sessions')) {
+                lists++;
+                return { stdout: lists === 1 ? owned(name(0), true, OTHER) : '', stderr: '', code: 0 };
+            }
+            if (command.includes('list-clients')) {
+                return { stdout: clients([name(0), NOW - 5]), stderr: '', code: 0 };
+            }
+            return { stdout: '', stderr: '', code: 0 };
+        });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ exec, opened, offerTakeOver: async () => true });
+
+        await provider.initialize();
+        await flush();
+
+        expect(opened).toEqual([]);
+    });
+
+    it('does not ask again on a reconnect after the user said not now', async () => {
+        const exec = fakeExec({ list: [owned(name(0), true, OTHER)], existing: [name(0)], clients: clients([name(0), NOW - 5]) });
+        const offerTakeOver = vi.fn(async () => false);
+        const { provider } = makeProvider({ exec, offerTakeOver });
+
+        await provider.initialize();
+        await provider.initialize({ awaitRevive: false });
+        await flush();
+
+        expect(offerTakeOver).toHaveBeenCalledTimes(1);
+    });
+
+    // A SIGKILLed VS Code / a sleeping laptop leaves its client attached for 3h. Once it has
+    // been idle past the threshold, `auto` hands the session over with no question asked.
+    it('takes over an idle foreign client silently under auto', async () => {
+        const exec = fakeExec({ list: [owned(name(0), true, OTHER)], clients: clients([name(0), NOW - 500]) });
+        const opened: LaunchOptions[] = [];
+        const offerTakeOver = vi.fn(async () => true);
+        const { provider } = makeProvider({ exec, opened, offerTakeOver });
+
+        await provider.initialize();
+        await flush();
+
+        expect(opened.map(targetSession)).toEqual([name(0)]);
+        expect(opened[0].shellArgs).toContain('-D');
+        expect(offerTakeOver).not.toHaveBeenCalled();
+        expect(provider.mappedSlots()).toEqual([0]);
+    });
+
+    it('honours the injected staleness threshold', async () => {
+        const exec = fakeExec({ list: [owned(name(0), true, OTHER)], clients: clients([name(0), NOW - 5]) });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ exec, opened, staleClientSeconds: 3 });
+
+        await provider.initialize();
+
+        expect(opened.map(targetSession)).toEqual([name(0)]);
+    });
+
+    it('treats an untagged (pre-upgrade) session held by an idle client as handed off', async () => {
+        const exec = fakeExec({ list: [row(name(0), true)], clients: clients([name(0), NOW - 500]) });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ exec, opened });
+
+        await provider.initialize();
+
+        expect(opened[0].shellArgs).toContain('-D');
+    });
+
+    it('only offers an idle foreign client under ask', async () => {
+        const exec = fakeExec({ list: [owned(name(0), true, OTHER)], clients: clients([name(0), NOW - 500]) });
+        const opened: LaunchOptions[] = [];
+        const offerTakeOver = vi.fn(async () => false);
+        const { provider } = makeProvider({ exec, opened, offerTakeOver, handOff: 'ask' });
+
+        await provider.initialize();
+        await flush();
+
+        expect(opened).toEqual([]);
+        expect(offerTakeOver).toHaveBeenCalledTimes(1);
+    });
+
+    it('neither takes nor offers under never', async () => {
+        const exec = fakeExec({ list: [owned(name(0), true, OTHER)], clients: clients([name(0), NOW - 500]) });
+        const opened: LaunchOptions[] = [];
+        const offerTakeOver = vi.fn(async () => true);
+        const { provider } = makeProvider({ exec, opened, offerTakeOver, handOff: 'never' });
+
+        await provider.initialize();
+        await flush();
+
+        expect(opened).toEqual([]);
+        expect(offerTakeOver).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ['list-clients rejects', (): Promise<ExecResult> => Promise.reject(new Error('channel'))],
+        ['list-clients exits non-zero', async (): Promise<ExecResult> => ({ stdout: '', stderr: 'boom', code: 1 })],
+        ['no remote clock', async (): Promise<ExecResult> => ({ stdout: `${name(0)} 1`, stderr: '', code: 0 })],
+    ])('reads every client as live when the evidence is missing (%s)', async (_label, answer) => {
+        const exec = vi.fn(async (command: string): Promise<ExecResult> => {
+            if (command.includes('list-sessions')) {
+                return { stdout: owned(name(0), true, OTHER), stderr: '', code: 0 };
+            }
+            if (command.includes('list-clients')) {
+                return answer();
+            }
+            return { stdout: '', stderr: '', code: 0 };
+        });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ exec, opened });
+
+        await provider.initialize();
+
+        expect(opened).toEqual([]);
+    });
+
+    it('skips the list-clients round-trip when no session is held by someone else', async () => {
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const exec = fakeExec({ list: [owned(name(0), true, ME), row(name(1), false)], existing: [name(0)] });
+        const { provider } = makeProvider({ state, exec });
+
+        await provider.initialize();
+
+        expect(exec.mock.calls.some(([command]) => command.includes('list-clients'))).toBe(false);
+    });
+
+    it('reclaims a session tagged with our id even when the mapping lost it', async () => {
+        const exec = fakeExec({ list: [owned(name(0), true, ME)], existing: [name(0)] });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ exec, opened });
+
+        await provider.initialize();
+
+        expect(opened.map(targetSession)).toEqual([name(0)]);
+        expect(opened[0].shellArgs).toContain('-D');
+        expect(provider.mappedSlots()).toEqual([0]);
+    });
+
+    it('tags every attach with this window\'s client id', async () => {
+        const { provider } = makeProvider();
+        const args = optionsOf(await provider.provideTerminalProfile()).shellArgs ?? [];
+        expect(args[args.indexOf('@orst_owner') + 1]).toBe(ME);
+    });
+
+    describe('the evicted side (another machine took our session)', () => {
+        /** Open slot 0, then close it for `reason` while the remote reports `after`. */
+        async function evict(reason: number, after: string) {
+            let closed = false;
+            const exec = vi.fn(async (command: string): Promise<ExecResult> => {
+                if (command.includes('list-sessions')) {
+                    return { stdout: closed ? after : '', stderr: '', code: 0 };
+                }
+                return { stdout: '', stderr: '', code: 0 };
+            });
+            const opened: LaunchOptions[] = [];
+            const made = makeProvider({ exec, opened });
+            const profile = await made.provider.provideTerminalProfile();
+            const term = { creationOptions: optionsOf(profile), exitStatus: { code: 0, reason } } as unknown as import('vscode').Terminal;
+            made.provider.handleTerminalOpened(term);
+            closed = true;
+            made.provider.handleTerminalClosed(term);
+            await flush();
+            await flush();
+            return { ...made, exec, opened };
+        }
+
+        // `-D` from the other machine detaches our client, which exits 0: VS Code reports a
+        // process exit. Killing would destroy the other machine's work; re-attaching would
+        // evict it right back (ping-pong).
+        it('keeps the session, forgets the slot, does not re-attach, logs one info line', async () => {
+            const { exec, opened, provider, log } = await evict(2, owned(name(0), true, OTHER));
+
+            expect(exec.mock.calls.some(([command]) => command.includes('kill-session'))).toBe(false);
+            expect(opened).toEqual([]);
+            expect(provider.mappedSlots()).toEqual([]);
+            const lines = log.info.mock.calls.map(c => String(c[0])).filter(line => /another machine/.test(line));
+            expect(lines).toHaveLength(1);
+        });
+
+        it('keeps the mapping when the shell simply exited (session gone)', async () => {
+            const { provider, log } = await evict(2, '');
+
+            expect(provider.mappedSlots()).toEqual([0]);
+            expect(log.info).not.toHaveBeenCalled();
+        });
+
+        it('does not probe on a window shutdown', async () => {
+            const { exec, provider } = await evict(1, owned(name(0), true, OTHER));
+
+            expect(exec.mock.calls.filter(([command]) => command.includes('list-sessions'))).toHaveLength(2); // the two at open
+            expect(provider.mappedSlots()).toEqual([0]);
+        });
+    });
+
+    describe('detachAll (window going away)', () => {
+        const detaches = (exec: ReturnType<typeof fakeExec>): string[] =>
+            exec.mock.calls.map(([command]) => command).filter(command => command.includes('detach-client'));
+
+        it('issues one owner-guarded detach per open slot, in one round-trip', async () => {
+            const exec = fakeExec();
+            const { provider } = makeProvider({ exec });
+            await provider.provideTerminalProfile(); // 0
+            await provider.provideTerminalProfile(); // 1
+
+            await provider.detachAll();
+
+            expect(detaches(exec)).toEqual([buildDetachClientsCommand([name(0), name(1)], ME)]);
+        });
+
+        it('also detaches slots whose terminals VS Code closed for the shutdown first', async () => {
+            const exec = fakeExec();
+            const { provider } = makeProvider({ exec });
+            const profile = await provider.provideTerminalProfile();
+            const term = { creationOptions: optionsOf(profile), exitStatus: { code: undefined, reason: 1 } } as unknown as import('vscode').Terminal;
+            provider.handleTerminalOpened(term);
+            provider.handleTerminalClosed(term);
+
+            await provider.detachAll();
+
+            expect(detaches(exec)).toEqual([buildDetachClientsCommand([name(0)], ME)]);
+        });
+
+        it('makes no round-trip when nothing is open', async () => {
+            const exec = fakeExec();
+            const { provider } = makeProvider({ exec });
+
+            await provider.detachAll();
+
+            expect(exec).not.toHaveBeenCalled();
+        });
+
+        it('never rejects', async () => {
+            let fail = false;
+            const exec = vi.fn(async (): Promise<ExecResult> => {
+                if (fail) {
+                    throw new Error('connection closed');
+                }
+                return { stdout: '', stderr: '', code: 0 };
+            });
+            const { provider } = makeProvider({ exec });
+            await provider.provideTerminalProfile();
+            fail = true;
+
+            await expect(provider.detachAll()).resolves.toBeUndefined();
+        });
     });
 });

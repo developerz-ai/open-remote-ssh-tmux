@@ -1,5 +1,6 @@
 import { createHash } from 'crypto';
 import { escapeShellArg } from '../common/shellQuote';
+import { isClientId } from './clientIdentity';
 
 // Re-exported for existing callers/tests that import `escapeShellArg` from
 // this module — the implementation now lives in `common/shellQuote.ts` so
@@ -42,6 +43,11 @@ export const TMUX_BIN = 'tmux';
  * (verified on the rig — every session on it is lost). */
 const SAVED_HISTORY_OPTION = '@orst_saved_hl';
 
+/** Session user option naming the client id (`clientIdentity.ts`) of the window that last
+ * attached — the ownership evidence `slotState.ts` decides hand-offs on. Session-scoped
+ * only, and never unset: `set-option -gu` on a user option crashes the tmux 2.6 server, and
+ * a session's own options die with it. Readable at 2.6 … 3.8 (verified on the rig). */
+const OWNER_OPTION = '@orst_owner';
 /** `escape-time` tmux shipped as its default before 3.5 (500 ms — Esc felt laggy in every
  * TUI) and the value 3.5 made the new default. Ours only replaces the old default. */
 const LEGACY_ESCAPE_TIME = '500';
@@ -136,6 +142,9 @@ export interface TmuxSession {
     readonly paneDead: boolean;
     /** `#{session_created}` — unix epoch seconds. */
     readonly createdEpoch: number;
+    /** `#{@orst_owner}` — the client id of the window that last attached, or `undefined` for
+     * a session that carries no tag (created before tags existed, or never attached by us). */
+    readonly owner?: string;
 }
 
 /** Per-session options applied at create time. */
@@ -157,6 +166,9 @@ export interface AttachOrCreateOptions {
     /** The probed tmux version; selects the chain variant via {@link tmuxFeatures}.
      * Unknown → the modern chain. */
     readonly tmuxVersion?: string;
+    /** This window's client id, written into the session as {@link OWNER_OPTION}. Must have
+     * {@link isClientId}'s shape — it is a tmux argv element, so anything else is refused. */
+    readonly owner?: string;
 }
 
 /** Inputs to the reap decision beyond the session itself. */
@@ -305,8 +317,12 @@ export function buildAttachOrCreateArgv(
     // — `status`/`history-limit` silently never applied. `=<name>:` (trailing colon =
     // exact session, empty/default window) is the form `set-option` actually accepts.
     const session = `=${name}:`;
+    // Right after the create, before anything later in the chain can fail: a session without
+    // our tag reads as "owner unknown" to every other machine, i.e. never ours to reclaim.
+    const tag = opts.owner === undefined ? [] : [';', 'set-option', '-t', session, OWNER_OPTION, checkedOwner(opts.owner)];
     return [
         ...head,
+        ...tag,
         ';', 'set-window-option', '-t', `=${name}`, 'remain-on-exit', 'off',
         ';', 'set-option', '-t', session, 'status', 'off',
         // On ≥ 3.7 this is what sizes the pane; before that it only covers windows created
@@ -373,7 +389,87 @@ export function buildAttachOrCreateArgv(
  */
 export function buildListSessions(tmuxPath = TMUX_BIN): string {
     return `${escapeShellArg(tmuxPath)} list-sessions -F `
-        + escapeShellArg('#{session_name} #{session_attached} #{session_windows} #{session_created} #{pane_dead}');
+        + escapeShellArg(`#{session_name} #{session_attached} #{session_windows} #{session_created} #{pane_dead} ${OWNER_FIELD}#{${OWNER_OPTION}}`);
+}
+
+/** Prefix of the owner field in a {@link buildListSessions} row. An untagged session prints
+ * just the prefix, so the field is always exactly one token and the numeric fields stay
+ * right-anchored behind it. */
+const OWNER_FIELD = 'o:';
+
+/** `owner`, or a thrown error when it is not a client id. A programming error, not input:
+ * the id is minted by `clientIdentity.ts`, and the check keeps a `;` or `#` out of tmux. */
+function checkedOwner(owner: string): string {
+    if (!isClientId(owner)) {
+        throw new Error(`not a client id: ${JSON.stringify(owner)}`);
+    }
+    return owner;
+}
+
+/** Tag on the remote-clock line of {@link buildListClientsCommand}. */
+const NOW_TAG = '__now';
+
+/**
+ * Every client on the server with its session and `#{client_activity}` (epoch seconds of its
+ * last keyboard/mouse input — output does not move it, verified on the rig), preceded by the
+ * remote's own clock so idleness is measured entirely on the remote. The exit status is
+ * `list-clients`'s, so "no server" classifies like any other tmux answer. Parse with
+ * {@link parseListClients}.
+ */
+export function buildListClientsCommand(tmuxPath = TMUX_BIN): string {
+    return `printf '${NOW_TAG} %s\\n' "$(date +%s)"; ${escapeShellArg(tmuxPath)} list-clients -F `
+        + escapeShellArg('#{client_session} #{client_activity}');
+}
+
+/** One attached client as {@link buildListClientsCommand} reports it. */
+export interface TmuxClient {
+    readonly session: string;
+    /** `#{client_activity}`, epoch seconds on the remote clock. */
+    readonly activity: number;
+}
+
+/** Read {@link buildListClientsCommand} output: the remote clock (`undefined` when its line is
+ * missing) and the clients. The epoch is the right-most token, so a session name with spaces
+ * survives; unrecognised lines are skipped. */
+export function parseListClients(stdout: string): { now: number | undefined; clients: TmuxClient[] } {
+    let now: number | undefined;
+    const clients: TmuxClient[] = [];
+    for (const rawLine of stdout.split('\n')) {
+        const tokens = rawLine.trim().split(/\s+/);
+        if (tokens.length < 2) {
+            continue;
+        }
+        const epoch = toNonNegativeInt(tokens[tokens.length - 1]);
+        if (epoch === undefined) {
+            continue;
+        }
+        if (tokens.length === 2 && tokens[0] === NOW_TAG) {
+            now = epoch;
+        } else {
+            clients.push({ session: tokens.slice(0, -1).join(' '), activity: epoch });
+        }
+    }
+    return { now, clients };
+}
+
+/**
+ * Detach this window's clients from `names`, for a window that is going away — so another
+ * machine finds the sessions free at once instead of waiting out VS Code's 3 h pty grace.
+ * Each detach is guarded by the owner tag still being `owner`: if another machine took the
+ * session over a moment ago, its client is the one on it now and `detach-client -s` would
+ * evict it. A shell test rather than `if-shell -F`, so the comparison is plain `[ = ]` on
+ * every tmux version. Errors are discarded: a session that is already gone is the goal.
+ */
+export function buildDetachClientsCommand(names: readonly string[], owner: string, tmuxPath = TMUX_BIN): string {
+    const id = escapeShellArg(checkedOwner(owner));
+    const tmux = escapeShellArg(tmuxPath);
+    return names
+        .map(name => {
+            const target = escapeShellArg(name);
+            return `[ "$(${tmux} display-message -p -t =${target}: '#{${OWNER_OPTION}}' 2>/dev/null)" = ${id} ] `
+                + `&& ${tmux} detach-client -s =${target} 2>/dev/null`;
+        })
+        .join('; ');
 }
 
 // `-t <name>` is prefix/fuzzy target matching in tmux — `has-session -t code-<h>-0`
@@ -489,6 +585,9 @@ export function parseListSessions(stdout: string): TmuxSession[] {
             continue;
         }
         const tokens = line.split(/\s+/);
+        // The owner field is optional on read: rows from before it existed (and test fixtures)
+        // carry five fields.
+        const ownerToken = tokens[tokens.length - 1].startsWith(OWNER_FIELD) ? tokens.pop()! : undefined;
         if (tokens.length < 5) {
             continue;
         }
@@ -506,6 +605,7 @@ export function parseListSessions(stdout: string): TmuxSession[] {
             windows,
             paneDead: paneDeadFlag > 0,
             createdEpoch,
+            owner: ownerToken === undefined || ownerToken === OWNER_FIELD ? undefined : ownerToken.slice(OWNER_FIELD.length),
         });
     }
     return sessions;

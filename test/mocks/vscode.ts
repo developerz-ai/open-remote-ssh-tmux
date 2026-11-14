@@ -7,6 +7,7 @@ export const version = '1.70.2';
 
 export const env = {
     appRoot: '/vscode/appRoot',
+    machineId: 'test-machine-id',
 };
 
 /**
@@ -128,7 +129,7 @@ class MockOutputChannel {
  * button label it wants the simulated user to click (or leaves it `undefined` to
  * model dismiss/cancel). Mirrors the real API returning the chosen item.
  */
-export const messageResponses: { warning: unknown } = { warning: undefined };
+export const messageResponses: { warning: unknown; information: unknown } = { warning: undefined, information: undefined };
 
 /** Messages surfaced via the `window.show*Message` APIs, recorded (message + items)
  * per call so a test can assert what — and whether — a dialog was shown. */
@@ -157,7 +158,7 @@ export const window = {
     },
     showInformationMessage(message: string, ...items: unknown[]): Promise<unknown> {
         shownMessages.information.push([message, ...items]);
-        return Promise.resolve(undefined);
+        return Promise.resolve(messageResponses.information);
     },
     showErrorMessage(message: string, ...items: unknown[]): Promise<unknown> {
         shownMessages.error.push([message, ...items]);

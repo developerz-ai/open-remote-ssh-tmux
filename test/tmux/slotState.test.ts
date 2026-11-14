@@ -1,113 +1,167 @@
 import { describe, expect, it } from 'vitest';
-import { decideSlotAction, describeSlot, type SlotInput } from '../../src/tmux/slotState';
+import {
+    decideSlotAction,
+    describeSlot,
+    isClientStale,
+    STALE_CLIENT_SECONDS,
+    toHandOffPolicy,
+    type HandOffPolicy,
+    type RemoteSlotState,
+    type SlotInput,
+    type SlotOwner,
+} from '../../src/tmux/slotState';
 
-// The slot lifecycle as ONE explicit decision, extracted from reconcile()'s inlined
-// conditionals. Every row below is a state this fork actually hits in the field; the
-// regression that forced this extraction is `reclaims a slot this client owns even when
-// it reports attached` — VS Code keeps a closed window's pty alive for
-// VSCODE_RECONNECTION_GRACE_TIME (3h by default), so the tmux client inside it stays
-// *attached* long after the window is gone. reconcile() read that `attached` flag as
-// "another machine holds this", refused to re-attach, and handed the user a brand-new
-// empty terminal while their real work (an htop, a Claude Code run) sat in an
-// unreachable session. Confirmed live: session `code-8282129a2247-0` running htop,
-// orphan client on /dev/pts/0 stale by 158s, user saw an empty shell.
+// The slot lifecycle as ONE explicit decision. Two field bugs shaped it:
+//  - VS Code keeps a closed window's pty alive for VSCODE_RECONNECTION_GRACE_TIME (3h), so
+//    our own tmux client stays *attached* long after the window is gone; reading that as
+//    "another machine" stranded the user's work (session `code-8282129a2247-0`, htop,
+//    orphan client stale by 158s).
+//  - The fix for that read "mapped" as "ours", which broke once a session moved machines:
+//    PC maps slot 0, laptop adopts it, PC reconnects and `-D`-evicts the laptop's LIVE
+//    terminal. Ownership now comes from the session's owner tag, not the local mapping.
 
 /** A slot with nothing going on — spread over with the case under test. */
-const BASE: SlotInput = { slot: 0, mapped: false, openHere: false, remote: undefined };
+const BASE: SlotInput = { slot: 0, mapped: false, openHere: false, remote: undefined, handOff: 'auto' };
 
-const live = (attached: boolean, windows = 1) => ({ attached, windows });
+const remote = (attached: boolean, owner: SlotOwner = 'unknown', stale = false, windows = 1): RemoteSlotState =>
+    ({ attached, windows, owner, stale });
 
-describe('decideSlotAction: the slot state machine', () => {
-    it('skips a slot already backing an open terminal in this window (no mirrored tab)', () => {
-        // Guards the re-resolve path: a reconnect re-runs reconcile over the same mapping.
-        const d = decideSlotAction({ ...BASE, mapped: true, openHere: true, remote: live(true) });
+describe('decideSlotAction: the slot state machine (03 table, one case per row)', () => {
+    // Row 1: openHere wins over everything.
+    it.each([
+        ['mapped, attached by us', { mapped: true, remote: remote(true, 'me') }],
+        ['unmapped, attached by another, stale', { mapped: false, remote: remote(true, 'other', true) }],
+        ['mapped, detached', { mapped: true, remote: remote(false) }],
+    ])('skips a slot already open in this window (%s)', (_label, over) => {
+        const d = decideSlotAction({ ...BASE, ...over, openHere: true });
         expect(d.action).toBe('skip');
         expect(d.reason).toMatch(/open/i);
     });
 
-    // There is deliberately no "the user closed this one" input any more. The old
-    // `tombstoned` flag made a user-closed slot skip BOTH restore and adoption while its
-    // tmux session kept running on the remote forever — an invisible, unreachable session,
-    // i.e. exactly the zombie this fork promises never to create. Observed in the field:
-    // `code-bcb9aa492263-2` alive with a shell in it, logged as
-    // `tombstoned=yes -> skip (user-closed)`, with no way for the user to ever see it again.
-    // An explicit close now KILLS the session (`handleTerminalClosed`), so by the time
-    // reconcile runs there is nothing left to skip and this decision has one less input.
-    it('restores a mapped detached session even if the user once closed its terminal', () => {
-        // Post-kill, a user-closed slot is either gone from the remote (-> caller prunes via
-        // has-session) or still live because the kill could not be delivered — in which case
-        // re-attaching is the only outcome that keeps the session reachable.
-        expect(decideSlotAction({ ...BASE, mapped: true, remote: live(false) }).action).toBe('restore');
+    // Row 2: not attached → restore (mapped) / adopt (unmapped), whatever the owner tag.
+    it.each<SlotOwner>(['me', 'other', 'unknown'])('restores a mapped detached session (owner %s)', owner => {
+        expect(decideSlotAction({ ...BASE, mapped: true, remote: remote(false, owner) }).action).toBe('restore');
     });
 
-    // Deliberately NOT 'prune'. `refreshRemote()` returns an empty list when the probe
-    // channel *fails*, so "absent from the snapshot" and "does not exist" are
-    // indistinguishable here. Pruning on absence would wipe every mapping on one network
-    // blip — the caller settles existence with a narrower `has-session` probe instead.
+    it.each<SlotOwner>(['me', 'other', 'unknown'])('adopts an unmapped detached session (owner %s)', owner => {
+        expect(decideSlotAction({ ...BASE, remote: remote(false, owner) }).action).toBe('adopt');
+    });
+
+    // Row 3: attached + owner me → our own zombie pty; mapped or not.
+    it.each([true, false])('reclaims a session our own client holds (mapped=%s)', mapped => {
+        const d = decideSlotAction({ ...BASE, mapped, remote: remote(true, 'me') });
+        expect(d.action).toBe('restore-takeover');
+        expect(d.forget).toBe(false);
+    });
+
+    // Row 4: attached + foreign owner + stale → hand-off take-over (auto).
+    it.each<SlotOwner>(['other', 'unknown'])('takes over an idle foreign client under auto (owner %s)', owner => {
+        const d = decideSlotAction({ ...BASE, remote: remote(true, owner, true) });
+        expect(d.action).toBe('handoff-takeover');
+        expect(d.forget).toBe(false);
+    });
+
+    // Row 5: attached + foreign owner + live → per policy.
+    it.each<[HandOffPolicy, string]>([
+        ['auto', 'offer'],
+        ['ask', 'offer'],
+        ['never', 'skip'],
+    ])('a live foreign client under %s → %s', (handOff, action) => {
+        expect(decideSlotAction({ ...BASE, handOff, remote: remote(true, 'other', false) }).action).toBe(action);
+    });
+
+    // THE REGRESSION: the laptop adopted PC's slot 0; PC's mapping still lists it. PC's
+    // reconnect must not evict the laptop's live client.
+    it('never takes over a mapped session a live client of another machine holds', () => {
+        const d = decideSlotAction({ ...BASE, mapped: true, remote: remote(true, 'other', false) });
+        expect(d.action).not.toBe('restore-takeover');
+        expect(d.action).not.toBe('handoff-takeover');
+        expect(d.action).toBe('offer');
+    });
+
+    it('treats a pre-tag (unknown owner) live session as foreign — never -D without proof', () => {
+        expect(decideSlotAction({ ...BASE, mapped: true, remote: remote(true, 'unknown', false) }).action).toBe('offer');
+    });
+
+    // The auto/ask distinction is real: ask never takes anything without a click.
+    it('offers (does not silently take) a stale foreign client under ask', () => {
+        expect(decideSlotAction({ ...BASE, handOff: 'ask', remote: remote(true, 'other', true) }).action).toBe('offer');
+    });
+
+    it('leaves even a stale foreign client alone under never', () => {
+        expect(decideSlotAction({ ...BASE, handOff: 'never', remote: remote(true, 'other', true) }).action).toBe('skip');
+    });
+
+    // Mapping hygiene: once the tag names another machine, our mapping entry is stale.
+    it.each<HandOffPolicy>(['auto', 'ask', 'never'])('forgets a mapped slot another machine now holds (%s)', handOff => {
+        expect(decideSlotAction({ ...BASE, handOff, mapped: true, remote: remote(true, 'other', false) }).forget).toBe(true);
+    });
+
+    it('does not forget a pre-tag session — it may well be ours from before the upgrade', () => {
+        expect(decideSlotAction({ ...BASE, mapped: true, remote: remote(true, 'unknown', false) }).forget).toBe(false);
+    });
+
     it('attempts restore (not prune) for a mapped slot missing from the snapshot', () => {
-        const d = decideSlotAction({ ...BASE, mapped: true, remote: undefined });
+        const d = decideSlotAction({ ...BASE, mapped: true });
         expect(d.action).toBe('restore');
         expect(d.reason).toMatch(/has-session/);
-    });
-
-    it('restores a mapped, live, detached session', () => {
-        expect(decideSlotAction({ ...BASE, mapped: true, remote: live(false) }).action).toBe('restore');
-    });
-
-    // THE REGRESSION. Ours + attached = our own zombie pty from a closed window, not a
-    // second machine — the mapping is client-local, so nothing another machine created
-    // can be in it. Reclaim with `-D` (verified on real tmux 3.4: evicts the stale client,
-    // attaches the new one, leaves the running process untouched).
-    it('reclaims a slot this client owns even when it reports attached', () => {
-        const d = decideSlotAction({ ...BASE, mapped: true, remote: live(true) });
-        expect(d.action).toBe('restore-takeover');
-        expect(d.reason).toMatch(/reclaim/i);
-    });
-
-    // The no-steal invariant, preserved exactly: an attached session we never mapped
-    // belongs to another machine. Touching it would mirror keystrokes into their terminal.
-    it('never touches an attached session this client does not own', () => {
-        const d = decideSlotAction({ ...BASE, mapped: false, remote: live(true) });
-        expect(d.action).toBe('skip');
-        expect(d.reason).toMatch(/another client|no steal/i);
-    });
-
-    it('adopts a detached orphan of this workspace (PC closed -> laptop takes over)', () => {
-        expect(decideSlotAction({ ...BASE, mapped: false, remote: live(false) }).action).toBe('adopt');
-    });
-
-    // No windows===0 special case: a zero-window session cannot appear in `list-sessions`
-    // because tmux destroys it (verified against real tmux 3.4 — `#{session_windows}` was
-    // never below 1 in any reproducible state). Adopting is the right answer for the input
-    // regardless, and a dead branch here would only re-import a predicate already proven
-    // unreachable once in the reap decision.
-    it('adopts a detached session regardless of window count (zero-window is unreachable)', () => {
-        expect(decideSlotAction({ ...BASE, mapped: false, remote: live(false, 0) }).action).toBe('adopt');
     });
 
     it('does nothing for an unmapped slot with no remote session', () => {
         expect(decideSlotAction(BASE).action).toBe('skip');
     });
 
-    // Precedence matters: openHere must win over ownership, because it is about THIS
-    // window's tabs — acting again on an already-open slot is what produced duplicate
-    // mirrored tabs on re-resolve.
-    it('orders precedence: open > ownership', () => {
-        expect(decideSlotAction({ ...BASE, mapped: true, openHere: true, remote: live(true) }).reason)
-            .toMatch(/open/i);
+    // No windows===0 special case: a zero-window session cannot appear in `list-sessions`.
+    it('adopts a detached session regardless of window count (zero-window is unreachable)', () => {
+        expect(decideSlotAction({ ...BASE, remote: remote(false, 'unknown', false, 0) }).action).toBe('adopt');
+    });
+});
+
+describe('isClientStale', () => {
+    const NOW = 1_800_000_000;
+
+    it('is stale when every client is idle past the threshold', () => {
+        expect(isClientStale([NOW - STALE_CLIENT_SECONDS, NOW - 500], NOW)).toBe(true);
+    });
+
+    it('is live when any client typed recently', () => {
+        expect(isClientStale([NOW - 500, NOW - 5], NOW)).toBe(false);
+    });
+
+    it('is never stale without evidence (no clients known)', () => {
+        expect(isClientStale([], NOW)).toBe(false);
+    });
+
+    it('takes an explicit threshold', () => {
+        expect(isClientStale([NOW - 3], NOW, 2)).toBe(true);
+        expect(isClientStale([NOW - 1], NOW, 2)).toBe(false);
+    });
+
+    it('defaults to two minutes', () => {
+        expect(STALE_CLIENT_SECONDS).toBe(120);
+    });
+});
+
+describe('toHandOffPolicy', () => {
+    it.each(['auto', 'ask', 'never'])('accepts %s', value => {
+        expect(toHandOffPolicy(value)).toBe(value);
+    });
+
+    it.each([undefined, '', 'yes', 1, null])('falls back to auto for %s', value => {
+        expect(toHandOffPolicy(value)).toBe('auto');
     });
 });
 
 describe('describeSlot: one greppable log line per slot', () => {
-    // Debuggability was the other half of this bug: the old log said only "slot 0 attached
-    // elsewhere", which stated a conclusion and hid every input that produced it. A log
-    // line has to carry the observed state, not just the verdict.
     it('reports the observed state and the resulting action', () => {
-        const line = describeSlot({ ...BASE, slot: 3, mapped: true, remote: live(true, 2) });
+        const line = describeSlot({ ...BASE, slot: 3, mapped: true, remote: remote(true, 'me', false, 2) });
         expect(line).toContain('slot 3');
         expect(line).toContain('mapped=yes');
         expect(line).toContain('attached=yes');
         expect(line).toContain('windows=2');
+        expect(line).toContain('owner=me');
+        expect(line).toContain('stale=no');
+        expect(line).toContain('handOff=auto');
         expect(line).toContain('restore-takeover');
     });
 

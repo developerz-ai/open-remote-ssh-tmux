@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { CLIPBOARD_PASTE_DEADLINE_MS, CLIPBOARD_SWEEP_DEADLINE_MS, clipboardExec, decideDefaultProfile, decideTmuxWiring, defaultProfileSettingKey, deriveTmuxSessionContext, idempotentResolveHandler, lazyExec, onceOnly, readTmuxSettings, reconcileDefaultTerminalProfile, TMUX_EXEC_DEADLINE_MS, TMUX_PROFILE_TITLE, tmuxExec } from '../src/extension';
+import { CLIPBOARD_PASTE_DEADLINE_MS, CLIPBOARD_SWEEP_DEADLINE_MS, clipboardExec, deactivate, decideDefaultProfile, DETACH_ON_CLOSE_DEADLINE_MS, detachBeforeExit, HAND_OFF_NOT_NOW, HAND_OFF_OFFER_MESSAGE, HAND_OFF_TAKE_OVER, offerHandOff, decideTmuxWiring, defaultProfileSettingKey, deriveTmuxSessionContext, idempotentResolveHandler, lazyExec, onceOnly, readTmuxSettings, reconcileDefaultTerminalProfile, TMUX_EXEC_DEADLINE_MS, TMUX_PROFILE_TITLE, tmuxExec } from '../src/extension';
 import { DeadlineError } from '../src/common/deadline';
 import { wrapWithExitCode } from '../src/tmux/remoteExec';
 import type { RemoteSSHResolver } from '../src/authResolver';
 import type Log from '../src/common/logger';
-import { ConfigurationTarget, configOverrides, inspectOverrides, TerminalProfile, updateCalls } from './mocks/vscode';
+import { ConfigurationTarget, configOverrides, inspectOverrides, messageResponses, shownMessages, TerminalProfile, updateCalls } from './mocks/vscode';
 import { FallbackTerminalProvider } from '../src/tmux/fallbackTerminalProvider';
 
 /** A no-op Log — the default-profile reconcile only calls `trace` on the (untaken) error path. */
@@ -168,6 +168,17 @@ describe('readTmuxSettings: the four remote.SSH.tmux.* settings are read', () =>
         expect(settings.historyLimit).toBe(50000);
         expect(settings.reapOnConnect).toBe(true);
         expect(settings.setDefaultProfile).toBe(true);
+        expect(settings.handOff).toBe('auto');
+    });
+
+    it.each(['auto', 'ask', 'never'])('reads remote.SSH.tmux.handOff=%s', (handOff) => {
+        configOverrides.set('remote.SSH.tmux.handOff', handOff);
+        expect(readTmuxSettings().handOff).toBe(handOff);
+    });
+
+    it('falls back to auto for an unrecognised handOff value', () => {
+        configOverrides.set('remote.SSH.tmux.handOff', 'sometimes');
+        expect(readTmuxSettings().handOff).toBe('auto');
     });
 
     it.each([false, true])('reads seeded values with setDefaultProfile=%s from the remote.SSH configuration section', (setDefaultProfile) => {
@@ -488,5 +499,46 @@ describe('FallbackTerminalProvider: graceful degradation when tmux is not wired'
     it('returns a fresh profile instance on every call (no shared/stale state)', () => {
         const provider = new FallbackTerminalProvider();
         expect(provider.provideTerminalProfile()).not.toBe(provider.provideTerminalProfile());
+    });
+});
+
+describe('hand-off UI and window close (03)', () => {
+    afterEach(() => {
+        vi.useRealTimers();
+        shownMessages.information.length = 0;
+        messageResponses.information = undefined;
+    });
+
+    // One non-modal notification, no tmux wording; only an explicit "Take over" counts.
+    it('offers with one plain-language notification and two buttons', async () => {
+        messageResponses.information = HAND_OFF_TAKE_OVER;
+
+        expect(await offerHandOff()).toBe(true);
+        expect(shownMessages.information).toEqual([[HAND_OFF_OFFER_MESSAGE, HAND_OFF_TAKE_OVER, HAND_OFF_NOT_NOW]]);
+        expect(HAND_OFF_OFFER_MESSAGE).not.toMatch(/tmux|session|detach/i);
+    });
+
+    it.each([HAND_OFF_NOT_NOW, undefined])('treats %j as not now', async (answer) => {
+        messageResponses.information = answer;
+        expect(await offerHandOff()).toBe(false);
+    });
+
+    it('bounds the detach on close and never rejects when it hangs', async () => {
+        vi.useFakeTimers();
+        const settled = detachBeforeExit(() => new Promise<void>(() => { /* half-dead link */ }));
+        vi.advanceTimersByTime(DETACH_ON_CLOSE_DEADLINE_MS);
+        await expect(settled).resolves.toBeUndefined();
+    });
+
+    it('never rejects when the detach fails', async () => {
+        await expect(detachBeforeExit(() => Promise.reject(new Error('closed')))).resolves.toBeUndefined();
+    });
+
+    it('keeps the close short', () => {
+        expect(DETACH_ON_CLOSE_DEADLINE_MS).toBeLessThanOrEqual(2000);
+    });
+
+    it('does nothing on deactivate when the tmux layer never wired', () => {
+        expect(deactivate()).toBeUndefined();
     });
 });
