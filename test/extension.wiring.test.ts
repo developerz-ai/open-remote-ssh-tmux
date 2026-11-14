@@ -1,5 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { decideDefaultProfile, decideTmuxWiring, defaultProfileSettingKey, deriveTmuxSessionContext, idempotentResolveHandler, lazyExec, onceOnly, readTmuxSettings, reconcileDefaultTerminalProfile, TMUX_PROFILE_TITLE } from '../src/extension';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { CLIPBOARD_PASTE_DEADLINE_MS, CLIPBOARD_SWEEP_DEADLINE_MS, clipboardExec, decideDefaultProfile, decideTmuxWiring, defaultProfileSettingKey, deriveTmuxSessionContext, idempotentResolveHandler, lazyExec, onceOnly, readTmuxSettings, reconcileDefaultTerminalProfile, TMUX_EXEC_DEADLINE_MS, TMUX_PROFILE_TITLE, tmuxExec } from '../src/extension';
+import { DeadlineError } from '../src/common/deadline';
+import { wrapWithExitCode } from '../src/tmux/remoteExec';
 import type { RemoteSSHResolver } from '../src/authResolver';
 import type Log from '../src/common/logger';
 import { ConfigurationTarget, configOverrides, inspectOverrides, TerminalProfile, updateCalls } from './mocks/vscode';
@@ -57,6 +59,32 @@ describe('lazyExec: post-reconnect exec targets the live connection', () => {
     it('rejects when no connection is live (provider/reaper degrade via never-throw paths)', async () => {
         const { resolver } = fakeResolver(undefined);
         await expect(lazyExec(resolver)('tmux ls')).rejects.toThrow();
+    });
+});
+
+describe('tmuxExec: every tmux-layer remote call is bounded and reports its exit code', () => {
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it('runs through the live connection with the exit-code marker, and parses it back', async () => {
+        const connection = { exec: vi.fn(async () => ({ stdout: 'row\n\n__rc=0\n', stderr: '' })) };
+        const { resolver } = fakeResolver(connection);
+
+        expect(await tmuxExec(resolver)('tmux ls')).toEqual({ stdout: 'row\n', stderr: '', code: 0 });
+        expect(connection.exec).toHaveBeenCalledWith(wrapWithExitCode('tmux ls'));
+    });
+
+    it('rejects with a DeadlineError after 8 s when the connection never answers', async () => {
+        vi.useFakeTimers();
+        const connection = { exec: vi.fn(() => new Promise(() => { /* half-dead link */ })) };
+        const { resolver } = fakeResolver(connection);
+
+        const pending = tmuxExec(resolver)('tmux ls');
+        const assertion = expect(pending).rejects.toBeInstanceOf(DeadlineError);
+        await vi.advanceTimersByTimeAsync(TMUX_EXEC_DEADLINE_MS);
+        await assertion;
+        expect(TMUX_EXEC_DEADLINE_MS).toBe(8000);
     });
 });
 
@@ -157,24 +185,69 @@ describe('readTmuxSettings: the four remote.SSH.tmux.* settings are read', () =>
 });
 
 describe('decideTmuxWiring: enabled setting × tmux availability', () => {
+    const AVAILABLE = { available: true } as const;
+    const MISSING = { available: false, reason: 'not-installed' } as const;
+    const UNREACHABLE = { available: false, reason: 'unreachable' } as const;
+
     it('off → skip, whether or not tmux is available', () => {
-        expect(decideTmuxWiring('off', true)).toBe('skip');
-        expect(decideTmuxWiring('off', false)).toBe('skip');
+        expect(decideTmuxWiring('off', AVAILABLE)).toBe('skip');
+        expect(decideTmuxWiring('off', MISSING)).toBe('skip');
+        expect(decideTmuxWiring('off', UNREACHABLE)).toBe('skip');
     });
 
     it('auto → wire when available, skip silently when not', () => {
-        expect(decideTmuxWiring('auto', true)).toBe('wire');
-        expect(decideTmuxWiring('auto', false)).toBe('skip');
+        expect(decideTmuxWiring('auto', AVAILABLE)).toBe('wire');
+        expect(decideTmuxWiring('auto', MISSING)).toBe('skip');
     });
 
     it('on → wire when available, require-error when not (the "fail if unavailable" contract)', () => {
-        expect(decideTmuxWiring('on', true)).toBe('wire');
-        expect(decideTmuxWiring('on', false)).toBe('require-error');
+        expect(decideTmuxWiring('on', AVAILABLE)).toBe('wire');
+        expect(decideTmuxWiring('on', MISSING)).toBe('require-error');
+        expect(decideTmuxWiring('on', { available: false, reason: 'too-old' })).toBe('require-error');
+        expect(decideTmuxWiring('on', undefined)).toBe('require-error');
+    });
+
+    // A probe that could not be asked (channel error, missed deadline) is not evidence that
+    // tmux is missing. Telling an `'on'` user to "install tmux" would be false — and would
+    // leak tmux wording for a transient condition. Plain shells this resolve, retry next.
+    it('unreachable → retry silently, never require-error, under on and auto alike', () => {
+        expect(decideTmuxWiring('on', UNREACHABLE)).toBe('retry');
+        expect(decideTmuxWiring('auto', UNREACHABLE)).toBe('retry');
     });
 
     it('an unknown value degrades to auto behaviour', () => {
-        expect(decideTmuxWiring('weird', true)).toBe('wire');
-        expect(decideTmuxWiring('weird', false)).toBe('skip');
+        expect(decideTmuxWiring('weird', AVAILABLE)).toBe('wire');
+        expect(decideTmuxWiring('weird', MISSING)).toBe('skip');
+    });
+});
+
+describe('clipboardExec: the image paste/sweep commands are deadline-bounded too', () => {
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it('passes the raw result through untouched (no exit-code wrapping for the clipboard)', async () => {
+        const connection = { exec: vi.fn(async () => ({ stdout: '/home/u\n', stderr: '' })) };
+        const { resolver } = fakeResolver(connection);
+
+        expect(await clipboardExec(resolver, CLIPBOARD_PASTE_DEADLINE_MS)('printf %s "$HOME"'))
+            .toEqual({ stdout: '/home/u\n', stderr: '' });
+        expect(connection.exec).toHaveBeenCalledWith('printf %s "$HOME"');
+    });
+
+    it.each([
+        ['paste', CLIPBOARD_PASTE_DEADLINE_MS, 60000],
+        ['sweep', CLIPBOARD_SWEEP_DEADLINE_MS, 15000],
+    ])('rejects with a DeadlineError once the %s deadline passes', async (_label, deadline, expected) => {
+        expect(deadline).toBe(expected);
+        vi.useFakeTimers();
+        const connection = { exec: vi.fn(() => new Promise(() => { /* half-dead link */ })) };
+        const { resolver } = fakeResolver(connection);
+
+        const pending = clipboardExec(resolver, deadline)('true');
+        const assertion = expect(pending).rejects.toBeInstanceOf(DeadlineError);
+        await vi.advanceTimersByTimeAsync(deadline);
+        await assertion;
     });
 });
 

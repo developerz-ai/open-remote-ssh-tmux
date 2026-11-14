@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from 'vitest';
-import { probeTmux } from '../../src/tmux/tmuxBootstrap';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { PROBE_DEADLINE_MS, probeTmux } from '../../src/tmux/tmuxBootstrap';
 
 // The capability probe is dependency-inverted: it takes an exec function (not an
 // `SSHConnection`), so the whole gate is unit-testable here with no ssh2. It
@@ -50,10 +50,6 @@ describe('probeTmux — not installed', () => {
         expect(await probeTmux(execWith('/usr/bin/tmux'))).toEqual({ available: false, reason: 'not-installed' });
     });
 
-    it('degrades to not-installed if the probe channel errors (never breaks the connect)', async () => {
-        const exec = vi.fn(async () => { throw new Error('channel closed'); });
-        expect(await probeTmux(exec)).toEqual({ available: false, reason: 'not-installed' });
-    });
 
     it('degrades (no throw) on a csh-style failure — error on stderr, empty stdout', async () => {
         // A csh/tcsh login shell that still choked on the probe: its complaint on
@@ -140,5 +136,45 @@ describe('probeTmux — platform gate', () => {
         const exec = execWith('tmux 3.2a');
         await probeTmux(exec, 'linux');
         expect(exec).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('probeTmux — unreachable (bounded, never breaks the connect)', () => {
+    // `probeTmux` is awaited inside the resolver's `resolve()`, so a probe that hangs on a
+    // half-dead channel would hang the base SSH connect with it. The deadline lives here,
+    // in the probe itself, so no caller can forget it.
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it('degrades to unreachable if the probe channel errors', async () => {
+        const exec = vi.fn(async () => { throw new Error('channel closed'); });
+        expect(await probeTmux(exec)).toEqual({ available: false, reason: 'unreachable' });
+    });
+
+    it('settles as unreachable (no throw) when the probe never answers', async () => {
+        vi.useFakeTimers();
+        const exec = vi.fn(() => new Promise<{ stdout: string; stderr: string }>(() => { /* hung */ }));
+
+        const result = probeTmux(exec);
+        await vi.advanceTimersByTimeAsync(PROBE_DEADLINE_MS);
+
+        await expect(result).resolves.toEqual({ available: false, reason: 'unreachable' });
+    });
+
+    it('does not give up before the deadline', async () => {
+        vi.useFakeTimers();
+        let answer!: (value: { stdout: string; stderr: string }) => void;
+        const exec = vi.fn(() => new Promise<{ stdout: string; stderr: string }>(res => { answer = res; }));
+
+        const result = probeTmux(exec);
+        await vi.advanceTimersByTimeAsync(PROBE_DEADLINE_MS - 1);
+        answer({ stdout: 'tmux 3.4', stderr: '' });
+
+        await expect(result).resolves.toEqual({ available: true, version: '3.4' });
+    });
+
+    it('uses a five-second deadline', () => {
+        expect(PROBE_DEADLINE_MS).toBe(5000);
     });
 });

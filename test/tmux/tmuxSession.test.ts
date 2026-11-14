@@ -2,11 +2,15 @@ import { describe, expect, it } from 'vitest';
 import {
     buildAttachOrCreateArgv,
     buildHasSession,
+    buildHasSessionsCommand,
     buildKillSession,
     buildListSessions,
+    classifyTmuxFailure,
     escapeShellArg,
     isOurSession,
+    parseHasSessions,
     parseListSessions,
+    readListSessionsResult,
     sessionName,
     sessionSlot,
     shouldReap,
@@ -109,6 +113,83 @@ describe('buildHasSession / buildKillSession', () => {
         // shell concatenates it onto the (still fully escaped) name.
         expect(buildHasSession(`code-${HASH_PROJ}-0`)).toBe(`tmux has-session -t ='code-${HASH_PROJ}-0'`);
         expect(buildKillSession(`code-${HASH_PROJ}-0`)).toBe(`tmux kill-session -t ='code-${HASH_PROJ}-0'`);
+    });
+});
+
+describe('buildHasSessionsCommand', () => {
+    // One remote round-trip for N names instead of N sequential `has-session`s (~400 ms
+    // each in the field). Each name gets its own exact `=name` probe, and its exit status
+    // and message come back on one tagged line so they can be classified per name.
+    const A = `code-${HASH_PROJ}-0`;
+    const B = `code-${HASH_PROJ}-1`;
+
+    it('probes every name with an exact-match target and tags each answer by index', () => {
+        expect(buildHasSessionsCommand([A, B])).toBe(
+            `r=$(tmux has-session -t ='${A}' 2>&1); printf '__has %s %s %s\\n' 0 "$?" "$r"; `
+            + `r=$(tmux has-session -t ='${B}' 2>&1); printf '__has %s %s %s\\n' 1 "$?" "$r"`,
+        );
+    });
+
+    it('reuses the single-name builder, so every name is escaped exactly like it', () => {
+        expect(buildHasSessionsCommand([A])).toContain(buildHasSession(A));
+    });
+
+    it('keeps a hostile name inert (quoted, never spliced as shell syntax)', () => {
+        const hostile = `x'; rm -rf ~; echo '`;
+        const command = buildHasSessionsCommand([hostile]);
+        expect(command).toContain(`=${escapeShellArg(hostile)}`);
+        expect(command).not.toContain(`='x'; rm`);
+    });
+
+    it('stays a single line (a csh login shell rejects newlines inside quotes)', () => {
+        expect(buildHasSessionsCommand([A, B])).not.toContain('\n');
+    });
+});
+
+describe('parseHasSessions', () => {
+    it('reads each tagged answer back by index', () => {
+        const stdout = `__has 0 0 \n__has 1 1 can't find session: x\n`;
+        expect(parseHasSessions(stdout, 2)).toEqual([
+            { code: 0, message: '' },
+            { code: 1, message: `can't find session: x` },
+        ]);
+    });
+
+    it('reports a name whose line never came back as code undefined', () => {
+        expect(parseHasSessions('__has 1 0 \n', 2)).toEqual([
+            { code: undefined, message: '' },
+            { code: 0, message: '' },
+        ]);
+    });
+
+    it('ignores banner noise and out-of-range indexes', () => {
+        const stdout = `Welcome!\n__has 7 0 \n__has 0 1 no server running on /tmp/tmux-1000/default\n`;
+        expect(parseHasSessions(stdout, 1)).toEqual([
+            { code: 1, message: 'no server running on /tmp/tmux-1000/default' },
+        ]);
+    });
+});
+
+describe('classifyTmuxFailure', () => {
+    // Prune/kill decisions hang on this: only a confirmed `absent` may ever drop a mapping.
+    // Anything we cannot positively read as "not there" is `unreachable` (keep, retry later).
+    it.each([
+        [`can't find session: code-abc-0`, 1, 'absent'],
+        [`can't find session code-abc-0`, 1, 'absent'],
+        [`session not found: code-abc-0`, 1, 'absent'],
+        ['no server running on /tmp/tmux-1000/default', 1, 'absent'],
+        // tmux 3.4 says this (verified) when the socket does not exist: no server, so absent.
+        ['error connecting to /tmp/tmux-1000/default (No such file or directory)', 1, 'absent'],
+        ['error connecting to /tmp/tmux-1000/default (Connection refused)', 1, 'absent'],
+        ['error connecting to /tmp/tmux-1000/default (Permission denied)', 1, 'unreachable'],
+        ['protocol version mismatch (client 8, server 7)', 1, 'incompatible'],
+        ['', 1, 'unreachable'],
+        ['sh: 1: tmux: not found', 127, 'unreachable'],
+        [`can't find session: x`, undefined, 'unreachable'],
+        ['', undefined, 'unreachable'],
+        ['', 0, 'present'],
+    ] as const)('%j (rc %s) -> %s', (stderr, code, expected) => {
+        expect(classifyTmuxFailure(stderr, code)).toBe(expected);
     });
 });
 
@@ -412,6 +493,27 @@ describe('parseListSessions', () => {
         expect(parseListSessions('my session 1 2 1700000000 0')).toEqual([
             { name: 'my session', attached: true, windows: 2, paneDead: false, createdEpoch: 1700000000 },
         ]);
+    });
+});
+
+describe('readListSessionsResult', () => {
+    const ROW = `code-${HASH_PROJ}-0 0 1 1700000000 0`;
+
+    it('parses a successful list', () => {
+        expect(readListSessionsResult({ stdout: ROW, stderr: '', code: 0 })).toHaveLength(1);
+    });
+
+    it('reads "no server running" (exit 1) as zero sessions — nothing to list is an answer', () => {
+        expect(readListSessionsResult({ stdout: '', stderr: 'no server running on /tmp/tmux-1000/default', code: 1 }))
+            .toEqual([]);
+    });
+
+    it.each([
+        ['tmux not runnable', { stdout: '', stderr: 'sh: 1: tmux: not found', code: 127 }],
+        ['exit status never came back', { stdout: ROW, stderr: '', code: undefined }],
+        ['client/server skew', { stdout: '', stderr: 'protocol version mismatch (client 8, server 7)', code: 1 }],
+    ])('returns undefined (could not list) when %s', (_label, result) => {
+        expect(readListSessionsResult(result)).toBeUndefined();
     });
 });
 

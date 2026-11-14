@@ -5,7 +5,10 @@ import SSHDestination from './ssh/sshDestination';
 import { KILL_WORKSPACE_SESSIONS_COMMAND_ID, killWorkspaceSessions, openSSHConfigFile, promptOpenRemoteSSHWindow, type WorkspaceKillTarget } from './commands';
 import { HostTreeDataProvider } from './hostTreeView';
 import { getRemoteWorkspaceLocationData, RemoteLocationHistory } from './remoteLocationHistory';
-import { TmuxTerminalProvider, type OpenTerminal, type RemoteExec } from './tmux/terminalProvider';
+import { TmuxTerminalProvider, type OpenTerminal } from './tmux/terminalProvider';
+import { createRemoteExec, type RawExec, type RemoteExec } from './tmux/remoteExec';
+import type { TmuxCapability } from './tmux/tmuxBootstrap';
+import { withDeadline } from './common/deadline';
 import { FallbackTerminalProvider } from './tmux/fallbackTerminalProvider';
 import { TerminalProfileRegistration } from './tmux/profileRegistration';
 import { pasteClipboardImage, sweepOldImages } from './clipboard/pasteImage';
@@ -57,7 +60,7 @@ export async function activate(context: vscode.ExtensionContext) {
     // remote window (no folder → no session context) and images uploaded fine while nothing
     // ever deleted them — the 48h retention promise quietly became "forever".
     const sweepImages = onceOnly(() => {
-        void sweepOldImages({ exec: lazyExec(remoteSSHResolver), log: logger });
+        void sweepOldImages({ exec: clipboardExec(remoteSSHResolver, CLIPBOARD_SWEEP_DEADLINE_MS), log: logger });
     });
     // `onResolveSuccessfullyCompleted` holds a single callback, so the two are composed here
     // rather than registered separately.
@@ -112,7 +115,7 @@ export async function activate(context: vscode.ExtensionContext) {
             logger.info('clipboard image: the remote is Windows — pasting as text');
         } else if (authority) {
             handled = await pasteClipboardImage({
-                exec: lazyExec(remoteSSHResolver),
+                exec: clipboardExec(remoteSSHResolver, CLIPBOARD_PASTE_DEADLINE_MS),
                 log: logger,
                 platform: process.platform,
                 authority,
@@ -162,7 +165,16 @@ function wireTmuxTerminalLayer(
         // tmux availability). `'off'` → skip; unavailable under `'on'` → user error;
         // unavailable under `'auto'` → silent skip; available (and not `'off'`) → wire.
         const capability = resolver.getTmuxCapability();
-        const decision = decideTmuxWiring(settings.enabled, capability?.available === true);
+        const decision = decideTmuxWiring(settings.enabled, capability);
+        if (decision === 'retry') {
+            // Transient: the probe could not reach the remote in time. Not wiring returns
+            // undefined, so idempotentResolveHandler re-wires on the next resolve (which
+            // probes again). The default-profile setting is deliberately left alone — the
+            // fallback provider answers it with a plain shell meanwhile, and clearing then
+            // re-writing the user's settings file over a blip would be pure churn.
+            logger.info('Persistent terminals: the remote did not answer the capability check — plain shells for now, retrying on reconnect');
+            return;
+        }
         if (decision === 'require-error') {
             // The one path that reaches the user: they required tmux but it isn't there.
             // Best-effort notification; the failed connection is already succeeded.
@@ -198,8 +210,9 @@ function wireTmuxTerminalLayer(
         // exec resolves the resolver's *current* SSH connection at call time (see
         // lazyExec) — never captured — so a reconnect's fresh connection is picked up
         // automatically and post-reconnect terminals/reaper hit the live channel
-        // instead of the dead pre-reconnect one (headline #3).
-        const exec = lazyExec(resolver);
+        // instead of the dead pre-reconnect one (headline #3). Deadline-bounded, so a
+        // half-dead link can never leave "New Terminal" or the reaper waiting forever.
+        const exec = tmuxExec(resolver);
         const openTerminal: OpenTerminal = (options) => vscode.window.createTerminal(options);
 
         const terminalProvider = new TmuxTerminalProvider({
@@ -385,14 +398,15 @@ export function idempotentResolveHandler(wire: () => TmuxTerminalLayer | undefin
 }
 
 /**
- * A {@link RemoteExec} bound to the resolver's *current* SSH connection, resolved
+ * A {@link RawExec} bound to the resolver's *current* SSH connection, resolved
  * at call time rather than captured at wire time. On a reconnect the resolver swaps
  * in a fresh `SSHConnection`; a captured connection would pin every terminal and the
  * reaper to the dead pre-reconnect channel — the "post-reconnect terminals fail"
  * headline bug. Rejects when no connection is live so the provider/reaper degrade via
- * their existing never-throw probe paths (a failed exec reads as "saw nothing").
+ * their never-throw probe paths (a failed exec reads as "could not ask", never as "absent").
+ * Raw (no deadline, no exit code): the tmux layer uses it through {@link tmuxExec}.
  */
-export function lazyExec(resolver: RemoteSSHResolver): RemoteExec {
+export function lazyExec(resolver: RemoteSSHResolver): RawExec {
     return async (command: string) => {
         const connection = resolver.getSSHConnection();
         if (!connection) {
@@ -400,6 +414,42 @@ export function lazyExec(resolver: RemoteSSHResolver): RemoteExec {
         }
         return connection.exec(command);
     };
+}
+
+/** Deadline for each tmux list/has/kill round-trip. Generous next to the ~400 ms a
+ * round-trip takes in the field, short enough that a dead link degrades a new terminal to a
+ * plain shell in seconds. (The capability probe has its own, `PROBE_DEADLINE_MS`, enforced
+ * inside `probeTmux` because the resolver awaits it.) */
+export const TMUX_EXEC_DEADLINE_MS = 8000;
+
+/**
+ * The tmux layer's {@link RemoteExec}: {@link lazyExec} (current connection per call) with an
+ * exit-code marker and {@link TMUX_EXEC_DEADLINE_MS} per call. Shared by the terminal
+ * provider, the connect-time reaper and the kill command, so none of them can await a remote
+ * command without a deadline.
+ */
+export function tmuxExec(resolver: RemoteSSHResolver): RemoteExec {
+    return createRemoteExec(lazyExec(resolver), TMUX_EXEC_DEADLINE_MS);
+}
+
+/** Per-command deadline for the clipboard image paste's remote commands (home lookup,
+ * private-directory create). Generous: the user is waiting on an image upload over a link
+ * that may be slow, and a missed deadline turns into a visible "could not paste" error. */
+export const CLIPBOARD_PASTE_DEADLINE_MS = 60000;
+
+/** Per-command deadline for the connect-time image sweep — background housekeeping, so it
+ * gives up sooner; a missed sweep is retried on the next window. */
+export const CLIPBOARD_SWEEP_DEADLINE_MS = 15000;
+
+/**
+ * {@link lazyExec} with a deadline per call, for the clipboard bridge. Raw shape kept (no
+ * exit-code wrapping): `src/clipboard/*` parses plain stdout/stderr and is independent of
+ * the tmux layer. Only the remote commands are bounded here; the image bytes themselves go
+ * through `workspace.fs`, which the clipboard module owns.
+ */
+export function clipboardExec(resolver: RemoteSSHResolver, deadlineMs: number): RawExec {
+    const exec = lazyExec(resolver);
+    return (command: string) => withDeadline(exec(command), deadlineMs, 'the remote command');
 }
 
 /**
@@ -442,9 +492,10 @@ export function readTmuxSettings(): TmuxSettings {
 }
 
 /** What {@link decideTmuxWiring} resolves the (enabled × availability) matrix to:
- * `'wire'` (register the tmux layer), `'skip'` (do nothing; base SSH unaffected), or
- * `'require-error'` (user required tmux via `'on'` but it is unavailable → notify). */
-export type TmuxWiringDecision = 'wire' | 'skip' | 'require-error';
+ * `'wire'` (register the tmux layer), `'skip'` (do nothing; base SSH unaffected),
+ * `'require-error'` (user required tmux via `'on'` but it is unavailable → notify), or
+ * `'retry'` (the probe could not be asked → plain shells this resolve, try again next). */
+export type TmuxWiringDecision = 'wire' | 'skip' | 'require-error' | 'retry';
 
 /**
  * The pure enablement rule for the tmux terminal layer, from `remote.SSH.tmux.enabled`
@@ -452,15 +503,24 @@ export type TmuxWiringDecision = 'wire' | 'skip' | 'require-error';
  *  - `'off'` → always `'skip'` (feature disabled);
  *  - available → `'wire'`;
  *  - unavailable + `'on'` → `'require-error'` (the "fail if unavailable" contract);
- *  - unavailable otherwise (`'auto'` / unknown) → `'skip'` (silent graceful degrade).
+ *  - unavailable otherwise (`'auto'` / unknown) → `'skip'` (silent graceful degrade);
+ *  - probe `unreachable` (channel error / missed deadline) → `'retry'` under any non-off
+ *    setting. That says nothing about whether tmux is installed, so even `'on'` must not
+ *    tell the user to install it — the next resolve probes again.
  * Pure + exported so the matrix is unit-tested without the VS Code terminal surface.
  */
-export function decideTmuxWiring(enabled: string, tmuxAvailable: boolean): TmuxWiringDecision {
+export function decideTmuxWiring(
+    enabled: string,
+    capability: Pick<TmuxCapability, 'available' | 'reason'> | undefined,
+): TmuxWiringDecision {
     if (enabled === 'off') {
         return 'skip';
     }
-    if (tmuxAvailable) {
+    if (capability?.available) {
         return 'wire';
+    }
+    if (capability?.reason === 'unreachable') {
+        return 'retry';
     }
     return enabled === 'on' ? 'require-error' : 'skip';
 }
@@ -637,20 +697,19 @@ function currentTmuxSessionContext(): { hostKey: string; workspaceKey: string } 
 }
 
 /**
- * Build the kill command's target from live resolver state: the current SSH
- * connection's `exec` wrapped in a fresh {@link SessionReaper}, plus the
+ * Build the kill command's target from live resolver state: a fresh {@link SessionReaper}
+ * over {@link tmuxExec} (deadline-bounded, exit-code-reporting), plus the
  * (host, workspace) identity. Returns `undefined` when there is no connection or no
  * resolved remote SSH workspace folder, so the command no-ops safely instead of
  * throwing. Wiring only — the reaper owns all tmux/session logic.
  */
 function resolveKillTarget(resolver: RemoteSSHResolver, logger: Log): WorkspaceKillTarget | undefined {
-    const sshConnection = resolver.getSSHConnection();
     const context = currentTmuxSessionContext();
-    if (!sshConnection || !context) {
+    if (!resolver.getSSHConnection() || !context) {
         return undefined;
     }
     const reaper = new SessionReaper({
-        exec: async (command: string) => sshConnection.exec(command),
+        exec: tmuxExec(resolver),
         now: () => Math.floor(Date.now() / 1000),
         log: logger,
     });
