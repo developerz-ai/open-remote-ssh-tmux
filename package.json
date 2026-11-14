@@ -1,7 +1,7 @@
 {
 	"name": "open-remote-ssh-tmux",
 	"displayName": "Open Remote - SSH (tmux)",
-	"description": "Use any remote machine with a SSH server as your development environment.",
+	"description": "Remote development over SSH with tmux-backed persistent terminals that survive disconnects and follow you between machines.",
 	"version": "1.4.0",
 	"publisher": "developerz-ai",
 	"license": "MIT",
@@ -567,9 +567,13 @@
 		"undici": "7.30.1"
 	},
 	"keywords": [
+		"persistent terminal",
 		"remote",
 		"remote development",
-		"ssh"
+		"ssh",
+		"terminal",
+		"tmux",
+		"vscodium"
 	],
 	"api": "none",
 	"enabledApiProposals": [

@@ -1,10 +1,18 @@
 # Open Remote - SSH (tmux)
 
+[![CI](https://github.com/developerz-ai/open-remote-ssh-tmux/actions/workflows/ci-main.yml/badge.svg?branch=main)](https://github.com/developerz-ai/open-remote-ssh-tmux/actions/workflows/ci-main.yml)
+[![Release](https://img.shields.io/github/v/release/developerz-ai/open-remote-ssh-tmux?sort=semver)](https://github.com/developerz-ai/open-remote-ssh-tmux/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/developerz-ai/open-remote-ssh-tmux)](LICENSE.txt)
+[![VS Code / VSCodium](https://img.shields.io/badge/VS%20Code%20%2F%20VSCodium-%E2%89%A51.90-007ACC)](#requirements)
+[![tmux tested](https://img.shields.io/badge/tmux%20tested-2.6%20%7C%203.0a%20%7C%203.4%20%7C%203.5a%20%7C%203.8-1BB91F)](test/rig/)
+[![AI-maintained](https://img.shields.io/badge/AI--maintained-agents%20write%2C%20humans%20review-8A2BE2)](#ai-maintained)
+
 A VS Code / VSCodium extension that connects to a remote dev machine over
-SSH — **identical to [open-remote-ssh](https://github.com/jeanp413/open-remote-ssh)
-in look and feel** — with one under-the-hood upgrade: **remote terminals are
-backed by [tmux](https://github.com/tmux/tmux)**, so they persist and can be
-re-attached from any machine.
+SSH — a fork of [open-remote-ssh](https://github.com/jeanp413/open-remote-ssh)
+with the same connect flow — plus one under-the-hood upgrade: **remote terminals
+are backed by [tmux](https://github.com/tmux/tmux)**, so they persist and can be
+re-attached from any machine. Connecting is a little smarter too: it reuses an
+empty local window instead of leaving a blank one behind (see [Connecting](#connecting)).
 
 ![Open Remote SSH](https://raw.githubusercontent.com/jeanp413/open-remote-ssh/master/docs/images/open-remote-ssh.gif)
 
@@ -230,6 +238,27 @@ was deliberately left out — see
 - **Use one window per workspace per machine.** Two windows of the same machine on
   the same folder share one record of their terminals and can take them from each
   other.
+
+## AI-maintained
+
+This repository is **AI-first**: coding agents write essentially all of the code,
+and humans set direction and review. That only works because the guard rails are
+mechanical, not trust-based:
+
+- **Unit TDD** — every change lands with a failing test first (`npm test`, ~1300 cases).
+- **Real tmux, real SSH** — `npm run test:tmux` runs the integration suite against
+  tmux 2.6, 3.0a, 3.4, 3.5a and 3.8 in docker on every pull request.
+- **Real editor** — `test/rig/edh/` drives a real VSCodium over SSH (Xvfb + xdotool in
+  docker) through the acceptance matrix: persistence, hand-off between machines, no
+  zombie sessions, reconnect storms, listener audit.
+- **Hard gates** — strict TypeScript, zero-warning typed lint, coverage ratchet,
+  Windows/macOS unit jobs, and a publish job that refuses a tag that doesn't match the
+  version or didn't pass build + test + lint.
+- **Written intent** — the *why* lives in [`docs/idea/`](docs/idea/README.md), the
+  agent playbook in [`CLAUDE.md`](CLAUDE.md), and each body of work as a plan with
+  results under [`docs/plans/`](docs/plans/).
+
+See [`docs/idea/ai-first.md`](docs/idea/ai-first.md) for the full stance.
 
 ## Security
 
