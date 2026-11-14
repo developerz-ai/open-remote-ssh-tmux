@@ -8,14 +8,14 @@ import { closeWorkspaceSessions, KILL_WORKSPACE_SESSIONS_COMMAND_ID, killWorkspa
 import { HostTreeDataProvider } from './hostTreeView';
 import { getRemoteWorkspaceLocationData, RemoteLocationHistory } from './remoteLocationHistory';
 import { TmuxTerminalProvider, type OpenTerminal, type TmuxSessionContext } from './tmux/terminalProvider';
-import { createRemoteExec, type RawExec, type RemoteExec } from './tmux/remoteExec';
+import { createCloseWatch, createRemoteExec, type RawExec, type RemoteExec } from './tmux/remoteExec';
 import { probeLifetimeRisk, type LifetimeFacts, type TmuxCapability } from './tmux/tmuxBootstrap';
 import { withDeadline } from './common/deadline';
 import { FallbackTerminalProvider } from './tmux/fallbackTerminalProvider';
 import { TerminalProfileRegistration } from './tmux/profileRegistration';
 import { pasteClipboardImage, sweepOldImages } from './clipboard/pasteImage';
 import { SessionReaper } from './tmux/sessionReaper';
-import { canonicalHostKey, canonicalWorkspaceKey, clampHistoryLimit, DEFAULT_ORPHAN_MAX_AGE_DAYS, type SshTarget } from './tmux/tmuxSession';
+import { buildCloseWatchCommand, canonicalHostKey, canonicalWorkspaceKey, clampHistoryLimit, DEFAULT_ORPHAN_MAX_AGE_DAYS, type SshTarget } from './tmux/tmuxSession';
 import { resolveClientId } from './tmux/clientIdentity';
 import { toHandOffPolicy, type HandOffPolicy } from './tmux/slotState';
 import { decideSettingsChange } from './tmux/settingsWatcher';
@@ -55,8 +55,15 @@ export async function activate(context: vscode.ExtensionContext) {
     // only refreshes it thereafter: re-swapping the terminal profile provider per reconnect
     // would needlessly churn the registration and orphan the live one. Settings and folder
     // changes rewire or unwire it at runtime (`watchTmuxLayerInputs`).
+    // One close watch per SSH connection for the life of this window, however often the layer
+    // is rebuilt on that connection (see `createCloseWatch`).
+    const watchClose = createCloseWatch({
+        current: () => remoteSSHResolver.getSSHConnection(),
+        run: (connection, command) => connection.exec(command),
+        log: logger,
+    });
     const layers = new TmuxLayerController(
-        () => wireTmuxTerminalLayer(context, remoteSSHResolver, profileRegistration, logger)
+        () => wireTmuxTerminalLayer(context, remoteSSHResolver, profileRegistration, logger, watchClose)
     );
     // Released before the registration it swaps the fallback back into.
     context.subscriptions.push({ dispose: () => layers.unwire() });
@@ -69,7 +76,7 @@ export async function activate(context: vscode.ExtensionContext) {
         readSettings: readTmuxSettings,
         connected: () => remoteSSHResolver.getSSHConnection() !== undefined,
         currentIdentity: () => currentTmuxIdentity(logger),
-        clearDefaultProfile: () => reconcileDefaultTerminalProfile(logger, false, remoteSSHResolver.getRemotePlatform()),
+        clearDefaultProfile: () => void reconcileDefaultTerminalProfile(logger, false, remoteSSHResolver.getRemotePlatform()),
         offerCleanup: identity => offerBackgroundCleanup(identity, {
             reaper: newReaper(remoteSSHResolver, logger),
             ask: (message, ...items) => vscode.window.showInformationMessage(message, ...items),
@@ -172,7 +179,8 @@ async function wireTmuxTerminalLayer(
     context: vscode.ExtensionContext,
     resolver: RemoteSSHResolver,
     profileRegistration: TerminalProfileRegistration,
-    logger: Log
+    logger: Log,
+    watchClose: (command: string) => void,
 ): Promise<TmuxTerminalLayer | undefined> {
     // Disposables this attempt has registered but not yet handed to the layer. Declared
     // out here so the catch can roll them back — see where it is filled below for why a
@@ -209,14 +217,14 @@ async function wireTmuxTerminalLayer(
             // Not wiring → remove any stale tmux default we wrote on a prior (tmux-capable)
             // connect, so "New Terminal" falls back to the base shell instead of a profile
             // we never registered.
-            reconcileDefaultTerminalProfile(logger, false, resolver.getRemotePlatform());
+            void reconcileDefaultTerminalProfile(logger, false, resolver.getRemotePlatform());
             return undefined;
         }
         if (decision !== 'wire' || !capability?.available) {
             // `'skip'` (disabled, or unavailable under `'auto'`). The `!capability?.available`
             // clause is redundant given `decision === 'wire'` implies availability — it is
             // there only to re-narrow `capability` to non-undefined for the compiler below.
-            reconcileDefaultTerminalProfile(logger, false, resolver.getRemotePlatform()); // clean up a stale tmux default, as above
+            void reconcileDefaultTerminalProfile(logger, false, resolver.getRemotePlatform()); // clean up a stale tmux default, as above
             return undefined;
         }
 
@@ -228,7 +236,7 @@ async function wireTmuxTerminalLayer(
             // window, or a non-ssh-remote folder) — there is no stable host+workspace
             // identity, so wire nothing rather than fabricate one. Still reconcile the
             // default toward cleanup, since we are not wiring the layer here.
-            reconcileDefaultTerminalProfile(logger, false, resolver.getRemotePlatform());
+            void reconcileDefaultTerminalProfile(logger, false, resolver.getRemotePlatform());
             return undefined;
         }
 
@@ -239,6 +247,9 @@ async function wireTmuxTerminalLayer(
         // never leave "New Terminal" waiting forever.
         const exec = tmuxExec(resolver);
         const openTerminal: OpenTerminal = (options) => vscode.window.createTerminal(options);
+        // Who this window is on the remote: a hash of the machine id plus a per-window
+        // nonce (never the raw machineId), tagged onto every session it attaches.
+        const clientId = resolveClientId(vscode.env.machineId, context.workspaceState);
 
         const provider = new TmuxTerminalProvider({
             ctx: identity,
@@ -259,9 +270,7 @@ async function wireTmuxTerminalLayer(
             // Scrollback lines for new sessions (remote.SSH.tmux.historyLimit); the
             // provider caps its `new-session` history buffer to this.
             historyLimit: settings.historyLimit,
-            // Who this window is on the remote: a hash of the machine id plus a per-window
-            // nonce (never the raw machineId), tagged onto every session it attaches.
-            clientId: resolveClientId(vscode.env.machineId, context.workspaceState),
+            clientId,
             handOff: settings.handOff,
             offerTakeOver: offerHandOff,
         });
@@ -314,15 +323,23 @@ async function wireTmuxTerminalLayer(
         // a default at ANY scope (a Workspace write silently overrides a User/Remote one).
         // The mirror case (not wiring → remove a stale write of ours) is reconciled on the
         // skip returns above, so the default never points at an unregistered profile.
-        reconcileDefaultTerminalProfile(logger, true, resolver.getRemotePlatform());
+        //
+        // Awaited (bounded, never rejects) before the layer counts as wired: the write lands in
+        // the remote's settings file seconds after it is issued, and a terminal opened in that
+        // gap on a first connect was a plain shell — "wired" was logged ~2 s too early (EDH
+        // row 01b). The provider is already registered above, so the moment VS Code sees the
+        // default, it is ours that answers.
+        await reconcileDefaultTerminalProfile(logger, true, resolver.getRemotePlatform());
 
         // Every fallible step is behind us, so this attempt is the one that keeps the
         // listeners: they now belong to the layer, released by its `dispose`.
         const listeners = wired.splice(0);
-        // A closing window detaches its tmux clients (see `deactivate`), so another machine
-        // can take the sessions at once instead of waiting out VS Code's 3 h pty grace.
-        const detach = (): Promise<void> => provider.detachAll();
-        detachOnClose = detach;
+        // A closing window cannot detach its tmux clients itself (VS Code kills this
+        // extension host within milliseconds); the close watch makes the remote notice the
+        // connection drop instead, so another machine can take the sessions at once rather
+        // than wait out VS Code's 3 h pty grace. One per connection: a reconnect starts its own.
+        const closeWatchCommand = buildCloseWatchCommand(clientId, capability.path);
+        watchClose(closeWatchCommand);
 
         // Advisory and off the connect path: does this host end the terminals at logout?
         if (!lifetimeChecked.has(identity.hostKey)) {
@@ -345,6 +362,7 @@ async function wireTmuxTerminalLayer(
             // its queue open waiting to be claimed — see `initialize`. The provider and its
             // lazy `exec` survive the reconnect, so nothing is re-registered.
             refresh: () => {
+                watchClose(closeWatchCommand);
                 provider.initialize({ awaitRevive: false })
                     .catch((err) => logger.trace(`Tmux provider refresh failed: ${errorMessage(err)}`));
             },
@@ -352,7 +370,7 @@ async function wireTmuxTerminalLayer(
                 provider.configure({ historyLimit: next.historyLimit, handOff: next.handOff });
                 provider.initialize({ awaitRevive: false })
                     .catch((err) => logger.trace(`Tmux provider reconfigure failed: ${errorMessage(err)}`));
-                reconcileDefaultTerminalProfile(logger, true, resolver.getRemotePlatform());
+                void reconcileDefaultTerminalProfile(logger, true, resolver.getRemotePlatform());
             },
             protectedSessions: async () => {
                 await provider.initialized.catch(() => undefined);
@@ -360,9 +378,6 @@ async function wireTmuxTerminalLayer(
             },
             dispose: () => {
                 provider.dispose();
-                if (detachOnClose === detach) {
-                    detachOnClose = undefined;
-                }
                 profileRegistration.use(new FallbackTerminalProvider());
                 disposeAll(listeners);
             },
@@ -413,21 +428,6 @@ function newReaper(resolver: RemoteSSHResolver, logger: Log, orphanMaxAgeDays?: 
         tmuxPath: resolver.getTmuxCapability()?.path,
         orphanMaxAgeDays,
     });
-}
-
-/** The wired provider's {@link TmuxTerminalProvider.detachAll}, for {@link deactivate}. One
- * per extension host (= per window); unset until the tmux layer has wired. */
-let detachOnClose: (() => Promise<void>) | undefined;
-
-/** How long a closing window waits for its tmux clients to detach. Short: VS Code is holding
- * the window open for it, and a detach that misses it is covered by the other machine's
- * staleness rule (`slotState.ts`) a couple of minutes later. */
-export const DETACH_ON_CLOSE_DEADLINE_MS = 1500;
-
-/** Run `detach` for at most `ms`, never rejecting — a window close must never fail or hang
- * on a remote command. */
-export function detachBeforeExit(detach: () => Promise<void>, ms = DETACH_ON_CLOSE_DEADLINE_MS): Promise<void> {
-    return withDeadline(detach(), ms, 'detach on close').catch(() => undefined);
 }
 
 /** Text of the take-over offer: one non-modal notification, no tmux wording. */
@@ -977,29 +977,33 @@ export function decideDefaultProfile(inspected: DefaultProfileScopes | undefined
  * User/Global or the remote's own ~/.tmux.conf. Best-effort: a failure here must not break the
  * (already-succeeded) connection, so it only logs.
  */
-export function reconcileDefaultTerminalProfile(logger: Log, wiring: boolean, remotePlatform?: string): void {
+export function reconcileDefaultTerminalProfile(logger: Log, wiring: boolean, remotePlatform?: string): Promise<void> {
     const terminalConfig = vscode.workspace.getConfiguration('terminal.integrated');
     const key = defaultProfileSettingKey(remotePlatform);
     const inspected = terminalConfig.inspect<string>(key);
     const action = decideDefaultProfile(inspected, wiring);
     if (action === 'none') {
-        return;
+        return Promise.resolve();
     }
     // Opting out blocks only the WRITE. A `'clear'` must still run, otherwise turning the
     // setting off would strand a previous write of ours in the user's repo pointing at a
     // profile we may no longer register — the opposite of what opting out is asking for.
     if (action === 'set' && !readTmuxSettings().setDefaultProfile) {
         logger.trace('Skipping default terminal profile write (remote.SSH.tmux.setDefaultProfile is false)');
-        return;
+        return Promise.resolve();
     }
     const value = action === 'set' ? TMUX_PROFILE_TITLE : undefined;
-    terminalConfig
-        .update(key, value, vscode.ConfigurationTarget.Workspace)
-        .then(
-            undefined,
-            (err: unknown) => logger.trace(`Could not ${action} default tmux terminal profile: ${err instanceof Error ? err.message : String(err)}`)
-        );
+    const write = Promise.resolve(terminalConfig.update(key, value, vscode.ConfigurationTarget.Workspace));
+    return withDeadline(write, DEFAULT_PROFILE_WRITE_DEADLINE_MS, 'the default terminal profile write').then(
+        undefined,
+        (err: unknown) => logger.trace(`Could not ${action} default tmux terminal profile: ${errorMessage(err)}`)
+    );
 }
+
+/** How long wiring waits for the default-profile write to land ({@link reconcileDefaultTerminalProfile}).
+ * The write goes to the remote's settings file, so a hung remote must not hold the layer
+ * unwired: past this the layer wires anyway and the write lands whenever it does. */
+export const DEFAULT_PROFILE_WRITE_DEADLINE_MS = 5000;
 
 /** The minimal slice of a `vscode.Uri` {@link deriveTmuxSessionContext} reads — the
  * workspace folder's scheme, resolved authority, and remote path. `vscode.Uri` is
@@ -1122,9 +1126,10 @@ async function resolveKillTarget(resolver: RemoteSSHResolver, logger: Log, layer
     return identity ? { reaper: newReaper(resolver, logger), identities: workspaceIdentities(identity) } : undefined;
 }
 
-/** Window closing (or reloading): detach this window's tmux clients, bounded by
- * {@link DETACH_ON_CLOSE_DEADLINE_MS}. VS Code awaits the returned promise before disposing
- * `context.subscriptions`, so the SSH connection is still up while this runs. */
-export function deactivate(): Promise<void> | undefined {
-    return detachOnClose ? detachBeforeExit(detachOnClose) : undefined;
+/** Nothing to do: a closing window's terminals are the close watch's business
+ * (`createCloseWatch`, `tmux/remoteExec.ts`). A remote call from here would not land —
+ * VS Code kills the extension host ~4 ms after asking it to terminate, and disposes
+ * `context.subscriptions` (the SSH connection among them) without waiting for this. */
+export function deactivate(): void {
+    // intentionally empty
 }

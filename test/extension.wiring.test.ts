@@ -1,12 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { backgroundTerminalsMessage, canonicalTmuxIdentity, CLIPBOARD_PASTE_DEADLINE_MS, CLIPBOARD_SWEEP_DEADLINE_MS, clipboardExec, CLOSE_BACKGROUND_TERMINALS, deactivate, decideDefaultProfile, DETACH_ON_CLOSE_DEADLINE_MS, detachBeforeExit, HAND_OFF_NOT_NOW, HAND_OFF_OFFER_MESSAGE, HAND_OFF_TAKE_OVER, KEEP_BACKGROUND_TERMINALS, LIFETIME_DOCS_URL, LIFETIME_LEARN_MORE, LIFETIME_WARNING_MESSAGE, maybeWarnTerminalLifetime, offerBackgroundCleanup, offerHandOff, decideTmuxWiring, defaultProfileSettingKey, deriveTmuxSessionContext, lazyExec, onceOnly, readTmuxSettings, reconcileDefaultTerminalProfile, resolveSshTarget, TMUX_EXEC_DEADLINE_MS, TMUX_PROFILE_TITLE, TmuxLayerController, tmuxExec, watchTmuxLayerInputs, type TmuxSettings, type TmuxTerminalLayer } from '../src/extension';
+import { backgroundTerminalsMessage, canonicalTmuxIdentity, CLIPBOARD_PASTE_DEADLINE_MS, CLIPBOARD_SWEEP_DEADLINE_MS, clipboardExec, CLOSE_BACKGROUND_TERMINALS, deactivate, decideDefaultProfile, DEFAULT_PROFILE_WRITE_DEADLINE_MS, HAND_OFF_NOT_NOW, HAND_OFF_OFFER_MESSAGE, HAND_OFF_TAKE_OVER, KEEP_BACKGROUND_TERMINALS, LIFETIME_DOCS_URL, LIFETIME_LEARN_MORE, LIFETIME_WARNING_MESSAGE, maybeWarnTerminalLifetime, offerBackgroundCleanup, offerHandOff, decideTmuxWiring, defaultProfileSettingKey, deriveTmuxSessionContext, lazyExec, onceOnly, readTmuxSettings, reconcileDefaultTerminalProfile, resolveSshTarget, TMUX_EXEC_DEADLINE_MS, TMUX_PROFILE_TITLE, TmuxLayerController, tmuxExec, watchTmuxLayerInputs, type TmuxSettings, type TmuxTerminalLayer } from '../src/extension';
 import SSHDestination from '../src/ssh/sshDestination';
 import type { TmuxSessionContext } from '../src/tmux/terminalProvider';
 import { DeadlineError } from '../src/common/deadline';
 import { wrapWithExitCode } from '../src/tmux/remoteExec';
 import type { RemoteSSHResolver } from '../src/authResolver';
 import type Log from '../src/common/logger';
-import { ConfigurationTarget, configOverrides, inspectOverrides, messageResponses, shownMessages, TerminalProfile, updateCalls } from './mocks/vscode';
+import { ConfigurationTarget, configOverrides, inspectOverrides, messageResponses, shownMessages, TerminalProfile, updateCalls, updateControl } from './mocks/vscode';
 import { FallbackTerminalProvider } from '../src/tmux/fallbackTerminalProvider';
 
 /** A no-op Log — the default-profile reconcile only calls `trace` on the (untaken) error path. */
@@ -801,6 +801,54 @@ describe('reconcileDefaultTerminalProfile: applies the decision to Workspace sco
         reconcileDefaultTerminalProfile(noopLog, false);
         expect(updateCalls).toHaveLength(0);
     });
+
+    // Bug B: "wired" was logged ~2 s before this write reached the remote settings file, and a
+    // terminal opened in between was a plain shell. The wiring now waits for it, so the write
+    // must say when it has landed.
+    describe('settles when the write has landed (bug B)', () => {
+        afterEach(() => {
+            updateControl.result = undefined;
+            vi.useRealTimers();
+        });
+
+        it('resolves only once the Workspace write has landed', async () => {
+            let land!: () => void;
+            updateControl.result = () => new Promise<void>(resolve => {
+                land = resolve;
+            });
+            let settled = false;
+            const done = reconcileDefaultTerminalProfile(noopLog, true).then(() => { settled = true; });
+            await new Promise(res => setTimeout(res, 0));
+            expect(settled).toBe(false);
+
+            land();
+            await done;
+            expect(settled).toBe(true);
+        });
+
+        it('resolves at once when there is nothing to write', async () => {
+            inspectOverrides.set(DEFAULT_PROFILE_ID, { workspaceValue: 'zsh' });
+            await expect(reconcileDefaultTerminalProfile(noopLog, true)).resolves.toBeUndefined();
+        });
+
+        it('never rejects when the write fails, and says why in the log', async () => {
+            updateControl.result = () => Promise.reject(new Error('no workspace'));
+            const log = { trace: vi.fn() } as unknown as Log;
+            await expect(reconcileDefaultTerminalProfile(log, true)).resolves.toBeUndefined();
+            expect((log.trace as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain('no workspace');
+        });
+
+        it('stops waiting for a write that never lands (a hung remote must not hold the wiring)', async () => {
+            vi.useFakeTimers();
+            updateControl.result = () => new Promise<void>(() => { /* never lands */ });
+            let settled = false;
+            void reconcileDefaultTerminalProfile(noopLog, true).then(() => { settled = true; });
+
+            await vi.advanceTimersByTimeAsync(DEFAULT_PROFILE_WRITE_DEADLINE_MS);
+
+            expect(settled).toBe(true);
+        });
+    });
 });
 
 // When tmux is unavailable or disabled, the "Persistent Shell" profile should still be
@@ -880,22 +928,10 @@ describe('hand-off UI and window close (03)', () => {
         expect(await offerHandOff()).toBe(false);
     });
 
-    it('bounds the detach on close and never rejects when it hangs', async () => {
-        vi.useFakeTimers();
-        const settled = detachBeforeExit(() => new Promise<void>(() => { /* half-dead link */ }));
-        vi.advanceTimersByTime(DETACH_ON_CLOSE_DEADLINE_MS);
-        await expect(settled).resolves.toBeUndefined();
-    });
-
-    it('never rejects when the detach fails', async () => {
-        await expect(detachBeforeExit(() => Promise.reject(new Error('closed')))).resolves.toBeUndefined();
-    });
-
-    it('keeps the close short', () => {
-        expect(DETACH_ON_CLOSE_DEADLINE_MS).toBeLessThanOrEqual(2000);
-    });
-
-    it('does nothing on deactivate when the tmux layer never wired', () => {
+    // A closing window cannot reach the remote from here: VS Code kills the extension host
+    // ~4 ms after "terminate" (EDH bug A). The remote learns of the close from the connection
+    // dropping (the close watch), so deactivate has nothing to send.
+    it('sends nothing on deactivate', () => {
         expect(deactivate()).toBeUndefined();
     });
 });

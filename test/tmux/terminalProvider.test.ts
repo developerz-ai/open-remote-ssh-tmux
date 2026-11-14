@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { REVIVE_DEADLINE_MS, REVIVE_GRACE_MS, REVIVE_QUIET_MS, SLOT_MAPPING_STATE_KEY, TmuxTerminalProvider } from '../../src/tmux/terminalProvider';
+import { REVIVE_DEADLINE_MS, REVIVE_GRACE_MS, REVIVE_QUIET_MS, SLOT_MAPPING_STATE_KEY, TmuxTerminalProvider, UNREACHABLE_RETRY_MS } from '../../src/tmux/terminalProvider';
 import { createRemoteExec } from '../../src/tmux/remoteExec';
-import { buildAttachOrCreateArgv, buildDetachClientsCommand, buildKillSession, buildRenameSession, sessionName } from '../../src/tmux/tmuxSession';
+import { buildAttachOrCreateArgv, buildClearClosedCommand, buildKillSession, buildRenameSession, sessionName } from '../../src/tmux/tmuxSession';
 
 // The terminal provider is the user-facing heart of the fork: it decides which
 // tmux session (slot) each VS Code terminal maps to. Both hard invariants live
@@ -968,7 +968,11 @@ describe('a remote that never answers (deadline-bounded)', () => {
         await vi.advanceTimersByTimeAsync(DEADLINE_MS);
         expect(optionsOf(await first)).toEqual({});
 
+        // Right after a failure the remote is not asked again (bug D: one deadline, not one
+        // per call); once it has had time to recover, the next terminal asks and gets slot 0.
         alive = true;
+        expect(optionsOf(await provider.provideTerminalProfile())).toEqual({});
+        await vi.advanceTimersByTimeAsync(UNREACHABLE_RETRY_MS);
         const second = provider.provideTerminalProfile();
         await vi.advanceTimersByTimeAsync(0);
         expect(targetSession(optionsOf(await second))).toBe(name(0));
@@ -2008,57 +2012,183 @@ describe('hand-off ownership (03: owner tag, staleness, offer)', () => {
         });
     });
 
-    describe('detachAll (window going away)', () => {
-        const detaches = (exec: ReturnType<typeof fakeExec>): string[] =>
-            exec.mock.calls.map(([command]) => command).filter(command => command.includes('detach-client'));
+    // Bug A. A window that closes cannot detach its tmux clients (VS Code kills the
+    // extension host within milliseconds); what reaches the remote instead is its connection
+    // dropping, on which the close watch marks the sessions it owned (`buildCloseWatchCommand`).
+    describe('a window that went away (close marker)', () => {
+        const closedBy = (client: string, at: number): string => ` c:${client}:${at}`;
 
-        it('issues one owner-guarded detach per open slot, in one round-trip', async () => {
-            const exec = fakeExec();
-            const { provider } = makeProvider({ exec });
-            await provider.provideTerminalProfile(); // 0
-            await provider.provideTerminalProfile(); // 1
+        it('takes the session over at once, without asking, when its owner\'s window closed', async () => {
+            // Typed 5 s ago — live by the idle rule — but the window it typed into is gone.
+            const exec = fakeExec({ list: [owned(name(0), true, OTHER) + closedBy(OTHER, NOW - 2)], clients: clients([name(0), NOW - 5]) });
+            const opened: LaunchOptions[] = [];
+            const offerTakeOver = vi.fn(async () => true);
+            const { provider } = makeProvider({ exec, opened, offerTakeOver });
 
-            await provider.detachAll();
+            await provider.initialize();
+            await flush();
 
-            expect(detaches(exec)).toEqual([buildDetachClientsCommand([name(0), name(1)], ME)]);
+            expect(opened.map(targetSession)).toEqual([name(0)]);
+            expect(opened[0].shellArgs).toContain('-D');
+            expect(offerTakeOver).not.toHaveBeenCalled();
         });
 
-        it('also detaches slots whose terminals VS Code closed for the shutdown first', async () => {
+        // The marker is about the window that left it. Once another machine has taken the
+        // session over, the client on it is that machine's, and live.
+        it('ignores a marker left by a previous owner', async () => {
+            const THIRD = '0badc0de-12345678';
+            const exec = fakeExec({ list: [owned(name(0), true, OTHER) + closedBy(THIRD, NOW - 2)], clients: clients([name(0), NOW - 5]) });
+            const opened: LaunchOptions[] = [];
+            const offerTakeOver = vi.fn(async () => false);
+            const { provider } = makeProvider({ exec, opened, offerTakeOver });
+
+            await provider.initialize();
+            await flush();
+
+            expect(opened).toEqual([]);
+            expect(offerTakeOver).toHaveBeenCalledTimes(1);
+        });
+
+        // Input after the close means the owner came back (a reload): never take it.
+        it('ignores a marker the owner has typed past', async () => {
+            const exec = fakeExec({ list: [owned(name(0), true, OTHER) + closedBy(OTHER, NOW - 10)], clients: clients([name(0), NOW - 5]) });
+            const opened: LaunchOptions[] = [];
+            const { provider } = makeProvider({ exec, opened, offerTakeOver: async () => false });
+
+            await provider.initialize();
+            await flush();
+
+            expect(opened).toEqual([]);
+        });
+
+        // A reload drops the connection too, so the watch marks this window's own sessions
+        // on the way out. The reloaded window is the same client: the marker is withdrawn on
+        // its first reconcile, so no other machine reads a live window as gone.
+        it('withdraws its own markers on reconcile, in one round-trip', async () => {
+            const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0), '1': name(1) } });
+            const exec = fakeExec({
+                list: [owned(name(0), true, ME) + closedBy(ME, NOW - 2), owned(name(1), false, ME) + closedBy(ME, NOW - 2), owned(name(2), true, OTHER) + closedBy(OTHER, NOW)],
+                existing: [name(0), name(1)],
+                clients: clients([name(2), NOW - 5]),
+            });
+            const { provider } = makeProvider({ state, exec, offerTakeOver: async () => false });
+
+            await provider.initialize();
+            await flush();
+
+            const clears = exec.mock.calls.map(([command]) => command).filter(command => command.includes('set-option'));
+            expect(clears).toEqual([buildClearClosedCommand([name(0), name(1)])]);
+        });
+
+        it('makes no extra round-trip when no marker names it', async () => {
+            const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+            const exec = fakeExec({ list: [owned(name(0), true, ME)], existing: [name(0)] });
+            const { provider } = makeProvider({ state, exec });
+
+            await provider.initialize();
+
+            expect(exec.mock.calls.some(([command]) => command.includes('set-option'))).toBe(false);
+        });
+
+        // Nothing is sent at close time any more: the window's own requests cannot outrun
+        // VS Code killing the extension host, so a close is the watch's business alone.
+        it('sends nothing to the remote when its terminals close for a window shutdown', async () => {
             const exec = fakeExec();
             const { provider } = makeProvider({ exec });
             const profile = await provider.provideTerminalProfile();
             const term = { creationOptions: optionsOf(profile), exitStatus: { code: undefined, reason: 1 } } as unknown as import('vscode').Terminal;
             provider.handleTerminalOpened(term);
+            const before = exec.mock.calls.length;
+
             provider.handleTerminalClosed(term);
+            await flush();
 
-            await provider.detachAll();
+            expect(exec.mock.calls.length).toBe(before);
+        });
+    });
 
-            expect(detaches(exec)).toEqual([buildDetachClientsCommand([name(0)], ME)]);
+    // Bug C. One vscode-server serves both machines, and it keeps each workspace's terminal
+    // layout. The machine that went away left its terminal in that layout with its pty still
+    // running; the window that takes over relaunches it — and with our profile as the default,
+    // VS Code relaunches it by asking this provider for a profile (EDH row 23: "new slot 1"
+    // 1.7 s after the take-over, no key pressed). That request IS the taken-over terminal.
+    describe('a take-over waits for VS Code to relaunch the other machine\'s terminal', () => {
+        it('hands the relaunch the taken-over session instead of minting a new one', async () => {
+            const exec = fakeExec({ list: [owned(name(0), true, OTHER)], clients: clients([name(0), NOW - 500]) });
+            const opened: LaunchOptions[] = [];
+            const { provider } = makeProvider({ exec, opened, reviveGraceMs: 20, reviveDeadlineMs: 2000, reviveQuietMs: 20 });
+
+            const init = provider.initialize();
+            await new Promise(res => setTimeout(res, 60)); // the relaunch lands after the grace
+            const relaunched = optionsOf(await provider.provideTerminalProfile());
+            await init;
+
+            expect(targetSession(relaunched)).toBe(name(0));
+            expect(relaunched.shellArgs).toContain('-D');
+            expect(opened).toEqual([]);
         });
 
-        it('makes no round-trip when nothing is open', async () => {
-            const exec = fakeExec();
-            const { provider } = makeProvider({ exec });
+        it('still opens it itself when no relaunch comes', async () => {
+            const exec = fakeExec({ list: [owned(name(0), true, OTHER)], clients: clients([name(0), NOW - 500]) });
+            const opened: LaunchOptions[] = [];
+            const { provider } = makeProvider({ exec, opened, reviveGraceMs: 5, reviveDeadlineMs: 40 });
 
-            await provider.detachAll();
+            await provider.initialize();
 
-            expect(exec).not.toHaveBeenCalled();
+            expect(opened.map(targetSession)).toEqual([name(0)]);
+            expect(opened[0].shellArgs).toContain('-D');
         });
+    });
+});
 
-        it('never rejects', async () => {
-            let fail = false;
-            const exec = vi.fn(async (): Promise<ExecResult> => {
-                if (fail) {
-                    throw new Error('connection closed');
-                }
-                return { stdout: '', stderr: '', code: 0 };
-            });
-            const { provider } = makeProvider({ exec });
-            await provider.provideTerminalProfile();
-            fail = true;
+// Bug D. Every remote call is bounded by one deadline, but a reconcile against a hung remote
+// used to make three of them in a row (legacy list, list, has-session) and New Terminal waited
+// behind all three and then made a fourth: a plain shell after 32 s (EDH row 24).
+describe('a hung remote costs one deadline, not one per call', () => {
+    const DEADLINE_MS = 8000;
+    const LEGACY = { hostKey: 'myvps', workspaceKey: '/home/user/proj/' };
+    const ctx = { hostKey: HOST, workspaceKey: WS, cwd: CWD, legacy: LEGACY };
+    const hung = () => createRemoteExec(() => new Promise(() => { /* never settles */ }), DEADLINE_MS);
 
-            await expect(provider.detachAll()).resolves.toBeUndefined();
-        });
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it('a reconcile gives up after the first deadline, keeping every mapping', async () => {
+        vi.useFakeTimers();
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const { provider } = makeProvider({ ctx, state, rawExec: hung() });
+
+        let settled = false;
+        void provider.initialize().then(() => { settled = true; });
+        await vi.advanceTimersByTimeAsync(DEADLINE_MS + 100);
+
+        expect(settled).toBe(true);
+        expect(provider.mappedSlots()).toEqual([0]);
+    });
+
+    it('New Terminal during that reconcile is a plain shell after one deadline', async () => {
+        vi.useFakeTimers();
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const { provider, log } = makeProvider({ ctx, state, rawExec: hung() });
+
+        void provider.initialize();
+        let answer: LaunchOptions | undefined;
+        void provider.provideTerminalProfile().then(profile => { answer = optionsOf(profile); });
+        await vi.advanceTimersByTimeAsync(DEADLINE_MS + 100);
+
+        expect(answer).toEqual({});
+        expect(log.info.mock.calls.some(([line]) => /did not answer in time/.test(String(line)))).toBe(true);
+    });
+
+    it('lists the remote once per reconcile when there is nothing legacy to rename', async () => {
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const exec = fakeExec({ list: [row(name(0), false)], existing: [name(0)] });
+        const { provider } = makeProvider({ ctx, state, exec });
+
+        await provider.initialize({ awaitRevive: false });
+
+        expect(exec.mock.calls.filter(([command]) => command.includes('list-sessions'))).toHaveLength(1);
     });
 });
 

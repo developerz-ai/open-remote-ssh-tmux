@@ -1,0 +1,26 @@
+{
+	"security.workspace.trust.enabled": false,
+	"workbench.startupEditor": "none",
+	"workbench.tips.enabled": false,
+	"workbench.welcomePage.walkthroughs.openOnInstall": false,
+	"update.mode": "none",
+	"extensions.autoUpdate": false,
+	"extensions.autoCheckUpdates": false,
+	"telemetry.telemetryLevel": "off",
+	"git.enabled": false,
+	"window.restoreWindows": "none",
+	"window.confirmBeforeClose": "never",
+	"terminal.integrated.confirmOnExit": "never",
+	"terminal.integrated.confirmOnKill": "never",
+	"terminal.integrated.showExitAlert": false,
+	"terminal.integrated.commandsToSkipShell": [
+		"workbench.action.reloadWindow",
+		"workbench.action.closeWindow",
+		"workbench.action.terminal.new",
+		"workbench.action.terminal.kill",
+		"-workbench.action.toggleSidebarVisibility"
+	],
+	"remote.SSH.remotePlatform": {
+		"edh-remote": "linux"
+	}
+}

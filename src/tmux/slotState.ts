@@ -55,13 +55,26 @@ export type SlotOwner = 'me' | 'other' | 'unknown';
 export const STALE_CLIENT_SECONDS = 120;
 
 /**
- * True iff every client on the session has been idle for at least `thresholdSeconds`.
- * `activities` are those clients' `#{client_activity}` epochs and `now` the remote's clock
- * (both remote-side, so the two machines' clock skew never enters). No clients known → not
- * stale: absent evidence must never license `-D`.
+ * True iff every client on the session is abandoned: idle for at least `thresholdSeconds`, or
+ * — when the owner's window has closed (`closedAt`, its close marker, see
+ * `buildCloseWatchCommand`) — given no input since that close. `activities` are those clients'
+ * `#{client_activity}` epochs; `now` and `closedAt` are the remote's clock too, so the two
+ * machines' clock skew never enters. No clients known → not stale: absent evidence must never
+ * license `-D`.
+ *
+ * The close half is what makes a clean hand-off immediate. The closed window's client lingers
+ * in VS Code's pty host for hours, and its last keystroke may be seconds old — live by the idle
+ * rule. But nobody can have typed into it since its window went away, so input after the
+ * marker can only mean the window came back (a reload, a reconnect), and then it is live.
  */
-export function isClientStale(activities: readonly number[], now: number, thresholdSeconds = STALE_CLIENT_SECONDS): boolean {
-    return activities.length > 0 && activities.every(activity => now - activity >= thresholdSeconds);
+export function isClientStale(
+    activities: readonly number[],
+    now: number,
+    thresholdSeconds = STALE_CLIENT_SECONDS,
+    closedAt?: number,
+): boolean {
+    return activities.length > 0 && activities.every(activity =>
+        now - activity >= thresholdSeconds || (closedAt !== undefined && activity <= closedAt));
 }
 
 /** What the remote reports about a slot's session right now, or `undefined` when the
@@ -74,8 +87,9 @@ export interface RemoteSlotState {
     readonly windows: number;
     /** Who the `@orst_owner` tag names. */
     readonly owner: SlotOwner;
-    /** Every client on the session is idle past {@link STALE_CLIENT_SECONDS}. Only gathered
-     * for a session held by someone else; `false` whenever it could not be measured. */
+    /** Every client on the session is abandoned ({@link isClientStale}: idle past
+     * {@link STALE_CLIENT_SECONDS}, or untouched since its window closed). Only gathered for a
+     * session held by someone else; `false` whenever it could not be measured. */
     readonly stale: boolean;
 }
 

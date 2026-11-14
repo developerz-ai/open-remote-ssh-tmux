@@ -66,3 +66,52 @@ export function createRemoteExec(raw: RawExec, deadlineMs: number): RemoteExec {
         return { ...parseExitCode(stdout), stderr };
     };
 }
+
+// The close watch (bug A of the 2026-11-14 EDH run) — the one remote command the layer leaves
+// RUNNING. A window that closes cannot tell the remote so itself: VS Code kills the extension
+// host ~4 ms after "terminate", which no round-trip outruns, and disposes the extension's
+// subscriptions — the SSH connection among them — without waiting for `deactivate`. Meanwhile
+// VS Code's pty host keeps the window's tmux clients alive for its reconnection grace (3 h),
+// so another machine found every session still held: a take-over offer, or two minutes of
+// waiting, where a hand-off was meant to be instant.
+//
+// What does reach the remote, every time, is the connection dropping. The watch command
+// (`buildCloseWatchCommand`) waits for exactly that and then marks this window's sessions as
+// closed; `createCloseWatch` only makes sure each connection carries one. It is started on
+// every resolve (a reconnect brings a new connection) and needs no stopping: it ends with the
+// connection it watches.
+
+/** What the watch needs, injected so this is testable without ssh2 (D in SOLID). */
+export interface CloseWatchDeps<C extends object> {
+    /** The SSH connection this window is on right now; `undefined` between connections. */
+    current(): C | undefined;
+    /** Run `command` on `connection`. Settles when its channel closes — for the watch, when
+     * the connection is gone. */
+    run(connection: C, command: string): Promise<unknown>;
+    readonly log: { trace(message: string): void };
+}
+
+/**
+ * Returns `ensure(command)`: start the watch `command` (`buildCloseWatchCommand`) on the
+ * current connection unless that connection already carries one. Create it once per window,
+ * so a layer rebuilt on the same connection (a settings or folder change) does not start a
+ * second. Never throws — a watch that cannot start costs only the fallback (the other machine
+ * waits out the idle threshold), never the connect.
+ */
+export function createCloseWatch<C extends object>(deps: CloseWatchDeps<C>): (command: string) => void {
+    const watched = new WeakSet<C>();
+    return (command: string) => {
+        const connection = deps.current();
+        if (connection === undefined || watched.has(connection)) {
+            return;
+        }
+        watched.add(connection);
+        const failed = (err: unknown): void =>
+            deps.log.trace(`Persistent terminals: close watch failed: ${err instanceof Error ? err.message : String(err)}`);
+        try {
+            deps.run(connection, command).catch(failed);
+        } catch (err) {
+            failed(err);
+        }
+    };
+}
