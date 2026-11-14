@@ -1,10 +1,14 @@
-## Unreleased
+## 1.3.0
 
 Hardening sweep (plan `101-bulletproof-hardening-sweep`): every change below was proven against real tmux 2.6, 3.0a, 3.4, 3.5a and 3.8 over real SSH in the new docker rig, not only in unit tests.
 
 **Requirements**
 
 - **build: VS Code / VSCodium 1.90 or newer is required** (was 1.70.2) (#67). The bundled code needs Node 20, and 1.90 is the first release whose extension host runs it
+
+**Known limitation**
+
+- On **tmux 3.8**, Esc reaches the program ~0.5 s late in persistent terminals: tmux 3.8 waits for an answer to its pixel-size query that VS Code's terminal never sends ([tmux #5777](https://github.com/tmux/tmux/issues/5777), fixed on tmux master). tmux 2.6–3.7 are not affected
 
 **Security**
 
