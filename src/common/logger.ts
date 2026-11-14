@@ -4,7 +4,7 @@ import { inspect } from 'node:util';
 
 type LogLevel = 'Trace' | 'Info' | 'Error';
 
-/** `vscode.LogLevel.Trace` — not in the 1.70 typings this extension builds against. */
+/** `vscode.LogLevel.Trace`, as a literal so a host without `env.logLevel` cannot throw here. */
 const TRACE_LOG_LEVEL = 1;
 
 export default class Log {

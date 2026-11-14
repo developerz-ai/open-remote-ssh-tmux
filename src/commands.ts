@@ -24,7 +24,8 @@ export async function promptOpenRemoteSSHWindow(reuseWindow: boolean) {
         // `validateInput` should already have blocked this via the UI, but the
         // input box only enforces it interactively — guard again so a malformed
         // destination can never open a window with an empty authority.
-        vscode.window.showErrorMessage(`Remote-SSH: "${host}" is not a valid [user@]hostname[:port] destination.`);
+        // Not awaited: notifications resolve only when dismissed, and never reject.
+        void vscode.window.showErrorMessage(`Remote-SSH: "${host}" is not a valid [user@]hostname[:port] destination.`);
         return;
     }
 
@@ -43,11 +44,12 @@ function validateSSHDestinationInput(value: string): string | undefined {
 }
 
 export function openRemoteSSHWindow(host: string, reuseWindow: boolean) {
-    vscode.commands.executeCommand('vscode.newWindow', { remoteAuthority: getRemoteAuthority(host), reuseWindow });
+    // Fire-and-forget: the command opens a window; there is nothing to wait for here.
+    void vscode.commands.executeCommand('vscode.newWindow', { remoteAuthority: getRemoteAuthority(host), reuseWindow });
 }
 
 export function openRemoteSSHLocationWindow(host: string, path: string, reuseWindow: boolean) {
-    vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.from({ scheme: 'vscode-remote', authority: getRemoteAuthority(host), path }), { forceNewWindow: !reuseWindow });
+    void vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.from({ scheme: 'vscode-remote', authority: getRemoteAuthority(host), path }), { forceNewWindow: !reuseWindow });
 }
 
 export async function addNewHost() {
@@ -85,7 +87,7 @@ export async function openSSHConfigFile() {
     if (!await fileExists(sshConfigPath)) {
         await fs.promises.appendFile(sshConfigPath, '');
     }
-    vscode.commands.executeCommand('vscode.open', vscode.Uri.file(sshConfigPath));
+    void vscode.commands.executeCommand('vscode.open', vscode.Uri.file(sshConfigPath));
 }
 
 /** Confirm button label for the kill command's modal. Exported so the handler test
@@ -146,7 +148,8 @@ export async function killWorkspaceSessions(
     const target = await resolveTarget();
     if (!target) {
         // Off a remote (or before resolve completes) there is nothing to kill.
-        vscode.window.showInformationMessage('Remote-SSH: Not connected to a remote — no persistent terminal sessions to kill.');
+        // Not awaited: notifications resolve only when dismissed, and never reject.
+        void vscode.window.showInformationMessage('Remote-SSH: Not connected to a remote — no persistent terminal sessions to kill.');
         return;
     }
 
@@ -179,13 +182,14 @@ export async function closeWorkspaceSessions(target: WorkspaceKillTarget): Promi
     } catch {
         outcome = undefined;
     }
+    // Not awaited: notifications resolve only when dismissed, and never reject.
     if (!outcome) {
-        vscode.window.showErrorMessage('Remote-SSH: Failed to kill persistent terminal sessions for this workspace.');
+        void vscode.window.showErrorMessage('Remote-SSH: Failed to kill persistent terminal sessions for this workspace.');
     } else if (outcome.failed > 0) {
-        vscode.window.showWarningMessage(
+        void vscode.window.showWarningMessage(
             `Remote-SSH: Killed ${outcome.killed} persistent terminal session(s) for this workspace; ${outcome.failed} could not be killed.`,
         );
     } else {
-        vscode.window.showInformationMessage(`Remote-SSH: Killed ${outcome.killed} persistent terminal session(s) for this workspace.`);
+        void vscode.window.showInformationMessage(`Remote-SSH: Killed ${outcome.killed} persistent terminal session(s) for this workspace.`);
     }
 }

@@ -270,8 +270,9 @@ describe('package.json manifest drift guard', () => {
             expect(activationEvents!.some(e => e === 'onTerminalProfile:tmux')).toBe(true);
         });
 
-        // `engines.vscode` (^1.70.2) predates VS Code's implicit-activation-events cutoff
-        // (~1.74), so every command that can actually be invoked before the extension is
+        // `engines.vscode` was ^1.70.2 when this was written — before VS Code's
+        // implicit-activation-events cutoff (~1.74) — and the explicit entries stay so the
+        // manifest is self-describing whatever the floor. Every command that can actually be invoked before the extension is
         // otherwise activated needs its own `onCommand:<id>` entry — pins the 06 fix
         // (`onCommand:openremotessh.tmux.killWorkspaceSessions` was missing, breaking
         // palette invocation pre-1.74). Commands hidden from the palette via a
@@ -547,6 +548,13 @@ describe('package.json manifest drift guard', () => {
             expect(scripts['update:dts']).toMatch(/\bdts\b/);
             expect(scripts['update:dts']).not.toMatch(/\bnpx\b/);
             expect(scripts['update:dts']).not.toMatch(/vscode-dts/);
+        });
+
+        // The honest floor: the bundled runtime deps need Node 20 (lru-cache@11 under
+        // glob@14 declares `20 || >=22`), and VS Code 1.90 (Electron 29) is the first whose
+        // extension host runs Node 20. A lower floor promises hosts the bundle cannot run on.
+        it('engines.vscode floor is ^1.90.0, the first release with a Node 20 extension host', () => {
+            expect(engines.vscode).toBe('^1.90.0');
         });
 
         it('fetches typings from a literal VS Code release at every invocation, engines-compatible', () => {

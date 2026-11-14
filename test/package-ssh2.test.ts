@@ -132,7 +132,7 @@ describe('ssh2 dependency (exact npm registry pin + patch wiring)', () => {
         // runs it when the lockfile records the package as having one.
         expect(
             installed!.hasInstallScript,
-            "node_modules/ssh2 must keep hasInstallScript — without it npm ci skips ssh2's install script"
+            `node_modules/ssh2 must keep hasInstallScript — without it npm ci skips ssh2's install script`
         ).toBe(true);
     });
 

@@ -115,7 +115,10 @@ describe('staged tooling', () => {
         expect(manifest.scripts['ci:lint:fix']).toBe('pipx run zizmor . --fix=all');
     });
 
-    it.each([0, 17])('appends workflow paths and propagates stubbed pipx status %i', (status) => {
+    // The stubs below are `#!/bin/sh` scripts found on PATH, which Windows cannot execute.
+    const posixStubs = process.platform !== 'win32';
+
+    it.runIf(posixStubs).each([0, 17])('appends workflow paths and propagates stubbed pipx status %i', (status) => {
         const directory = mkdtempSync(path.join(tmpdir(), 'staged-workflow-'));
         try {
             const argumentsFile = path.join(directory, 'arguments');
@@ -155,6 +158,9 @@ console.log(JSON.stringify({ command: task.commands, failed }));
             mkdirSync(path.join(directory, 'src/tmux'), { recursive: true });
             writeFileSync(path.join(directory, 'eslint.config.mjs'),
                 `export { default } from ${JSON.stringify(pathToFileURL(path.join(root, 'eslint.config.mjs')).href)};\n`);
+            // `src/**` is linted with type information, so the fixture needs a project to
+            // be part of, as the real `src/` is part of the root tsconfig.json.
+            writeFileSync(path.join(directory, 'tsconfig.json'), JSON.stringify({ compilerOptions: { strict: true }, include: ['src'] }));
             const env = { PATH: `${path.join(root, 'node_modules/.bin')}${path.delimiter}${process.env.PATH}` };
             for (const [source, status] of [['export const answer = 42;\n', 0], ['export const answer: any = 42;\n', 1]] as const) {
                 writeFileSync(path.join(directory, 'src/tmux/probe.ts'), source);
@@ -259,7 +265,7 @@ console.log(JSON.stringify({ command: task.commands, failed }));
         }
     });
 
-    it.each([0, 23])('propagates stubbed checker exit %i under Husky-equivalent sh -e', (status) => {
+    it.runIf(posixStubs).each([0, 23])('propagates stubbed checker exit %i under Husky-equivalent sh -e', (status) => {
         const directory = mkdtempSync(path.join(tmpdir(), 'staged-hook-'));
         try {
             const calls = path.join(directory, 'calls');

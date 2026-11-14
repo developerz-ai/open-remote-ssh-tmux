@@ -4,7 +4,7 @@
 
 Only the latest release line gets security fixes. Older releases are not patched.
 Upgrade to the newest version from the
-[releases page](https://github.com/developerz-ai/open-remote-ssh-tmux/releases) or Open VSX.
+[releases page](https://github.com/developerz-ai/open-remote-ssh-tmux/releases).
 
 | Version | Supported |
 |---------|-----------|
