@@ -22,6 +22,8 @@
 // quoting and path construction are auditable in one file (tmux's are built separately
 // in `src/tmux/*`).
 
+import { escapeShellArg } from '../common/shellQuote';
+
 /** Directory, relative to the remote user's `$HOME`, under which every uploaded image
  * lives. `.cache` is the XDG-conventional home for regenerable data, so nothing here is
  * worth backing up or syncing — see {@link remoteImageDir} for why this is no longer
@@ -258,8 +260,17 @@ export const MKDIR_OK_MARKER = 'orst-mkdir-ok';
  * means the marker cannot appear unless every step succeeded.
  */
 export function buildRemoteMkdirCommand(dir: string): string {
-    const path = quote(dir);
-    return `mkdir -p -m 700 ${path} && chmod 700 ${path} && echo ${MKDIR_OK_MARKER}`;
+    const path = escapeShellArg(dir);
+    return inPosixShell(`mkdir -p -m 700 ${path} && chmod 700 ${path} && echo ${MKDIR_OK_MARKER}`);
+}
+
+/**
+ * Print the remote user's `$HOME`. `printf` rather than `echo` because `echo` mangles a home
+ * path containing a backslash on some shells; expanded by sh (see {@link inPosixShell}), so a
+ * login shell with its own variable syntax (nushell's `$env.HOME`) cannot misread it.
+ */
+export function buildRemoteHomeCommand(): string {
+    return inPosixShell('printf %s "$HOME"');
 }
 
 /** A plain absolute POSIX path: rooted, no `..` segment, and free of the characters that
@@ -281,7 +292,22 @@ function isAbsolutePosixPath(value: string): boolean {
  */
 export function buildCleanupCommand(dir: string, maxAgeHours: number): string {
     const minutes = Math.round(maxAgeHours * 60);
-    return `find ${quote(dir)} -maxdepth 1 -type f -name '*.png' -mmin +${minutes} -delete 2>/dev/null`;
+    return inPosixShell(`find ${escapeShellArg(dir)} -maxdepth 1 -type f -name '*.png' -mmin +${minutes} -delete 2>/dev/null`);
+}
+
+/**
+ * Run `script` under `sh` rather than the remote user's login shell.
+ *
+ * sshd hands every exec request to the LOGIN shell, and the scripts here are POSIX: on
+ * csh/tcsh `2>/dev/null` parses as the argument `2` plus a stdout redirect, so the sweep gave
+ * `find` a stray operand and never ran. As one `sh -c '<script>'` command the login shell
+ * only has to parse a single-quoted word, which sh, bash, zsh, csh, tcsh and fish all read
+ * alike. Known gap: fish treats `\'` and `\\` inside single quotes as escapes, so on fish a
+ * remote home that itself contains `'` or `\` can still misparse. The value is the user's own
+ * `$HOME`, so that is a failed paste or sweep for a vanishingly rare path, not an injection.
+ */
+function inPosixShell(script: string): string {
+    return `sh -c ${escapeShellArg(script)}`;
 }
 
 /**
@@ -290,15 +316,16 @@ export function buildCleanupCommand(dir: string, maxAgeHours: number): string {
  * Full-screen TUIs treat typed input very differently from pasted input. Claude Code in
  * particular will act on a bare path as keystrokes — triggering completion, or submitting
  * early. `ESC[200~ … ESC[201~` tells the application "this arrived as a paste", which is
- * what makes the path land in the prompt intact. tmux forwards these sequences through to
- * the running application unchanged. No trailing newline: the user decides when to submit.
+ * what makes the path land in the prompt intact. No trailing newline: the user decides when
+ * to submit.
+ *
+ * Sent unconditionally because no VS Code API exposes whether the application enabled
+ * bracketed-paste mode (DECSET 2004). In a tmux terminal that does not matter: tmux parses
+ * the markers as paste keys and forwards them only to a pane that enabled the mode, so a
+ * plain `cat` receives just the path (checked against tmux 3.4). Only a non-tmux terminal
+ * running a program without the mode (dash, csh) shows the raw markers; dropping them
+ * instead would break Claude Code, bash and zsh, which all enable it.
  */
 export function bracketedPaste(payload: string): string {
     return `[200~${payload}[201~`;
-}
-
-/** POSIX single-quote quoting — identical rule to `escapeShellArg` in `common/shellQuote.ts`,
- * restated here rather than imported so this module stays import-free and liftable. */
-function quote(value: string): string {
-    return `'${value.replace(/'/g, `'\\''`)}'`;
 }

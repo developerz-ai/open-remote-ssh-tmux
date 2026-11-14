@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { randomBytes } from 'crypto';
 
 // Last-resort local clipboard reader: a webview.
 //
@@ -83,22 +84,44 @@ export function readClipboardImageViaWebview(log: WebviewLog, restoreFocus?: vsc
             finish(new Uint8Array(bytes), `read ${bytes.byteLength} bytes`);
         });
 
-        panel.webview.html = PAGE;
+        panel.webview.html = buildWebviewHtml(newNonce());
     });
 }
 
-/** The page runs locally in the editor's renderer. It reports exactly one message and then
- * waits to be disposed; the extension side owns every timeout and every decision. */
-const PAGE = `<!DOCTYPE html>
+/** A fresh CSP nonce: 128 random bits, base64 (a valid CSP nonce source). One per page,
+ * so nothing can predict the value a script would need to carry to be allowed to run. */
+export function newNonce(): string {
+    return randomBytes(16).toString('base64');
+}
+
+/**
+ * The page runs locally in the editor's renderer. It reports exactly one message and then
+ * waits to be disposed; the extension side owns every timeout and every decision.
+ *
+ * Scripts are enabled and the page holds the user's clipboard, so it carries a Content
+ * Security Policy: deny everything, then allow only the one script and the one stylesheet
+ * tagged with `nonce`. The page loads nothing (no images, fonts, frames or network), so no
+ * other source is listed. Styles live in a `<style>` block rather than `style="…"`
+ * attributes because a nonce cannot cover an attribute — that would need `'unsafe-inline'`.
+ */
+export function buildWebviewHtml(nonce: string): string {
+    return `<!DOCTYPE html>
 <html>
-<head><meta charset="UTF-8"></head>
-<body style="display:flex;align-items:center;justify-content:center;height:100vh;margin:0;
-             font-family:var(--vscode-font-family);color:var(--vscode-foreground)">
-  <div id="zone" tabindex="0" style="padding:32px 48px;border-radius:12px;text-align:center;
-       border:2px dashed var(--vscode-focusBorder);outline:none">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'">
+<style nonce="${nonce}">
+  body { display:flex; align-items:center; justify-content:center; height:100vh; margin:0;
+         font-family:var(--vscode-font-family); color:var(--vscode-foreground); }
+  #zone { padding:32px 48px; border-radius:12px; text-align:center;
+          border:2px dashed var(--vscode-focusBorder); outline:none; }
+</style>
+</head>
+<body>
+  <div id="zone" tabindex="0">
     <div id="msg">Reading clipboard…</div>
   </div>
-<script>
+<script nonce="${nonce}">
   const vscode = acquireVsCodeApi();
   const zone = document.getElementById('zone');
   const msg = document.getElementById('msg');
@@ -169,3 +192,4 @@ const PAGE = `<!DOCTYPE html>
 </script>
 </body>
 </html>`;
+}

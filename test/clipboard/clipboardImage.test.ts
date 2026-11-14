@@ -1,7 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import { execFileSync, spawnSync } from 'child_process';
+import { mkdtempSync, rmSync, statSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { afterEach, describe, expect, it } from 'vitest';
 import {
     buildCleanupCommand,
     buildLocalCaptureCandidates,
+    buildRemoteHomeCommand,
     buildRemoteMkdirCommand,
     MKDIR_OK_MARKER,
     bracketedPaste,
@@ -223,11 +228,81 @@ describe('remoteImageDir / remoteImagePath: under the user\'s own home, never wo
     });
 });
 
+/** The POSIX script inside a `sh -c '<script>'` command line, unquoted again — the inverse
+ * of `escapeShellArg`. Throws if the command is anything other than exactly that shape, so a
+ * builder that leaves syntax outside the wrapper fails every test that reads its script. */
+const shScript = (command: string): string => {
+    const match = /^sh -c '((?:[^']|'\\'')*)'$/s.exec(command);
+    if (!match) {
+        throw new Error(`not a single sh -c word: ${command}`);
+    }
+    return match[1].replace(/'\\''/g, '\'');
+};
+
+describe('remote commands: one sh -c word, whatever the login shell is', () => {
+    // sshd runs every exec through the user's LOGIN shell. `2>/dev/null` is POSIX syntax:
+    // csh/tcsh parse it as the argument `2` plus a stdout redirect, so the sweep handed find
+    // a stray `2` operand and never ran. Wrapping in `sh -c '<script>'` leaves the login
+    // shell exactly one thing to parse — a command with a single-quoted argument, which
+    // sh, bash, zsh, csh, tcsh and fish all read the same way — and runs the script in sh.
+    const dir = '/home/alice/.cache/open-remote-ssh-tmux/images';
+    const builders: Array<[string, string]> = [
+        ['home', buildRemoteHomeCommand()],
+        ['mkdir', buildRemoteMkdirCommand(dir)],
+        ['cleanup', buildCleanupCommand(dir, 48)],
+    ];
+
+    it.each(builders)('wraps the %s command in sh -c', (_name, command) => {
+        expect(() => shScript(command)).not.toThrow();
+    });
+
+    // A quote in the path must stay inside the wrapper: if the escaping were wrong the
+    // remainder of the path would reach the login shell as code.
+    it('keeps a path with a single quote inside the wrapper', () => {
+        expect(shScript(buildRemoteMkdirCommand('/home/it\'s/images'))).toContain('\'/home/it\'\\\'\'s/images\'');
+    });
+
+    it('reads $HOME in sh, not in the login shell', () => {
+        expect(shScript(buildRemoteHomeCommand())).toBe('printf %s "$HOME"');
+    });
+});
+
+describe('remote commands: run for real through a POSIX shell', () => {
+    // What sshd does with an exec request: `$SHELL -c '<command>'`. sh stands in for the
+    // login shell here; the structural test above covers the shells CI does not have.
+    let scratch: string | undefined;
+    afterEach(() => {
+        if (scratch) {
+            rmSync(scratch, { recursive: true, force: true });
+            scratch = undefined;
+        }
+    });
+    const run = (command: string, env: NodeJS.ProcessEnv = process.env): string =>
+        execFileSync('sh', ['-c', command], { encoding: 'utf8', env });
+
+    it('creates a private directory, even one whose path holds a quote, and prints the marker', () => {
+        scratch = mkdtempSync(join(tmpdir(), 'orst-clip-'));
+        const dir = join(scratch, 'it\'s', 'images');
+        expect(run(buildRemoteMkdirCommand(dir))).toContain(MKDIR_OK_MARKER);
+        expect(statSync(dir).mode & 0o777).toBe(0o700);
+    });
+
+    // find still exits non-zero here; `exec` ignores exit codes, so silence is what counts.
+    it('sweeps a missing directory silently', () => {
+        const result = spawnSync('sh', ['-c', buildCleanupCommand('/nonexistent/orst-clip-test', 48)], { encoding: 'utf8' });
+        expect(result.stdout + result.stderr).toBe('');
+    });
+
+    it('prints the remote home', () => {
+        expect(run(buildRemoteHomeCommand(), { ...process.env, HOME: '/home/a b' })).toBe('/home/a b');
+    });
+});
+
 describe('buildRemoteMkdirCommand: 0700 before the first byte lands, and provably so', () => {
     // `vscode.workspace.fs.writeFile` cannot set a mode, so the directory must already be
     // private when the file is created — otherwise the image is briefly world-readable.
     it('creates the directory with mode 700', () => {
-        const cmd = buildRemoteMkdirCommand('/home/alice/.cache/open-remote-ssh-tmux/images');
+        const cmd = shScript(buildRemoteMkdirCommand('/home/alice/.cache/open-remote-ssh-tmux/images'));
         expect(cmd).toContain('mkdir -p -m 700');
         expect(cmd).toContain('\'/home/alice/.cache/open-remote-ssh-tmux/images\'');
     });
@@ -236,7 +311,7 @@ describe('buildRemoteMkdirCommand: 0700 before the first byte lands, and provabl
     // keeps whatever mode it already had, silently — so the mode has to be asserted, not
     // assumed, every time.
     it('also chmods an already-existing directory rather than trusting -m', () => {
-        expect(buildRemoteMkdirCommand('/home/alice/x')).toContain('chmod 700');
+        expect(shScript(buildRemoteMkdirCommand('/home/alice/x'))).toContain('chmod 700');
     });
 
     // `SSHConnection#exec` surfaces no exit code — it resolves on channel close whatever the
@@ -245,15 +320,15 @@ describe('buildRemoteMkdirCommand: 0700 before the first byte lands, and provabl
     // the upload proceeded straight into `writeFile` with only a generic error to show for
     // it. An explicit success marker on stdout is the only reliable signal available here.
     it('emits a success marker the caller can require on stdout', () => {
-        expect(buildRemoteMkdirCommand('/home/alice/x')).toContain(MKDIR_OK_MARKER);
+        expect(shScript(buildRemoteMkdirCommand('/home/alice/x'))).toContain(MKDIR_OK_MARKER);
         // Chained with && so the marker cannot print unless every step succeeded.
-        expect(buildRemoteMkdirCommand('/home/alice/x')).toMatch(/mkdir[^&]*&&[^&]*chmod[^&]*&&.*echo/);
+        expect(shScript(buildRemoteMkdirCommand('/home/alice/x'))).toMatch(/mkdir[^&]*&&[^&]*chmod[^&]*&&.*echo/);
     });
 
     it('quotes a path containing a single quote rather than breaking out of the command', () => {
-        const cmd = buildRemoteMkdirCommand('/home/it\'s/images');
+        const cmd = shScript(buildRemoteMkdirCommand('/home/it\'s/images'));
         expect(cmd).not.toMatch(/[^\\]'\/home\/it's/); // the inner quote is escaped, not raw
-        expect(cmd.startsWith('mkdir -p -m 700 ')).toBe(true);
+        expect(cmd.startsWith('mkdir -p -m 700 ')).toBe(true); // nothing before the wrapper's script
     });
 });
 
@@ -262,7 +337,7 @@ describe('buildCleanupCommand: the 48h sweep', () => {
     // construction. Scoped with -maxdepth so it can never wander outside our own directory,
     // and restricted to regular .png files so a stray subdirectory is not deleted.
     it('deletes only regular .png files older than the given age, inside our dir only', () => {
-        const cmd = buildCleanupCommand('/home/alice/.cache/open-remote-ssh-tmux/images', 48);
+        const cmd = shScript(buildCleanupCommand('/home/alice/.cache/open-remote-ssh-tmux/images', 48));
         expect(cmd).toContain('\'/home/alice/.cache/open-remote-ssh-tmux/images\'');
         expect(cmd).toContain('-maxdepth 1');
         expect(cmd).toContain('-type f');
@@ -272,19 +347,19 @@ describe('buildCleanupCommand: the 48h sweep', () => {
     });
 
     it('converts hours to minutes for any age', () => {
-        expect(buildCleanupCommand('/d', 1)).toContain('-mmin +60');
-        expect(buildCleanupCommand('/d', 24)).toContain('-mmin +1440');
+        expect(shScript(buildCleanupCommand('/d', 1))).toContain('-mmin +60');
+        expect(shScript(buildCleanupCommand('/d', 24))).toContain('-mmin +1440');
     });
 
     it('never emits a bare recursive delete', () => {
-        const cmd = buildCleanupCommand('/home/alice/.cache/open-remote-ssh-tmux/images', 48);
+        const cmd = shScript(buildCleanupCommand('/home/alice/.cache/open-remote-ssh-tmux/images', 48));
         expect(cmd).not.toContain('rm -rf');
     });
 
     it('tolerates a missing directory instead of erroring on every connect', () => {
         // Nothing has been pasted yet on a fresh remote — that is the normal case, not a
         // failure worth a log line.
-        expect(buildCleanupCommand('/d', 48)).toContain('2>/dev/null');
+        expect(shScript(buildCleanupCommand('/d', 48))).toContain('2>/dev/null');
     });
 });
 
