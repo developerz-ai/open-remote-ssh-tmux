@@ -1,11 +1,23 @@
-# Open Remote - SSH (tmux)
+<p align="center">
+  <img src="https://raw.githubusercontent.com/developerz-ai/open-remote-ssh-tmux/main/resources/icon.png" alt="Open Remote - SSH (tmux)" width="128">
+</p>
 
+<h1 align="center">Open Remote - SSH (tmux)</h1>
+
+<p align="center"><strong>Close the PC, open the laptop, land in the same live terminals. Remote-SSH for VS Code and VSCodium, with tmux-backed terminals that outlive every connection.</strong></p>
+
+<div align="center">
+
+[![Maintained by developerz.ai](https://img.shields.io/badge/maintained%20by-developerz.ai-8a2be2.svg)](#ai-maintained)
 [![CI](https://github.com/developerz-ai/open-remote-ssh-tmux/actions/workflows/ci-main.yml/badge.svg?branch=main)](https://github.com/developerz-ai/open-remote-ssh-tmux/actions/workflows/ci-main.yml)
 [![Release](https://img.shields.io/github/v/release/developerz-ai/open-remote-ssh-tmux?sort=semver)](https://github.com/developerz-ai/open-remote-ssh-tmux/releases/latest)
-[![License: MIT](https://img.shields.io/github/license/developerz-ai/open-remote-ssh-tmux)](LICENSE.txt)
-[![VS Code / VSCodium](https://img.shields.io/badge/VS%20Code%20%2F%20VSCodium-%E2%89%A51.90-007ACC)](#requirements)
-[![tmux tested](https://img.shields.io/badge/tmux%20tested-2.6%20%7C%203.0a%20%7C%203.4%20%7C%203.5a%20%7C%203.8-1BB91F)](test/rig/)
-[![AI-maintained](https://img.shields.io/badge/AI--maintained-agents%20write%2C%20humans%20review-8A2BE2)](#ai-maintained)
+[![Downloads](https://img.shields.io/github/downloads/developerz-ai/open-remote-ssh-tmux/total?logo=github)](https://github.com/developerz-ai/open-remote-ssh-tmux/releases)
+[![VS Code / VSCodium](https://img.shields.io/badge/VS%20Code%20%2F%20VSCodium-%E2%89%A5%201.90-007ACC?logo=vscodium&logoColor=white)](#requirements)
+[![tmux](https://img.shields.io/badge/tmux-2.6%20%E2%80%93%203.8%20tested-1BB91F?logo=tmux&logoColor=white)](test/rig/)
+[![GitHub stars](https://img.shields.io/github/stars/developerz-ai/open-remote-ssh-tmux?style=flat&logo=github)](https://github.com/developerz-ai/open-remote-ssh-tmux/stargazers)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.txt)
+
+</div>
 
 A VS Code / VSCodium extension that connects to a remote dev machine over
 SSH — a fork of [open-remote-ssh](https://github.com/jeanp413/open-remote-ssh)
@@ -241,24 +253,20 @@ was deliberately left out — see
 
 ## AI-maintained
 
-This repository is **AI-first**: coding agents write essentially all of the code,
-and humans set direction and review. That only works because the guard rails are
-mechanical, not trust-based:
+open-remote-ssh-tmux is maintained by AI: by [developerz.ai](https://developerz.ai), the way a human maintainer looks after an open-source project. The agent works publicly as `developerz-ai[bot]` and marks every comment it posts as bot-made. Its policy is committed in [`.dz/maintainer/maintainer.yml`](.dz/maintainer/maintainer.yml), and [`CLAUDE.md`](CLAUDE.md) binds it: no policy line relaxes a non-negotiable (terminals only, invisible tmux, no zombie sessions, SSH transport unchanged).
 
-- **Unit TDD** — every change lands with a failing test first (`npm test`, ~1300 cases).
-- **Real tmux, real SSH** — `npm run test:tmux` runs the integration suite against
-  tmux 2.6, 3.0a, 3.4, 3.5a and 3.8 in docker on every pull request.
-- **Real editor** — `test/rig/edh/` drives a real VSCodium over SSH (Xvfb + xdotool in
-  docker) through the acceptance matrix: persistence, hand-off between machines, no
-  zombie sessions, reconnect storms, listener audit.
-- **Hard gates** — strict TypeScript, zero-warning typed lint, coverage ratchet,
-  Windows/macOS unit jobs, and a publish job that refuses a tag that doesn't match the
-  version or didn't pass build + test + lint.
-- **Written intent** — the *why* lives in [`docs/idea/`](docs/idea/README.md), the
-  agent playbook in [`CLAUDE.md`](CLAUDE.md), and each body of work as a plan with
-  results under [`docs/plans/`](docs/plans/).
+| What arrives | What happens |
+|---|---|
+| an issue | triaged into bug / feature / dupe / question / docs; asked for steps, expected, actual and version when missing; closed after 14 days without a reproduction |
+| a pull request | reviewed (CodeRabbit and the developerz.ai reviewer), driven to green on `check`, the tmux rig and the package job; the agent merges its own on green, everyone else's waits for a member |
+| Dependabot | driven to green, then waits for a member: runtime deps (`ssh2`, `socks`, `simple-socks`) always get a human review |
+| an outside change to CI or publish automation (`.github/`) | declined: members maintain the pipeline that publishes the extension |
+| a change that surfaces tmux to the user, rewrites the SSH transport, or persists more than terminals | declined with the non-goal quoted |
+| a release | not the agent's: a member tags `v*` and `publish.yml` gates it (tag = version, build + test + lint) before publishing |
 
-See [`docs/idea/ai-first.md`](docs/idea/ai-first.md) for the full stance.
+What keeps agent-written code honest is mechanical, not trust: unit TDD (~1300 tests), the real-tmux docker rig ([`test/rig/`](test/rig/), tmux 2.6, 3.0a, 3.4, 3.5a, 3.8 on every pull request), the real-VSCodium end-to-end driver ([`test/rig/edh/`](test/rig/edh/), the full acceptance matrix with no manual steps), zero-warning typed lint, a coverage ratchet and Windows/macOS unit jobs. The *why* lives in [`docs/idea/`](docs/idea/README.md); each body of work is a plan with results under [`docs/plans/`](docs/plans/).
+
+Scheduled checkups, briefs in [`.dz/briefs/`](.dz/briefs/): weekly `health` catches the failures nothing announces, and weekly `improve` lands small, evidenced improvements.
 
 ## Security
 
@@ -406,6 +414,15 @@ Before 1.99.0, the old scheme needs to be used:
 ```
 "remote.SSH.serverDownloadUrlTemplate": "https://github.com/VSCodium/vscodium/releases/download/${version}.${release}/vscodium-reh-${os}-${arch}-${version}.${release}.tar.gz",
 ```
+
+## Star history
+
+<a href="https://star-history.com/#developerz-ai/open-remote-ssh-tmux&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=developerz-ai/open-remote-ssh-tmux&type=Date&theme=dark">
+    <img alt="Star history of developerz-ai/open-remote-ssh-tmux" src="https://api.star-history.com/svg?repos=developerz-ai/open-remote-ssh-tmux&type=Date" width="600">
+  </picture>
+</a>
 
 ## Credit
 
