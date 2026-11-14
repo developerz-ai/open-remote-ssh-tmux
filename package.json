@@ -211,11 +211,12 @@
 					]
 				},
 				"remote.SSH.tmux.historyLimit": {
-					"type": "number",
+					"type": "integer",
 					"description": "Maximum number of lines to retain in each tmux terminal's history buffer.",
 					"scope": "application",
 					"default": 50000,
-					"minimum": 0
+					"minimum": 0,
+					"maximum": 1000000
 				},
 				"remote.SSH.tmux.reapOnConnect": {
 					"type": "boolean",

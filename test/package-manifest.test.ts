@@ -130,8 +130,11 @@ describe('package.json manifest drift guard', () => {
         it('declares remote.SSH.tmux.historyLimit with the documented default', () => {
             const historyLimit = properties['remote.SSH.tmux.historyLimit'];
             expect(historyLimit).toBeDefined();
-            expect(historyLimit.type).toBe('number');
+            expect(historyLimit.type).toBe('integer');
             expect(historyLimit.default).toBe(50000);
+            // Same bounds as clampHistoryLimit, so the Settings UI rejects what tmux would.
+            expect(historyLimit.minimum).toBe(0);
+            expect(historyLimit.maximum).toBe(1_000_000);
         });
 
         it('declares remote.SSH.tmux.reapOnConnect with the documented default', () => {

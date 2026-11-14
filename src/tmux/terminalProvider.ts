@@ -9,6 +9,7 @@ import {
     readListSessionsResult,
     sessionName,
     sessionSlot,
+    TMUX_BIN,
     type TmuxSession,
     type TmuxTargetVerdict,
 } from './tmuxSession';
@@ -105,6 +106,9 @@ export interface TmuxTerminalDeps {
      * fails with a tmux-naming spawn error. Undefined → fall back to a bare `tmux`
      * on PATH (probe printed no path line, or an exotic build). */
     readonly tmuxPath?: string;
+    /** The probed tmux version (`TmuxCapability.version`); picks the attach chain's
+     * variant (see `tmuxFeatures`). Undefined → the modern chain. */
+    readonly tmuxVersion?: string;
     /** How long reconcile waits for VS Code to revive its own persisted terminals before
      * deciding anything ({@link REVIVE_GRACE_MS}). Injectable so tests need not sleep. */
     readonly reviveGraceMs?: number;
@@ -210,10 +214,6 @@ export const SLOT_MAPPING_STATE_KEY = 'tmux.slotSessions.v1';
  * so an upgraded client sheds the stale data instead of carrying it forever. */
 const LEGACY_TOMBSTONE_STATE_KEY = 'tmux.tombstonedSlots.v1';
 
-/** Fallback `shellPath` when the probe resolved no absolute tmux path — a bare
- * `tmux` on PATH (see {@link TmuxTerminalDeps.tmuxPath} for why a path is preferred). */
-const TMUX_BIN = 'tmux';
-
 /** One of this workspace's sessions as seen on the remote right now. */
 interface RemoteSession {
     readonly slot: number;
@@ -233,6 +233,7 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
     /** Resolved `shellPath` for every launched terminal — the probe's absolute tmux
      * path when known, else a bare `tmux` on PATH ({@link TMUX_BIN}). */
     private readonly tmuxPath: string;
+    private readonly tmuxVersion?: string;
     /** Grace period before reconcile reads the window (see {@link REVIVE_GRACE_MS}). */
     private readonly reviveGraceMs: number;
     /** Backstop for the claim-driven wait (see {@link REVIVE_DEADLINE_MS}). */
@@ -285,6 +286,7 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         this.log = deps.log;
         this.historyLimit = deps.historyLimit;
         this.tmuxPath = deps.tmuxPath ?? TMUX_BIN;
+        this.tmuxVersion = deps.tmuxVersion;
         this.reviveGraceMs = deps.reviveGraceMs ?? REVIVE_GRACE_MS;
         this.reviveDeadlineMs = deps.reviveDeadlineMs ?? REVIVE_DEADLINE_MS;
         this.reviveQuietMs = deps.reviveQuietMs ?? REVIVE_QUIET_MS;
@@ -667,7 +669,7 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
             // the hold either way: a failed kill must not strand the slot for the life of
             // the window.
             this.killingSlots.add(slot);
-            this.exec(buildKillSession(name))
+            this.exec(buildKillSession(name, this.tmuxPath))
                 .then(({ stderr, code }) => {
                     if (code !== 0 && classifyTmuxFailure(stderr, code) !== 'absent') {
                         this.log.trace(`tmux terminal: kill of ${name} not confirmed (rc ${code ?? 'unknown'})`);
@@ -835,8 +837,18 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
             name: folderName(this.ctx.cwd),
             // Absolute path from the probe (or a bare `tmux` fallback) — see tmuxPath.
             shellPath: this.tmuxPath,
-            shellArgs: buildAttachOrCreateArgv(name, this.ctx.cwd, undefined, { historyLimit: this.historyLimit, takeOver }),
+            shellArgs: buildAttachOrCreateArgv(name, this.ctx.cwd, undefined, {
+                historyLimit: this.historyLimit,
+                takeOver,
+                tmuxPath: this.tmuxPath,
+                tmuxVersion: this.tmuxVersion,
+            }),
             cwd: this.ctx.cwd,
+            // `null` deletes the variable from the pty's environment. An inherited `TMUX`
+            // naming this same server makes `new-session` refuse ("sessions should be nested
+            // with care"), failing the attach chain after it borrowed the global
+            // history-limit — and a stale `TMUX_PANE` would misdirect tools inside.
+            env: { TMUX: null, TMUX_PANE: null },
             // Deliberately NOT `isTransient: true`. That opted the terminal out of VS Code's
             // own persistence, on the reasoning that tmux owns lifetime so VS Code should
             // keep its hands off. It owns the *session*, but not the *window*: the same
@@ -855,7 +867,7 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
     private async refreshRemote(): Promise<RemoteSession[] | undefined> {
         let parsed: TmuxSession[] | undefined;
         try {
-            const result = await this.exec(buildListSessions());
+            const result = await this.exec(buildListSessions(this.tmuxPath));
             parsed = readListSessionsResult(result);
             if (parsed === undefined) {
                 this.log.trace(`tmux list-sessions failed (rc ${result.code ?? 'unknown'}): ${result.stderr.trim()}`);
@@ -907,7 +919,7 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         }
         const names = slots.map(slot => this.mapping.get(slot)!);
         try {
-            const { stdout } = await this.exec(buildHasSessionsCommand(names));
+            const { stdout } = await this.exec(buildHasSessionsCommand(names, this.tmuxPath));
             parseHasSessions(stdout, names.length).forEach(({ code, message }, index) => {
                 verdicts.set(slots[index], classifyTmuxFailure(message, code));
             });

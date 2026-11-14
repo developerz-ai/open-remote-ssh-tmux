@@ -29,8 +29,11 @@ describeRig('argv chain hardening (real tmux)', target => {
         await rig.run('rm -f "$HOME"/pwned*');
     });
 
+    /** What production passes: the probed path and version (`TmuxCapability`). */
+    const probed: AttachOrCreateOptions = { tmuxPath: RIG_TMUX, tmuxVersion: target.version };
+
     async function launch(name: string, cwd: string, opts: AttachOrCreateOptions = {}): Promise<void> {
-        await rig.spawnHeldClient(RIG_TMUX, buildAttachOrCreateArgv(name, cwd, undefined, opts));
+        await rig.spawnHeldClient(RIG_TMUX, buildAttachOrCreateArgv(name, cwd, undefined, { ...probed, ...opts }));
         await rig.waitUntil(`a client on ${name}`, async () => (await rig.clientCount(name)) >= 1);
     }
 
@@ -48,13 +51,34 @@ describeRig('argv chain hardening (real tmux)', target => {
         expect(await option('-s', 'set-clipboard')).toBe('on');
     });
 
-    it.fails('(04b) a user\'s own global history-limit is unchanged after our attach', async () => {
+    it('(04b) a user\'s own global history-limit is unchanged after our attach', async () => {
         expect((await rig.tmux('new-session', '-d', '-s', 'main')).code).toBe(0);
         expect((await rig.tmux('set-option', '-g', 'history-limit', '100000')).code).toBe(0);
+        // A session-local value on the user's most recent session must not leak into the
+        // global either (a `#{history-limit}` format would have read this one).
+        expect((await rig.tmux('set-option', '-t', '=main:', 'history-limit', '777')).code).toBe(0);
+        const name = sessionName(HOST, home, 0);
 
-        await launch(sessionName(HOST, home, 0), home, { historyLimit: 1234 });
+        await launch(name, home, { historyLimit: 1234 });
 
         expect(await option('-g', 'history-limit')).toBe('100000');
+        expect((await rig.tmux('display-message', '-p', '-t', `=${name}:`, '#{history_limit}')).stdout.trim()).toBe('1234');
+    });
+
+    it('(04c) server-wide settings the user configured survive our attach', async () => {
+        expect((await rig.tmux('new-session', '-d', '-s', 'main')).code).toBe(0);
+        expect((await rig.tmux('set-option', '-s', 'set-clipboard', 'off')).code).toBe(0);
+        expect((await rig.tmux('set-option', '-s', 'escape-time', '42')).code).toBe(0);
+        expect((await rig.tmux('bind-key', '-n', 'PPage', 'display-message', 'mine')).code).toBe(0);
+
+        await launch(sessionName(HOST, home, 0), home);
+
+        expect(await option('-s', 'set-clipboard')).toBe('off');
+        expect(await option('-s', 'escape-time')).toBe('42');
+        const rootKeys = (await rig.tmux('list-keys', '-T', 'root')).stdout;
+        expect(rootKeys).toMatch(/\bPPage\b.*display-message mine/);
+        expect(rootKeys).toMatch(/\bNPage\b.*if-shell/);
+        expect(await option('-g', 'prefix')).toBe('C-b');
     });
 
     const hostileDirs: ReadonlyArray<readonly [string, string]> = [
@@ -63,7 +87,7 @@ describeRig('argv chain hardening (real tmux)', target => {
         ['a trailing ;', 'x;'],
     ];
     for (const [label, dir] of hostileDirs) {
-        it.fails(`(04f) cwd containing ${label}: no command runs, cwd exact`, async () => {
+        it(`(04f) cwd containing ${label}: no command runs, cwd exact`, async () => {
             const cwd = `${home}/${dir}`;
             await rig.ok(`mkdir -p ${escapeShellArg(cwd)}`);
             const name = sessionName(HOST, cwd, 0);
@@ -78,15 +102,15 @@ describeRig('argv chain hardening (real tmux)', target => {
     }
 
     for (const historyLimit of [1.5, -1, 1e10]) {
-        it.fails(`(04a) historyLimit ${historyLimit}: the session is still created`, async () => {
+        it(`(04a) historyLimit ${historyLimit}: the session is still created`, async () => {
             const name = sessionName(HOST, home, 0);
-            await rig.spawnHeldClient(RIG_TMUX, buildAttachOrCreateArgv(name, home, undefined, { historyLimit }));
+            await rig.spawnHeldClient(RIG_TMUX, buildAttachOrCreateArgv(name, home, undefined, { ...probed, historyLimit }));
 
             await rig.waitUntil(`a client on ${name}`, async () => (await rig.clientCount(name)) >= 1, 5000);
         });
     }
 
-    it.fails('(04g) a login shell that prints a banner still yields the absolute tmux path', async () => {
+    it('(04g) a login shell that prints a banner still yields the absolute tmux path', async () => {
         await rig.ok('cp "$HOME/.bashrc" "$HOME/.bashrc.rig" && { echo "echo Welcome to the rig"; cat "$HOME/.bashrc.rig"; } > "$HOME/.bashrc"');
         try {
             const capability = await probeTmux(rig.rawExec, 'linux');
@@ -107,13 +131,14 @@ function describeKeys(target: RigTarget, rig: () => RigSession, home: () => stri
 
     async function openTerminal(): Promise<PtyClient> {
         const name = sessionName(HOST, `${home()}/keys`, 0);
-        const client = await PtyClient.open(target, WORKERS.hardening, RIG_TMUX, buildAttachOrCreateArgv(name, home(), INNER));
+        const client = await PtyClient.open(target, WORKERS.hardening, RIG_TMUX,
+            buildAttachOrCreateArgv(name, home(), INNER, { tmuxPath: RIG_TMUX, tmuxVersion: target.version }));
         await rig().waitUntil('the pane to run cat', async () =>
             (await rig().tmux('display-message', '-p', '-t', name, '#{pane_current_command}')).stdout.trim() === 'cat');
         return client;
     }
 
-    it.fails('(04d) Ctrl-B reaches the program inside (no tmux prefix)', async () => {
+    it('(04d) Ctrl-B reaches the program inside (no tmux prefix)', async () => {
         const terminal = await openTerminal();
         try {
             terminal.write('\x02z');
@@ -125,13 +150,13 @@ function describeKeys(target: RigTarget, rig: () => RigSession, home: () => stri
     });
 
     // tmux holds a lone Esc for `escape-time` to tell it from an Alt- sequence: 500 ms by
-    // default before 3.5, 10 ms from 3.5. From 3.6 the delay is also stretched to 500 ms
-    // while tmux's own queries to the outer terminal are unanswered (CHANGES 3.6: "extended
-    // escape-time"), and this rig's bare pty answers none — measured 500 ms on 3.8 even with
-    // `escape-time 0`. Whether xterm.js's replies make 3.6+ fast is for slice 04 to settle
-    // in F5; here 3.6+ is an expected failure like the pre-3.5 default. Measured against an
-    // ordinary key so link latency cancels out.
-    const escFast = versionAtLeast(target.version, '3.5') && !versionAtLeast(target.version, '3.6');
+    // default before 3.5 (the chain lowers that default to 10 ms), 10 ms from 3.5. From 3.6
+    // the delay is also stretched to 500 ms while tmux's own queries to the outer terminal
+    // are unanswered (CHANGES 3.6: "extended escape-time"), and this rig's bare pty answers
+    // none — measured 500 ms on 3.8 even with `escape-time 0`. That is a rig artefact (a real
+    // xterm.js answers the queries), so 3.6+ stays an expected failure here. Measured against
+    // an ordinary key so link latency cancels out.
+    const escFast = !versionAtLeast(target.version, '3.6');
     (escFast ? it : it.fails)(`(04d) Esc reaches the program within 50 ms of a normal key`, async () => {
         const terminal = await openTerminal();
         try {

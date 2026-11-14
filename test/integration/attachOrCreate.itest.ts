@@ -30,7 +30,7 @@ describeRig('attach-or-create argv (real tmux)', target => {
 
     /** Launch the production argv the way VS Code's pty host would; wait for the client. */
     async function launch(name: string, cwd: string, opts: AttachOrCreateOptions = {}): Promise<number> {
-        const pid = await rig.spawnHeldClient(RIG_TMUX, buildAttachOrCreateArgv(name, cwd, undefined, opts));
+        const pid = await rig.spawnHeldClient(RIG_TMUX, buildAttachOrCreateArgv(name, cwd, undefined, { tmuxPath: RIG_TMUX, tmuxVersion: target.version, ...opts }));
         await rig.waitUntil(`a client on ${name}`, async () => (await rig.clientCount(name)) >= 1);
         return pid;
     }
