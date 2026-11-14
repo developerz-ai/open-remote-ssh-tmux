@@ -1,3 +1,8 @@
+## 1.4.2
+
+- fix: on a folder's first connect over a real-latency link, the first New Terminal could still be a plain shell: writing the default-terminal setting to the remote took ~6 s, past the 5 s wait, so the layer declared itself ready before tmux was the default. The wait is now 15 s (found by the field replay against a real dev box)
+- docs: the acceptance results gain the field replay: v1.4.1 against a real dev box, every assertion PASS, and the log sweep went from 10 Error-level lines, 29 SOCKS timeouts and 10/12 pruning reconciles (v1.2.0) to 0, 0 and 0/2
+
 ## 1.4.1
 
 - fix(ci): release `.sha256` files are in `sha256sum -c` format, so the README's verify step works (the v1.3.0 and v1.4.0 assets were re-uploaded in this format, same hashes) (#72)

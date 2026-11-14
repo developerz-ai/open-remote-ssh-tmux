@@ -848,6 +848,22 @@ describe('reconcileDefaultTerminalProfile: applies the decision to Workspace sco
 
             expect(settled).toBe(true);
         });
+
+        // Field replay (plan 101, step 6): over a real-latency link the remote settings write took
+        // ~6 s on a folder's first connect; a 5 s cap declared the layer wired before tmux was the
+        // default, so the first New Terminal was a plain shell. The cap must cover that with margin.
+        it('waits long enough for a real-latency remote write (~6 s measured) to land before wiring', async () => {
+            vi.useFakeTimers();
+            updateControl.result = () => new Promise<void>((resolve) => setTimeout(resolve, 6000));
+            let settled = false;
+            void reconcileDefaultTerminalProfile(noopLog, true).then(() => { settled = true; });
+
+            await vi.advanceTimersByTimeAsync(5999);
+            expect(settled).toBe(false);
+            await vi.advanceTimersByTimeAsync(1);
+            expect(settled).toBe(true);
+            expect(DEFAULT_PROFILE_WRITE_DEADLINE_MS).toBeGreaterThanOrEqual(15000);
+        });
     });
 });
 
