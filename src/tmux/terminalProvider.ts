@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import {
     buildAttachOrCreateArgv,
     buildClaimSessionCommand,
-    buildDetachClientsCommand,
+    buildClearClosedCommand,
     buildHasSessionsCommand,
     buildKillSession,
     buildListClientsCommand,
@@ -256,6 +256,17 @@ export const REVIVE_DEADLINE_MS = 10000;
  */
 export const REVIVE_QUIET_MS = 2000;
 
+/**
+ * How long after the remote failed to answer a new terminal skips asking it again.
+ *
+ * Every remote call is bounded by a deadline, but they used to be paid one after another: a
+ * reload against a hung tmux spent a deadline on each of its probes, and "New Terminal", which
+ * waits for that reconcile, then spent one more on its own — a plain shell after 32 s (EDH row
+ * 24) for what one deadline had already settled. A terminal asked for within this window of a
+ * failure is a plain shell at once; after it, the next one asks again.
+ */
+export const UNREACHABLE_RETRY_MS = 5000;
+
 /** How many slots one new terminal tries while other machines keep claiming them first. A
  * bound, not a tuning knob: two machines racing settle on the second try. */
 const MAX_CLAIM_ATTEMPTS = 8;
@@ -281,6 +292,13 @@ interface RemoteSession {
     readonly attached: boolean;
     readonly windows: number;
     readonly owner: SlotOwner;
+    /** When the window that owns the session went away (its close marker), if the marker
+     * names the session's CURRENT owner — one left by an earlier owner says nothing about the
+     * client on it now. Remote epoch seconds. */
+    readonly closedAt?: number;
+    /** The close marker names this window: left by its previous connection (a reload, a
+     * reconnect), and withdrawn by the next reconcile. */
+    readonly closedByMe: boolean;
 }
 
 export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
@@ -353,6 +371,9 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
     private followUp: Promise<void> | undefined;
     /** Set by {@link dispose}: the layer was switched off. Nothing more is opened. */
     private disposed = false;
+    /** When a remote call last failed outright (no answer: dead channel, missed deadline);
+     * `undefined` once one has answered since. See {@link UNREACHABLE_RETRY_MS}. */
+    private unreachableAt: number | undefined;
     /** Sessions still to be looked for under {@link TmuxSessionContext.legacy}. Cleared once
      * a pass finds none left that it could not adopt. */
     private legacyPending: boolean;
@@ -543,11 +564,17 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         // A reconnect re-plans from scratch; entries left over from the previous pass would
         // hand out slots that have since been opened.
         this.pendingRestores.length = 0;
-        await this.adoptLegacySessions();
+        // ONE list serves legacy adoption and every decision below; it is read again only when
+        // adoption renamed something. Each list used to be its own round-trip, and against a
+        // hung remote each cost a full deadline (bug D).
+        let listed = await this.listRemote();
+        if (await this.adoptLegacySessions(listed)) {
+            listed = await this.listRemote();
+        }
         this.adoptRevivedTerminals();
         // Could not list → act as if nothing is there: nothing is adopted, and every mapped
         // slot is still settled by the has-session probe below, which never prunes on doubt.
-        const remote = await this.refreshRemote() ?? [];
+        const remote = listed === undefined ? [] : this.absorbRemote(listed);
         const remoteBySlot = new Map(remote.map(s => [s.slot, s]));
         // Every slot with any evidence behind it: ours (mapped) or the remote's (a
         // session of this workspace we haven't mapped — the adoption candidates).
@@ -556,8 +583,9 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         this.log.trace(`tmux reconcile: ${slots.length} slot(s) to resolve, ${remote.length} session(s) on remote`);
 
         const stale = await this.staleSlots(remote);
+        this.withdrawCloseMarkers(remote);
         const counts = { restored: 0, reclaimed: 0, adopted: 0, handedOff: 0, pruned: 0, skipped: 0 };
-        const decisions: Array<{ slot: number; action: SlotAction; mapped: boolean }> = [];
+        const decisions: Array<{ slot: number; action: SlotAction }> = [];
         for (const slot of slots) {
             const session = remoteBySlot.get(slot);
             const state: SlotInput = {
@@ -572,7 +600,7 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
             // field bug indistinguishable from correct no-steal behaviour in user logs.
             this.log.trace(`tmux ${describeSlot(state)}`);
             const decision = decideSlotAction(state);
-            decisions.push({ slot, action: decision.action, mapped: state.mapped });
+            decisions.push({ slot, action: decision.action });
             if (decision.forget && this.mapping.delete(slot)) {
                 // Handed away to another machine: our entry is history, not a claim.
                 counts.pruned++;
@@ -594,7 +622,7 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         const verdicts = await this.sessionVerdicts(toConfirm);
 
         const offers: number[] = [];
-        for (const { slot, action, mapped } of decisions) {
+        for (const { slot, action } of decisions) {
             switch (action) {
                 case 'restore':
                 case 'restore-takeover': {
@@ -632,7 +660,14 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
                     // to is gone (closed lid, killed VS Code) but its pty lives on for VS Code's
                     // 3 h grace. Taking it over is the hand-off that window could not do itself.
                     this.mapping.set(slot, remoteBySlot.get(slot)!.name);
-                    this.pendingRestores.push({ slot, takeOver: true, revivable: mapped });
+                    // Revivable even when it was never ours (bug C): both machines share one
+                    // vscode-server, which keeps the workspace's terminal layout. The window
+                    // that went away left its terminal in it, pty still running, and VS Code
+                    // relaunches that terminal here by asking this provider for a profile —
+                    // 1.7 s after the take-over in EDH row 23. Opened directly first, the
+                    // relaunch found the queue empty and minted a second session. Waiting
+                    // costs only the backstop when no relaunch comes (a different server).
+                    this.pendingRestores.push({ slot, takeOver: true, revivable: true });
                     counts.handedOff++;
                     break;
                 case 'offer':
@@ -682,7 +717,8 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
 
     /**
      * Adopt the sessions older versions named under {@link TmuxSessionContext.legacy} — the
-     * SSH alias as typed and the raw folder path — into the canonical identity, once. Each
+     * SSH alias as typed and the raw folder path — into the canonical identity, once, from the
+     * reconcile's own list (`sessions`; `undefined` when it could not be read). Each
      * is renamed (`rename-session`: the process inside and any attached client carry on) to
      * the same slot under the canonical name, or the lowest free one when that is taken.
      *
@@ -695,17 +731,13 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
      * Last, the persisted mapping is re-keyed to canonical names: a mapping entry still naming
      * a legacy session would be probed under that name and restored under the canonical one,
      * creating an empty session beside the real one.
+     *
+     * Resolves whether anything was renamed — the caller's list is stale if so.
      */
-    private async adoptLegacySessions(): Promise<void> {
+    private async adoptLegacySessions(sessions: readonly TmuxSession[] | undefined): Promise<boolean> {
         const legacy = this.ctx.legacy;
         if (!this.legacyPending || legacy === undefined) {
-            return;
-        }
-        let sessions: TmuxSession[] | undefined;
-        try {
-            sessions = readListSessionsResult(await this.exec(buildListSessions(this.tmuxPath)));
-        } catch (err) {
-            this.log.trace(`tmux legacy adoption: list failed: ${errorText(err)}`);
+            return false;
         }
         let unfinished = sessions === undefined;
         const taken = new Set<number>();
@@ -770,11 +802,13 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         if (adopted > 0) {
             this.log.info(`tmux terminals: adopted ${adopted} session(s) from the previous naming scheme`);
         }
+        return adopted > 0;
     }
 
     /**
-     * Sessions of this workspace whose foreign clients are all idle past the threshold —
-     * the staleness input to the decision. One extra round-trip, paid only when some
+     * Sessions of this workspace whose foreign clients are all abandoned — idle past the
+     * threshold, or untouched since their window closed (`closedAt`) — the staleness input to
+     * the decision. One extra round-trip, paid only when some
      * session is held by a client that is not ours (the hand-off case); every failure reads
      * as "not stale", because absent evidence must never license `-D`.
      */
@@ -793,7 +827,7 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
             }
             for (const session of held) {
                 const activities = clients.filter(c => c.session === session.name).map(c => c.activity);
-                if (isClientStale(activities, now, this.staleClientSeconds)) {
+                if (isClientStale(activities, now, this.staleClientSeconds, session.closedAt)) {
                     stale.add(session.slot);
                 }
             }
@@ -801,6 +835,23 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
             this.log.trace(`tmux list-clients failed: ${errorText(err)} — treating every client as live`);
         }
         return stale;
+    }
+
+    /**
+     * Withdraw the close markers this window's previous connection left (a reload or a
+     * reconnect drops the connection exactly like a close does — `buildCloseWatchCommand`).
+     * This window is back, so another machine must not read its terminals as abandoned. Not
+     * awaited: nothing in this pass depends on it, and a marker that survives a failed attempt
+     * is still checked against input since (`isClientStale`) and retried next reconcile.
+     */
+    private withdrawCloseMarkers(remote: readonly RemoteSession[]): void {
+        const names = remote.filter(session => session.closedByMe).map(session => session.name);
+        if (names.length === 0) {
+            return;
+        }
+        this.exec(buildClearClosedCommand(names, this.tmuxPath))
+            .then(() => this.log.trace(`tmux terminals: this window is back on ${names.length} session(s)`))
+            .catch(err => this.log.trace(`tmux terminals: close marker not withdrawn: ${errorText(err)}`));
     }
 
     /**
@@ -842,31 +893,6 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         }
         await this.persist();
         this.log.info(`tmux terminals: took over ${taken} session(s) from another machine at the user's request`);
-    }
-
-    /**
-     * Detach this window's tmux clients, for a window that is going away (extension
-     * deactivation). Without it the clients outlive the window inside VS Code's pty host for
-     * its reconnection grace (3 h), and another machine sees the sessions as held. Only
-     * sessions still tagged with this window's id are touched (`buildDetachClientsCommand`),
-     * so a session another machine took over a moment ago keeps its client. Best effort and
-     * never rejects: the caller bounds it with a short deadline, and a missed detach is
-     * covered by the staleness rule on the other side.
-     */
-    async detachAll(): Promise<void> {
-        const names = [...new Set([...this.openSlots, ...this.closingSlots])]
-            .sort((a, b) => a - b)
-            .map(slot => sessionName(this.ctx.hostKey, this.ctx.workspaceKey, slot));
-        this.closingSlots.clear();
-        if (names.length === 0) {
-            return;
-        }
-        try {
-            await this.exec(buildDetachClientsCommand(names, this.clientId, this.tmuxPath));
-            this.log.trace(`tmux terminals: detached this window from ${names.length} session(s)`);
-        } catch (err) {
-            this.log.trace(`tmux terminals: detach on close failed: ${errorText(err)}`);
-        }
     }
 
     /**
@@ -961,6 +987,11 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
             return profile;
         }
 
+        // The remote just failed to answer (typically the reconcile this call waited for, bug
+        // D): asking again would only spend another full deadline before the same plain shell.
+        if (this.unreachableAt !== undefined && Date.now() - this.unreachableAt < UNREACHABLE_RETRY_MS) {
+            return this.plainShellProfile();
+        }
         // No-steal snapshot, refreshed on create. Without one, any slot we picked could be
         // another client's session, so this terminal gets a plain shell instead.
         if (await this.refreshRemote() === undefined) {
@@ -1108,10 +1139,6 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         this.persist().catch(err => this.log.trace(`tmux terminal: close persist failed: ${errorText(err)}`));
     }
 
-    /** Slots whose terminal closed because the window is shutting down; {@link detachAll}
-     * detaches them along with whatever is still open. */
-    private readonly closingSlots = new Set<number>();
-
     /** Live `vscode.Terminal` -> slot, so a later close can find and release the
      * right slot. VS Code gives the provider no handle to the `Terminal` it
      * eventually constructs from a returned `TerminalProfile` (nor from `reopen`'s
@@ -1203,10 +1230,10 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
             return;
         }
         if (exitReason(terminal) === EXIT_REASON_SHUTDOWN) {
-            // The window is going away: remember the slot so `detachAll` (deactivate) still
-            // detaches its client — VS Code may report these closes before deactivating.
+            // The window is going away. Nothing is sent from here: VS Code kills the extension
+            // host within milliseconds, before any remote call could land. The remote learns of
+            // the close from the connection dropping (the close watch, `remoteExec.ts`).
             this.log.trace(`tmux terminal: slot ${slot} closed (${closeReason(terminal)}) — session kept`);
-            this.closingSlots.add(slot);
         } else {
             // A shell exit, an unknown reason, or no reason at all (VS Code < 1.71). Whether
             // the session survived is a question for the remote, not something to assert.
@@ -1345,27 +1372,39 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
     /** Snapshot this workspace's sessions on the remote; also refresh the
      * attached-elsewhere guard. `undefined` when the list could not be read (channel
      * failure, missed deadline, tmux not runnable) — distinct from "no sessions", and
-     * never thrown, so it can never break the connect. */
+     * never thrown, so it can never break the connect.
+     *
+     * On a *transient* probe failure (network blip) the last-known `attachedRemoteSlots` is
+     * retained: clearing it would silently disarm the no-steal guard, and the next new
+     * terminal could -A-attach a slot another client holds (mirrored keystrokes). Erring safe
+     * keeps a since-detached slot guarded only until the next *successful* probe re-syncs it —
+     * worst case a higher slot number, never a steal. */
     private async refreshRemote(): Promise<RemoteSession[] | undefined> {
-        let parsed: TmuxSession[] | undefined;
+        const parsed = await this.listRemote();
+        return parsed === undefined ? undefined : this.absorbRemote(parsed);
+    }
+
+    /** `list-sessions`, every session on the server; `undefined` when it could not be read.
+     * Records whether the remote answered at all ({@link unreachableAt}). */
+    private async listRemote(): Promise<TmuxSession[] | undefined> {
         try {
             const result = await this.exec(buildListSessions(this.tmuxPath));
-            parsed = readListSessionsResult(result);
+            this.unreachableAt = undefined;
+            const parsed = readListSessionsResult(result);
             if (parsed === undefined) {
                 this.log.trace(`tmux list-sessions failed (rc ${result.code ?? 'unknown'}): ${result.stderr.trim()}`);
             }
+            return parsed;
         } catch (err) {
+            this.unreachableAt = Date.now();
             this.log.trace(`tmux list-sessions failed: ${errorText(err)}`);
-        }
-        if (parsed === undefined) {
-            // Retain the last-known `attachedRemoteSlots` on a *transient* probe
-            // failure (network blip): clearing it would silently disarm the no-steal
-            // guard, and the next new terminal could -A-attach a slot another client
-            // holds (mirrored keystrokes). Erring safe keeps a since-detached slot
-            // guarded only until the next *successful* probe re-syncs it — worst case
-            // a higher slot number, never a steal.
             return undefined;
         }
+    }
+
+    /** This workspace's sessions out of a full list, and the attached-elsewhere guard
+     * refreshed from it. */
+    private absorbRemote(parsed: readonly TmuxSession[]): RemoteSession[] {
         const sessions: RemoteSession[] = [];
         const attached = new Set<number>();
         for (const session of parsed) {
@@ -1373,7 +1412,16 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
             if (slot === undefined) {
                 continue; // another workspace/user's session — not ours to touch
             }
-            sessions.push({ slot, name: session.name, attached: session.attached, windows: session.windows, owner: this.ownerOf(session.owner) });
+            const closed = session.closed;
+            sessions.push({
+                slot,
+                name: session.name,
+                attached: session.attached,
+                windows: session.windows,
+                owner: this.ownerOf(session.owner),
+                closedAt: closed !== undefined && closed.client === session.owner ? closed.at : undefined,
+                closedByMe: closed?.client === this.clientId,
+            });
             if (session.attached) {
                 attached.add(slot);
             }
@@ -1408,12 +1456,22 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
             return verdicts; // nothing to confirm — skip the round-trip
         }
         const names = slots.map(slot => this.mapping.get(slot)!);
+        if (this.unreachableAt !== undefined) {
+            // This pass's list got no answer at all: asking again only spends another deadline
+            // to learn the same thing (bug D). Unreachable keeps every mapping.
+            this.log.trace(`tmux has-session probe skipped for ${names.length} session(s): the remote did not answer`);
+            for (const slot of slots) {
+                verdicts.set(slot, 'unreachable');
+            }
+            return verdicts;
+        }
         try {
             const { stdout } = await this.exec(buildHasSessionsCommand(names, this.tmuxPath));
             parseHasSessions(stdout, names.length).forEach(({ code, message }, index) => {
                 verdicts.set(slots[index], classifyTmuxFailure(message, code));
             });
         } catch (err) {
+            this.unreachableAt = Date.now();
             this.log.trace(`tmux has-session probe failed for ${names.length} session(s): ${errorText(err)}`);
             for (const slot of slots) {
                 verdicts.set(slot, 'unreachable');

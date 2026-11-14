@@ -31,6 +31,10 @@ export const inspectOverrides = new Map<string, { globalValue?: unknown; workspa
  */
 export const updateCalls: { id: string; value: unknown; target: unknown }[] = [];
 
+/** What the next `config.update(...)` calls settle with. Unset: they resolve at once. A test
+ * sets `result` to hold a write open (the remote settings file not written yet) or fail it. */
+export const updateControl: { result?: () => Promise<void> } = {};
+
 /** Mirror of `vscode.ConfigurationTarget` (values match the real enum) — the default-profile
  * write targets `Workspace`; exposed so a test can assert the scope. */
 export enum ConfigurationTarget {
@@ -61,7 +65,7 @@ class MockWorkspaceConfiguration {
     public update(key: string, value: unknown, target?: unknown): Promise<void> {
         const id = this.section ? `${this.section}.${key}` : key;
         updateCalls.push({ id, value, target });
-        return Promise.resolve();
+        return updateControl.result ? updateControl.result() : Promise.resolve();
     }
 }
 

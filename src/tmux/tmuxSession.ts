@@ -48,6 +48,12 @@ const SAVED_HISTORY_OPTION = '@orst_saved_hl';
  * only, and never unset: `set-option -gu` on a user option crashes the tmux 2.6 server, and
  * a session's own options die with it. Readable at 2.6 … 3.8 (verified on the rig). */
 const OWNER_OPTION = '@orst_owner';
+/** Session user option a window's close watch sets when that window's connection drops:
+ * `<client id>:<remote epoch>` (see {@link buildCloseWatchCommand}). It is never unset, for
+ * the same reason as the owner tag; it is withdrawn by overwriting it with
+ * {@link CLOSED_CLEARED}, which no reader takes for a marker. */
+const CLOSED_OPTION = '@orst_closed';
+const CLOSED_CLEARED = 'none';
 /** `escape-time` tmux shipped as its default before 3.5 (500 ms — Esc felt laggy in every
  * TUI) and the value 3.5 made the new default. Ours only replaces the old default. */
 const LEGACY_ESCAPE_TIME = '500';
@@ -149,6 +155,11 @@ export interface TmuxSession {
     /** `#{@orst_owner}` — the client id of the window that last attached, or `undefined` for
      * a session that carries no tag (created before tags existed, or never attached by us). */
     readonly owner?: string;
+    /** `#{@orst_closed}` — the window whose connection dropped while it owned this session,
+     * and when (remote epoch seconds). `undefined` when the session carries no marker. A
+     * marker is only evidence about the client it names; whether that client still owns the
+     * session is the reader's question (`slotState.ts`). */
+    readonly closed?: { readonly client: string; readonly at: number };
 }
 
 /** Per-session options applied at create time. */
@@ -466,7 +477,7 @@ export function isDuplicateSession(stderr: string): boolean {
 export function buildListSessions(tmuxPath = TMUX_BIN): string {
     return `${escapeShellArg(tmuxPath)} list-sessions -F `
         + escapeShellArg(`#{session_name} #{session_attached} #{session_windows} #{session_created} #{pane_dead} `
-            + `${ACTIVITY_FIELD}#{session_activity} ${OWNER_FIELD}#{${OWNER_OPTION}}`);
+            + `${ACTIVITY_FIELD}#{session_activity} ${OWNER_FIELD}#{${OWNER_OPTION}} ${CLOSED_FIELD}#{${CLOSED_OPTION}}`);
 }
 
 /** Prefix of the activity field in a {@link buildListSessions} row — tagged like the owner
@@ -477,6 +488,9 @@ const ACTIVITY_FIELD = 'a:';
  * just the prefix, so the field is always exactly one token and the numeric fields stay
  * right-anchored behind it. */
 const OWNER_FIELD = 'o:';
+
+/** Prefix of the close-marker field in a {@link buildListSessions} row (last on the line). */
+const CLOSED_FIELD = 'c:';
 
 /** `owner`, or a thrown error when it is not a client id. A programming error, not input:
  * the id is minted by `clientIdentity.ts`, and the check keeps a `;` or `#` out of tmux. */
@@ -534,22 +548,44 @@ export function parseListClients(stdout: string): { now: number | undefined; cli
 }
 
 /**
- * Detach this window's clients from `names`, for a window that is going away — so another
- * machine finds the sessions free at once instead of waiting out VS Code's 3 h pty grace.
- * Each detach is guarded by the owner tag still being `owner`: if another machine took the
- * session over a moment ago, its client is the one on it now and `detach-client -s` would
- * evict it. A shell test rather than `if-shell -F`, so the comparison is plain `[ = ]` on
- * every tmux version. Errors are discarded: a session that is already gone is the goal.
+ * The close watch: one remote command per SSH connection of a window, started when the tmux
+ * layer wires and left running. It reads its stdin — the ssh channel — until EOF, which only
+ * comes when the connection that started it is gone, and then marks every session this
+ * window owns (`@orst_owner` = `owner`) as closed by it, at the remote clock.
+ *
+ * Why the remote has to do this: a closing window cannot. VS Code kills the extension host
+ * ~4 ms after telling it to terminate (EDH, VSCodium 1.143), so a detach sent from the window
+ * never arrives, while the window's tmux client lives on in VS Code's pty host for the
+ * reconnection grace (3 h) and another machine sees the session as held. The connection
+ * dropping is the one part of a close that reliably reaches the remote.
+ *
+ * It only MARKS. A reload and a network blip drop the connection too, and a window that comes
+ * back must find its terminals still attached; so nothing is detached here, the marker is
+ * withdrawn by the window's next reconcile ({@link buildClearClosedCommand}), and another
+ * machine reads it only alongside the client's input time (`isClientStale`).
+ *
+ * `trap '' HUP` and the redirections keep it alive and quiet once the channel is gone (the
+ * marking runs after EOF, when nothing may be written to it). Under `sh -c`, one line, like
+ * every other remote command here, so no login shell parses a byte of it.
  */
-export function buildDetachClientsCommand(names: readonly string[], owner: string, tmuxPath = TMUX_BIN): string {
+export function buildCloseWatchCommand(owner: string, tmuxPath = TMUX_BIN): string {
     const id = escapeShellArg(checkedOwner(owner));
     const tmux = escapeShellArg(tmuxPath);
+    const script = `trap '' HUP; exec >/dev/null 2>&1; cat; now=$(date +%s); `
+        + `${tmux} list-sessions -F '#{${OWNER_OPTION}} #{session_name}' | while read -r o n; do `
+        + `[ "$o" = ${id} ] && ${tmux} set-option -t "=$n:" ${CLOSED_OPTION} "${checkedOwner(owner)}:$now"; done`;
+    return `sh -c ${escapeShellArg(script)}`;
+}
+
+/**
+ * Withdraw this window's close markers from `names` — it is connected again (a reload, a
+ * reconnect), so another machine must not read its terminals as abandoned. Overwritten rather
+ * than unset (see {@link CLOSED_OPTION}); a session that is gone is no error.
+ */
+export function buildClearClosedCommand(names: readonly string[], tmuxPath = TMUX_BIN): string {
+    const tmux = escapeShellArg(tmuxPath);
     return names
-        .map(name => {
-            const target = escapeShellArg(name);
-            return `[ "$(${tmux} display-message -p -t =${target}: '#{${OWNER_OPTION}}' 2>/dev/null)" = ${id} ] `
-                + `&& ${tmux} detach-client -s =${target} 2>/dev/null`;
-        })
+        .map(name => `${tmux} set-option -t =${escapeShellArg(name)}: ${CLOSED_OPTION} ${CLOSED_CLEARED} 2>/dev/null`)
         .join('; ');
 }
 
@@ -676,8 +712,9 @@ export function parseListSessions(stdout: string): TmuxSession[] {
             continue;
         }
         const tokens = line.split(/\s+/);
-        // The owner field is optional on read: rows from before it existed (and test fixtures)
-        // carry five fields.
+        // The tagged fields are optional on read: rows from before they existed (and test
+        // fixtures) carry five fields. They are popped right to left, in the order written.
+        const closedToken = tokens[tokens.length - 1].startsWith(CLOSED_FIELD) ? tokens.pop()! : undefined;
         const ownerToken = tokens[tokens.length - 1].startsWith(OWNER_FIELD) ? tokens.pop()! : undefined;
         const activityToken = tokens[tokens.length - 1].startsWith(ACTIVITY_FIELD) ? tokens.pop()! : undefined;
         if (tokens.length < 5) {
@@ -699,6 +736,7 @@ export function parseListSessions(stdout: string): TmuxSession[] {
             createdEpoch,
             activityEpoch: activityToken === undefined ? undefined : toNonNegativeInt(activityToken.slice(ACTIVITY_FIELD.length)),
             owner: ownerToken === undefined || ownerToken === OWNER_FIELD ? undefined : ownerToken.slice(OWNER_FIELD.length),
+            closed: closedToken === undefined ? undefined : parseClosedMarker(closedToken.slice(CLOSED_FIELD.length)),
         });
     }
     return sessions;
@@ -763,6 +801,14 @@ export function reapVerdict(session: TmuxSession, now: number, opts: ReapOptions
 export function shouldReap(session: TmuxSession, now: number, opts: ReapOptions = {}): boolean {
     const verdict = reapVerdict(session, now, opts);
     return verdict === 'reap-corpse' || verdict === 'reap-orphan';
+}
+
+/** A close marker's value, or `undefined` for anything that is not one (unset, withdrawn). */
+function parseClosedMarker(value: string): TmuxSession['closed'] {
+    const colon = value.lastIndexOf(':');
+    const client = value.slice(0, colon);
+    const at = toNonNegativeInt(value.slice(colon + 1));
+    return colon > 0 && isClientId(client) && at !== undefined ? { client, at } : undefined;
 }
 
 /** Parse a token as a non-negative integer, or `undefined` if it is not one. */

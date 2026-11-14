@@ -140,6 +140,24 @@ describe('isClientStale', () => {
     it('defaults to two minutes', () => {
         expect(STALE_CLIENT_SECONDS).toBe(120);
     });
+
+    // Bug A: the owner's window closed (its close marker, on the remote clock). Its client
+    // lingers in VS Code's pty host, but nothing typed into it since the close can be a person.
+    describe('with a close marker', () => {
+        const CLOSED = NOW - 3;
+
+        it('is stale at once when no client has had input since the close', () => {
+            expect(isClientStale([CLOSED - 1, CLOSED], NOW, STALE_CLIENT_SECONDS, CLOSED)).toBe(true);
+        });
+
+        it('is live when a client has had input since the close (the window came back)', () => {
+            expect(isClientStale([CLOSED - 1, CLOSED + 1], NOW, STALE_CLIENT_SECONDS, CLOSED)).toBe(false);
+        });
+
+        it('is still never stale without clients', () => {
+            expect(isClientStale([], NOW, STALE_CLIENT_SECONDS, CLOSED)).toBe(false);
+        });
+    });
 });
 
 describe('toHandOffPolicy', () => {

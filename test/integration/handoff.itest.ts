@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it } from 'vitest';
-import { buildListClientsCommand, buildListSessions, parseListClients, parseListSessions } from '../../src/tmux/tmuxSession';
+import { buildCloseWatchCommand, buildListClientsCommand, buildListSessions, parseListClients, parseListSessions } from '../../src/tmux/tmuxSession';
 import { describeRig, PtyClient, RIG_TMUX, RigSession, sleep, WORKERS } from './rig';
 import { MachineState, RigWindow } from './window';
 
@@ -116,24 +116,41 @@ describeRig('hand-off between machines (real tmux)', target => {
         expect((await rigB.tmux('display-message', '-p', '-t', `=${terminalA.session}:`, '#{pane_pid}')).stdout.trim()).toBe(panePid);
     });
 
-    it('a window that closes detaches its own client at once, so B adopts without waiting', async () => {
+    /** A's close watch on its own connection, as `extension.ts` starts it at wiring. */
+    const watchClose = (windowA: RigWindow): void => {
+        void rigA.rawExec(buildCloseWatchCommand(windowA.clientId, RIG_TMUX)).catch(() => undefined);
+    };
+    const closedMarker = async (session: string): Promise<string> =>
+        (await rigB.tmux('display-message', '-p', '-t', `=${session}:`, '#{@orst_closed}')).stdout.trim();
+
+    // Bug A (EDH rows 03/22): a closing window cannot detach its client — VS Code kills the
+    // extension host first — and the client lives on in VS Code's pty host. The connection
+    // dropping is what reaches the remote, and the watch turns it into a marker.
+    it('a window whose connection drops is taken over by B at once, at the default threshold', async () => {
         const windowA = new RigWindow(rigA, new MachineState(), CTX);
         await windowA.connect();
+        watchClose(windowA);
         const terminalA = await windowA.newTerminal();
         await rigB.waitUntil('A attached', () => rigB.heldClientAttached(terminalA.holderPid, terminalA.session));
+        await sleep(SETTLE_MS); // the watch is waiting on its channel
 
-        await windowA.provider.detachAll();
-        await rigB.waitUntil('A detached', async () => (await rigB.clientCount(terminalA.session)) === 0);
+        await rigA.close();
+        await rigB.waitUntil('A\'s sessions marked closed', async () =>
+            new RegExp(`^${windowA.clientId}:\\d+$`).test(await closedMarker(terminalA.session)));
+        expect(await rigB.heldClientAttached(terminalA.holderPid, terminalA.session)).toBe(true); // pty host keeps it
 
-        // Default threshold (two minutes): only the explicit detach can make this immediate.
-        const windowB = new RigWindow(rigB, new MachineState(), CTX);
+        const windowB = new RigWindow(rigB, new MachineState(), CTX, { offerTakeOver: async () => false });
         await windowB.connect();
         expect(windowB.opened.map(t => t.session)).toEqual([terminalA.session]);
+        await rigB.waitUntil('B took over', async () =>
+            await rigB.heldClientAttached(windowB.opened[0].holderPid, terminalA.session)
+            && !await rigB.heldClientAttached(terminalA.holderPid, terminalA.session));
     });
 
-    it('detachAll never detaches another machine\'s client from a session it took over', async () => {
+    it('a marker never licenses taking a session another machine took over since', async () => {
         const windowA = new RigWindow(rigA, new MachineState(), CTX);
         await windowA.connect();
+        watchClose(windowA);
         const terminalA = await windowA.newTerminal();
         await rigB.waitUntil('A attached', () => rigB.heldClientAttached(terminalA.holderPid, terminalA.session));
         const windowB = new RigWindow(rigB, new MachineState(), CTX, { offerTakeOver: async () => true });
@@ -143,11 +160,31 @@ describeRig('hand-off between machines (real tmux)', target => {
             return windowB.opened.length === 1 && await rigB.heldClientAttached(windowB.opened[0].holderPid, terminalA.session);
         });
 
-        // A's provider still believes slot 0 is open (VS Code has not told it the tab closed).
-        await windowA.provider.detachAll();
+        await rigA.close(); // A's watch fires now, on a session that is B's
         await sleep(SETTLE_MS);
 
+        const windowC = new RigWindow(rigB, new MachineState(), CTX, { offerTakeOver: async () => false });
+        await windowC.connect();
+        expect(windowC.opened).toEqual([]);
         expect(await rigB.heldClientAttached(windowB.opened[0].holderPid, terminalA.session)).toBe(true);
+    });
+
+    // A reload drops the connection exactly like a close; the reloaded window is the same
+    // client and withdraws the marker, so nobody reads its live terminals as abandoned.
+    it('the same window coming back withdraws its marker', async () => {
+        const machineA = new MachineState();
+        const windowA = new RigWindow(rigA, machineA, CTX);
+        await windowA.connect();
+        watchClose(windowA);
+        const terminalA = await windowA.newTerminal();
+        await rigB.waitUntil('A attached', () => rigB.heldClientAttached(terminalA.holderPid, terminalA.session));
+        await sleep(SETTLE_MS);
+        await rigA.close();
+        await rigB.waitUntil('marked', async () => (await closedMarker(terminalA.session)) !== '');
+
+        const reloaded = new RigWindow(rigB, machineA, CTX);
+        await reloaded.connect();
+        await rigB.waitUntil('marker withdrawn', async () => (await closedMarker(terminalA.session)) === 'none');
     });
 
     // What the staleness rule measures (recorded in slotState.ts): `client_activity` moves on

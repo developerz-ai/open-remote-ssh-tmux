@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest';
 import {
     buildAttachOrCreateArgv,
     buildClaimSessionCommand,
-    buildDetachClientsCommand,
+    buildClearClosedCommand,
+    buildCloseWatchCommand,
     buildHasSession,
     buildHasSessionsCommand,
     buildKillSession,
@@ -111,7 +112,7 @@ describe('buildListSessions', () => {
         // `#{session_windows}` alone can never be 0 for a live session, so it is not it.
         expect(buildListSessions()).toBe(
             `'tmux' list-sessions -F `
-            + `'#{session_name} #{session_attached} #{session_windows} #{session_created} #{pane_dead} a:#{session_activity} o:#{@orst_owner}'`,
+            + `'#{session_name} #{session_attached} #{session_windows} #{session_created} #{pane_dead} a:#{session_activity} o:#{@orst_owner} c:#{@orst_closed}'`,
         );
     });
 
@@ -697,30 +698,89 @@ describe('buildListClientsCommand / parseListClients (staleness evidence)', () =
     });
 });
 
-describe('buildDetachClientsCommand (explicit detach on window close)', () => {
+describe('close marker (bug A: a window that went away says so)', () => {
     const OWNER = '1a2b3c4d-0011aabb';
     const A = `code-${HASH_PROJ}-0`;
     const B = `code-${HASH_PROJ}-1`;
 
-    // Only detach where the owner tag is still ours: if another machine took the session over
-    // a moment ago, its client is the one on it now, and `detach-client -s` would evict it.
-    it('detaches each session only while its owner tag is ours, with exact = targets', () => {
-        const command = buildDetachClientsCommand([A, B], OWNER);
-        for (const name of [A, B]) {
-            expect(command).toContain(
-                `[ "$('tmux' display-message -p -t ='${name}': '#{@orst_owner}' 2>/dev/null)" = '${OWNER}' ] `
-                + `&& 'tmux' detach-client -s ='${name}' 2>/dev/null`,
+    describe('parseListSessions', () => {
+        it('reads the marker: which client went away, and when (remote clock)', () => {
+            expect(parseListSessions(`code-x-0 1 1 1700000000 0 a:1700000500 o:${OWNER} c:${OWNER}:1700000900`)[0]).toMatchObject({
+                name: 'code-x-0', owner: OWNER, activityEpoch: 1700000500, closed: { client: OWNER, at: 1700000900 },
+            });
+        });
+
+        it.each(['c:', 'c:none', 'c:x;y:1', `c:${OWNER}:`, `c:${OWNER}:12a`])('reads %j as no marker', field => {
+            expect(parseListSessions(`code-x-0 1 1 1700000000 0 a:1700000500 o:${OWNER} ${field}`)[0]).toMatchObject({
+                name: 'code-x-0', owner: OWNER, closed: undefined,
+            });
+        });
+
+        it('still parses a row from before the marker existed', () => {
+            expect(parseListSessions(`code-x-0 1 1 1700000000 0 a:1700000500 o:${OWNER}`)[0]).toMatchObject({
+                name: 'code-x-0', owner: OWNER, activityEpoch: 1700000500, closed: undefined,
+            });
+        });
+    });
+
+    describe('buildCloseWatchCommand', () => {
+        const script = (command: string): string => {
+            const match = /^sh -c '(.*)'$/s.exec(command);
+            expect(match).not.toBeNull();
+            return match![1].replace(/'\\''/g, '\'');
+        };
+
+        // Run through `sh -c` like every other remote command here: a csh/fish login shell
+        // must not parse a byte of it.
+        it('is one line under sh -c', () => {
+            const command = buildCloseWatchCommand(OWNER);
+            expect(command).toMatch(/^sh -c '/);
+            expect(command).not.toContain('\n');
+        });
+
+        // The whole point: nothing happens until the connection is gone. stdin is the ssh
+        // channel, which only reaches EOF when the connection that started it dies.
+        it('waits for the channel to close before touching tmux', () => {
+            const body = script(buildCloseWatchCommand(OWNER));
+            expect(body.indexOf('cat')).toBeGreaterThanOrEqual(0);
+            expect(body.indexOf('cat')).toBeLessThan(body.indexOf('\'tmux\''));
+        });
+
+        it('survives the hang-up and never writes to the dead channel', () => {
+            const body = script(buildCloseWatchCommand(OWNER));
+            expect(body).toMatch(/^trap '' HUP; exec >\/dev\/null 2>&1; /);
+        });
+
+        it('marks only the sessions this window owns, by exact target, with the remote clock', () => {
+            const body = script(buildCloseWatchCommand(OWNER));
+            expect(body).toContain(`'tmux' list-sessions -F '#{@orst_owner} #{session_name}'`);
+            expect(body).toContain(`[ "$o" = '${OWNER}' ]`);
+            expect(body).toContain(`'tmux' set-option -t "=$n:" @orst_closed "${OWNER}:$now"`);
+            expect(body).toContain('now=$(date +%s)');
+        });
+
+        it('runs the given tmux binary, quoted', () => {
+            expect(script(buildCloseWatchCommand(OWNER, '/opt/my tmux'))).toContain(`'/opt/my tmux' list-sessions`);
+        });
+
+        it('refuses a malformed owner', () => {
+            expect(() => buildCloseWatchCommand('x;y')).toThrow();
+        });
+    });
+
+    describe('buildClearClosedCommand', () => {
+        // Overwritten, never unset: `set-option -u` on a user option is the operation that
+        // crashed the tmux 2.6 server (see SAVED_HISTORY_OPTION).
+        it('overwrites the marker on each session, exact target, failures ignored', () => {
+            expect(buildClearClosedCommand([A, B])).toBe(
+                `'tmux' set-option -t ='${A}': @orst_closed none 2>/dev/null; `
+                + `'tmux' set-option -t ='${B}': @orst_closed none 2>/dev/null`,
             );
-        }
-        expect(command.split('; ')).toHaveLength(2);
-    });
+        });
 
-    it('runs the given tmux binary, quoted', () => {
-        expect(buildDetachClientsCommand([A], OWNER, '/opt/my tmux')).toContain(`'/opt/my tmux' detach-client`);
-    });
-
-    it('refuses a malformed owner', () => {
-        expect(() => buildDetachClientsCommand([A], 'x;y')).toThrow();
+        it('runs the given tmux binary, quoted', () => {
+            expect(buildClearClosedCommand([A], '/opt/my tmux')).toContain(`'/opt/my tmux' set-option`);
+        });
     });
 });
 
