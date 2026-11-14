@@ -56,8 +56,7 @@ Logs go to the local "Remote - SSH" output channel only; nothing is sent anywher
   being spawned, and the list of identity files found.
   The connection token is redacted from the install command and its output, and
   ProxyCommand arguments are replaced by their count. Trace lines appear only when VS Code's
-  log level is set to Trace. On VS Code hosts before 1.74, which have no log level for
-  extensions, they are always written; the redactions above still apply.
+  log level is set to Trace.
 
 Check the channel before pasting it into a public issue: it contains host names, user names
 and remote paths.

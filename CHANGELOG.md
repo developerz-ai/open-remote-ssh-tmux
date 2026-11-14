@@ -1,3 +1,57 @@
+## Unreleased
+
+Hardening sweep (plan `101-bulletproof-hardening-sweep`): every change below was proven against real tmux 2.6, 3.0a, 3.4, 3.5a and 3.8 over real SSH in the new docker rig, not only in unit tests.
+
+**Requirements**
+
+- **build: VS Code / VSCodium 1.90 or newer is required** (was 1.70.2) (#67). The bundled code needs Node 20, and 1.90 is the first release whose extension host runs it
+
+**Security**
+
+- **fix: the local tunnel, SOCKS and port-forwarding listeners bound every interface** (#61). `.listen(port)` exposed an unauthenticated SOCKS5 relay into the remote's network to anyone on the client's LAN. All listeners now bind `127.0.0.1`
+- **fix: a workspace folder name could run commands on the remote** (#64). `tmux new-session -c <folder>` format-expands its argument, so a folder named `x#(touch $HOME/pwned)` executed that command on every tmux version, and `#S` or a trailing `;` landed the shell in `$HOME`. `#` is now doubled and a trailing `;` escaped
+- **fix: a Windows `.bat`/`.cmd` ProxyCommand ran with unescaped host values** (#61). A `%h`/`%n`/`%r`/`%p` value containing a cmd.exe metacharacter (`& | < > ^ % " ! ( )` or a newline) is now refused instead of spliced into the command line
+- fix: ProxyCommand arguments are redacted in the log, the install script is logged once per session (then as a sha256), and Trace lines are written only at the Trace log level on VS Code 1.74+ (#61)
+- fix: the clipboard webview runs under a strict nonce-based Content Security Policy (#59)
+
+**Terminals moving between machines** (#65)
+
+- **fix: reconnecting on one machine evicted the terminal another machine was using.** Ownership was read from a client-local mapping, so a PC reconnecting after the laptop adopted its terminals took them back with tmux `-D`, and the two ping-ponged on every reload. Each window now tags the sessions it attaches with an id derived from a hash of its machine id (never the raw id); a session held by another machine's live window is never taken without a click
+- **feat: hand-off from a machine that went to sleep.** A window that disappears without closing keeps its terminals for up to 3 hours. They are now treated as abandoned after 2 minutes without typing and moved to the machine that opens the workspace. New setting `remote.SSH.tmux.handOff`: `auto` (default; idle terminals move without asking, live ones are offered), `ask` (always offer), `never`. Note that a window someone is only watching, with no typing for 2 minutes, counts as idle
+- feat: "This workspace's terminals are open on another machine." **[Take over]** **[Not now]** — one notification instead of a silent skip
+- **fix: closing a window never released its terminals.** VS Code ends the extension host milliseconds after a window closes, so a release sent from the window never reached the remote, and another machine waited out the 2-minute idle rule. Each connection now carries a small remote watch: when the connection ends, the remote marks that window's terminals as closed, and a machine opening the workspace takes them over at once if nobody has typed in them since. Nothing is detached at close; a window that reconnects (reload, network blip) withdraws the mark. Under `auto`, a machine that opens the workspace while another window's connection is down takes its terminals at once
+- fix: taking terminals over from another machine could leave one extra, empty terminal — VS Code relaunched the departed window's terminal here and that relaunch got a new session. Taken-over terminals now wait for that relaunch (10 s at most)
+
+**Session lifecycle** (#66)
+
+- **fix: connect-time cleanup never removed anything.** It only reaped sessions with a dead pane, which `remain-on-exit off` never leaves. Detached sessions of ours idle longer than the new `remote.SSH.tmux.orphanMaxAgeDays` (default 14, `0` = never) are now closed on connect; attached sessions, sessions we did not create and this window's own terminals are never touched. Log: `tmux housekeeping: K killed, O old sessions kept`
+- feat: `remote.SSH.tmux.*` settings apply without a reload. Turning `enabled` off offers to close this workspace's terminals that are still running; turning it back on restores the layer
+- fix: the same machine reached through an alias, an address and a lower/upper-case name counted as different workspaces. Sessions are keyed on the resolved `user@host:port` and a normalised folder path; existing sessions are renamed once, processes kept
+- fix: two machines opening a terminal at the same moment could both attach the same new session (mirrored input). A new terminal now claims its session on the remote first
+- feat: a one-time warning per host when systemd-logind `KillUserProcesses=yes` would end every terminal at logout
+
+**Reliability** (#60, #61, #64)
+
+- **fix: a half-dead connection could hang the connect or a New Terminal forever.** Every remote tmux command now has a deadline (capability check 5 s, other commands 8 s) and reports its exit status; a remote that does not answer gives a plain shell for that terminal instead of a stall, and a transient failure no longer reads as "tmux is not installed". Keepalive follows `ServerAliveInterval`/`ServerAliveCountMax` (default 15 s × 3), and the connect path is bounded (`uname` 30 s, server install 30 min, ProxyJump by `connectTimeout`, SSH agent 10 s)
+- fix: a mapped terminal is forgotten only when tmux says its session is gone, never because a command could not be delivered (#60)
+- fix: against a hung tmux, waits stacked up — a reload plus a New Terminal took about 33 s to give a plain shell. Each reconnect now lists sessions once and skips the follow-up check after a timeout, and for 5 s after a failed call a new terminal is a plain shell at once (about 9 s in the same case)
+- fix: the very first terminal after the first connect to a host could be a plain shell, because "New Terminal" ran before the default-profile setting was written. Wiring now waits for that write (5 s at most)
+- fix: `remote.SSH.tmux.historyLimit` values such as `1.5`, `-1` or `1e10` stopped every terminal from opening; the value is now an integer from 0 to 1000000 (#64)
+- fix: the user's own tmux settings were overwritten. Their global `history-limit` was reset to 2000; `escape-time`, `set-clipboard` and the PageUp/PageDown bindings are now changed only while they still hold tmux's defaults (#64)
+- fix: Ctrl-B reached tmux instead of the program (Claude Code uses it); Esc no longer lags half a second on tmux before 3.5 (#64)
+- fix: `known_hosts` handling honours `UserKnownHostsFile`, `GlobalKnownHostsFile` and `HostKeyAlias` (#61)
+- fix: remote clipboard commands run under `sh -c`, so csh/tcsh/fish login shells no longer break the image paste (#59)
+
+**Build and release** (#62, #63)
+
+- test: a committed real-tmux docker rig (`npm run test:tmux`) runs in CI for every supported tmux version
+- ci: publishing requires the tag to match `package.json` and re-runs build, tests and lint; pull requests build and check the `.vsix`; `npm audit` and zizmor moved to a daily workflow
+- ci: lint fails on any warning and checks floating promises with type information; unit tests run under coverage thresholds and also on Windows and macOS (#67)
+
+**Docs**
+
+- docs: [`docs/troubleshooting.md`](docs/troubleshooting.md) (reading the log, notifications, terminals closed after disconnect) and [`docs/upstream-sync.md`](docs/upstream-sync.md); README lists requirements, every setting, known limitations and a security section
+
 ## 1.2.0
 
 A security and correctness release from a full audit of the codebase. No new features; the

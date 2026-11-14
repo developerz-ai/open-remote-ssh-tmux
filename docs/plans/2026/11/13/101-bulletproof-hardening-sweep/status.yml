@@ -1,43 +1,48 @@
 plan: 101-bulletproof-hardening-sweep
 title: Bulletproof hardening sweep (terminals, connection, tests, release)
-status: not_started        # not_started | in_progress | blocked | complete | superseded
+status: complete           # not_started | in_progress | blocked | complete | superseded
 created_by: sebi
-worked_by: ""              # who is executing it; empty = unclaimed
+worked_by: "claude (coordinator) + subagents"              # who is executing it; empty = unclaimed
 owner: sebi
-percent: 0                 # 0–100, overall completion
-current_focus: "01-real-tmux-rig.md"
+percent: 100               # 0–100, overall completion
+current_focus: "done"
 slices:                    # one row per <NN>-<aspect>.md slice
   - file: 01-real-tmux-rig.md
-    status: not_started      # not_started | in_progress | complete
-    percent: 0
+    status: complete
+    percent: 100
   - file: 02-exec-deadlines.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 03-handoff-ownership.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 04-tmux-command-hardening.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 05-session-lifecycle.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 06-connection-security.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 07-ci-release-gates.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 08-docs-truth.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 09-verify.md
-    status: not_started
-    percent: 0
-evidence: []               # commits/PRs proving progress, e.g. ["#42", "abc1234"]
+    status: complete
+    percent: 100
+evidence: ["#58", "#59", "#60", "#61", "#62", "#63", "#64", "#65", "#66", "#67", "#68", "results-2026-11-14.md"]               # commits/PRs proving progress, e.g. ["#42", "abc1234"]
 notes: >-
-  Based on an audit of v1.2.0 (code read, VSCodium logs 2026-11-04..13, live remote tmux state).
-  Owner decisions pending before slice 03 ships: hand-off policy default (auto | ask | never) and
-  whether to wrap the tmux server start for systemd lifetime (slice 05 k). Items marked [S] in the
-  slices must be reproduced on the rig before any fix.
-last_updated: 2026-11-13
+  Owner decisions applied: handOff default auto (idle = no keyboard input for 120 s; a watched-only window
+  counts as idle, documented); systemd lifetime = detect logind KillUserProcesses + one-time warning, no wrapper.
+  Slice 03's detach-on-deactivate never reached the remote (ext host dies ~5 ms after terminate) and was
+  replaced in #68 by a remote close watch that marks sessions @orst_closed. Rig per-version: whole chain
+  works on tmux 2.6, 3.0a, 3.4, 3.5a, 3.8 (floor stays 2.6); client_activity moves on keystrokes only;
+  set -gu @user-option crashes tmux 2.6 (never done). Known limitation: Esc held ~0.5 s on tmux 3.8 (tmux
+  #5777, fixed upstream 2b12402). Deferred: Windows remote (row 13), Claude Code TUI (18), logind host (36),
+  ProxyJump/password/port-forward regression drive, field replay, local zizmor pin, simple-socks stays a git
+  dep (fork differs from registry), server tarball checksum (TLS only).
+last_updated: 2026-11-14

@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import * as fs from 'node:fs';
 import { createRequire } from 'node:module';
 import * as path from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -309,4 +310,22 @@ describe('commit-message policy', () => {
     it('still judges a typed merge subject by the type policy', async () => {
         expect((await verdict('fix: repair the commit-message gate (#36)\n')).status).toBe(0);
     }, 30_000);
+});
+
+// The allowed types are written down in three places agents read before committing. Each
+// must say exactly what commitlint enforces, or an agent following the doc either has a
+// commit refused or avoids a type the policy allows.
+describe('documented commit types', () => {
+    const config = repoRequire('./commitlint.config.js') as { rules: Record<string, [number, string, string[]]> };
+    const enforced = [...config.rules['type-enum'][2]].sort();
+
+    it.each([
+        ['CLAUDE.md', /Allowed types:\s*`([^`]+)`/],
+        ['.claude/commands/feature.md', /allowed types `([^`]+)`/],
+        ['.claude/commands/planx.md', /commitlint types: `([^`]+)`/],
+    ])('%s lists exactly the types commitlint.config.js allows', (file, pattern) => {
+        const listed = pattern.exec(fs.readFileSync(path.join(root, file), 'utf8'))?.[1];
+        expect(listed, `${file} names the allowed commit types`).toBeDefined();
+        expect(listed!.split(/\s+/).filter(Boolean).sort()).toEqual(enforced);
+    });
 });
