@@ -2,7 +2,7 @@
 
 This repo is built to be worked by **AI coding agents** — agents write ~100% of
 the code, humans review/steer/operate. The full playbook lives in
-[`../../../gold-standards-in-ai/`](../../../gold-standards-in-ai/docs/00-philosophy.md);
+[`gold-standards-in-ai`](https://github.com/developerz-ai/gold-standards-in-ai/blob/main/docs/00-philosophy.md);
 this doc records what that means *here*, and what's already true vs. still a gap.
 
 > The core loop: **great DX → fast agents → more shipped → better DX.** Every
