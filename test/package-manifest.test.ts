@@ -144,6 +144,17 @@ describe('package.json manifest drift guard', () => {
             expect(reapOnConnect.default).toBe(true);
         });
 
+        it('declares remote.SSH.tmux.orphanMaxAgeDays with the documented default (05)', () => {
+            const orphanMaxAgeDays = properties['remote.SSH.tmux.orphanMaxAgeDays'];
+            expect(orphanMaxAgeDays).toBeDefined();
+            expect(orphanMaxAgeDays.type).toBe('integer');
+            expect(orphanMaxAgeDays.default).toBe(14);
+            expect(orphanMaxAgeDays.minimum).toBe(0);
+            expect(orphanMaxAgeDays.scope).toBe('application');
+            // Invisible UX: the setting describes terminals, not the tmux machinery behind them.
+            expect(String(orphanMaxAgeDays.markdownDescription)).not.toMatch(/tmux/i);
+        });
+
         it('declares remote.SSH.tmux.handOff with the documented default', () => {
             const handOff = properties['remote.SSH.tmux.handOff'];
             expect(handOff).toBeDefined();

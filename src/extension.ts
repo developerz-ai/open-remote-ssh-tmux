@@ -1,21 +1,24 @@
+import * as os from 'os';
 import * as vscode from 'vscode';
 import Log from './common/logger';
-import { RemoteSSHResolver, REMOTE_SSH_AUTHORITY } from './authResolver';
+import { expandTokens, RemoteSSHResolver, REMOTE_SSH_AUTHORITY } from './authResolver';
 import SSHDestination from './ssh/sshDestination';
-import { KILL_WORKSPACE_SESSIONS_COMMAND_ID, killWorkspaceSessions, openSSHConfigFile, promptOpenRemoteSSHWindow, type WorkspaceKillTarget } from './commands';
+import SSHConfiguration from './ssh/sshConfig';
+import { closeWorkspaceSessions, KILL_WORKSPACE_SESSIONS_COMMAND_ID, killWorkspaceSessions, openSSHConfigFile, promptOpenRemoteSSHWindow, type WorkspaceKillTarget, type WorkspaceSessionIdentity, type WorkspaceSessionKiller } from './commands';
 import { HostTreeDataProvider } from './hostTreeView';
 import { getRemoteWorkspaceLocationData, RemoteLocationHistory } from './remoteLocationHistory';
-import { TmuxTerminalProvider, type OpenTerminal } from './tmux/terminalProvider';
+import { TmuxTerminalProvider, type OpenTerminal, type TmuxSessionContext } from './tmux/terminalProvider';
 import { createRemoteExec, type RawExec, type RemoteExec } from './tmux/remoteExec';
-import type { TmuxCapability } from './tmux/tmuxBootstrap';
+import { probeLifetimeRisk, type LifetimeFacts, type TmuxCapability } from './tmux/tmuxBootstrap';
 import { withDeadline } from './common/deadline';
 import { FallbackTerminalProvider } from './tmux/fallbackTerminalProvider';
 import { TerminalProfileRegistration } from './tmux/profileRegistration';
 import { pasteClipboardImage, sweepOldImages } from './clipboard/pasteImage';
 import { SessionReaper } from './tmux/sessionReaper';
-import { clampHistoryLimit } from './tmux/tmuxSession';
+import { canonicalHostKey, canonicalWorkspaceKey, clampHistoryLimit, DEFAULT_ORPHAN_MAX_AGE_DAYS, type SshTarget } from './tmux/tmuxSession';
 import { resolveClientId } from './tmux/clientIdentity';
 import { toHandOffPolicy, type HandOffPolicy } from './tmux/slotState';
+import { decideSettingsChange } from './tmux/settingsWatcher';
 import { prepareEnvCollection } from './common/envCollection';
 import { disposeAll } from './common/disposable';
 
@@ -45,17 +48,34 @@ export async function activate(context: vscode.ExtensionContext) {
     // unavailable or disabled; wireTmuxTerminalLayer swaps in the real provider.
     const profileRegistration = new TerminalProfileRegistration(TMUX_PROFILE_ID);
     profileRegistration.use(new FallbackTerminalProvider());
-    context.subscriptions.push(profileRegistration);
 
-    // Wire tmux terminal provider and session reaper after remote resolution completes.
-    // The provider/reaper are gated on PR3 capability (tmux available) and PR5 setting
-    // (remote.SSH.tmux.enabled). This callback fires after *every* resolve() succeeds —
-    // including reconnects — so it wires the layer exactly once and only refreshes it
-    // thereafter (idempotentResolveHandler): re-swapping the terminal profile provider
-    // per reconnect would needlessly churn the registration and orphan the live one.
-    const wireOnResolve = idempotentResolveHandler(
+    // Wire the tmux terminal provider after remote resolution completes, gated on the
+    // capability probe and `remote.SSH.tmux.enabled`. The resolve callback fires after
+    // *every* resolve() — including reconnects — so the controller wires the layer once and
+    // only refreshes it thereafter: re-swapping the terminal profile provider per reconnect
+    // would needlessly churn the registration and orphan the live one. Settings and folder
+    // changes rewire or unwire it at runtime (`watchTmuxLayerInputs`).
+    const layers = new TmuxLayerController(
         () => wireTmuxTerminalLayer(context, remoteSSHResolver, profileRegistration, logger)
     );
+    // Released before the registration it swaps the fallback back into.
+    context.subscriptions.push({ dispose: () => layers.unwire() });
+    context.subscriptions.push(profileRegistration);
+    context.subscriptions.push(watchTmuxLayerInputs({
+        onDidChangeConfiguration: listener => vscode.workspace.onDidChangeConfiguration(listener),
+        onDidChangeWorkspaceFolders: listener => vscode.workspace.onDidChangeWorkspaceFolders(listener),
+    }, {
+        controller: layers,
+        readSettings: readTmuxSettings,
+        connected: () => remoteSSHResolver.getSSHConnection() !== undefined,
+        currentIdentity: () => currentTmuxIdentity(logger),
+        clearDefaultProfile: () => reconcileDefaultTerminalProfile(logger, false, remoteSSHResolver.getRemotePlatform()),
+        offerCleanup: identity => offerBackgroundCleanup(identity, {
+            reaper: newReaper(remoteSSHResolver, logger),
+            ask: (message, ...items) => vscode.window.showInformationMessage(message, ...items),
+        }),
+        log: logger,
+    }));
     // The image sweep is deliberately NOT inside `wireTmuxTerminalLayer`. It used to be, and
     // that tied housekeeping for pasted screenshots to a gate it has nothing to do with:
     // pasting only needs a remote authority, but the sweep only ran when the tmux layer wired.
@@ -69,7 +89,9 @@ export async function activate(context: vscode.ExtensionContext) {
     // rather than registered separately.
     remoteSSHResolver.onResolveSuccessfullyCompleted(() => {
         sweepImages();
-        wireOnResolve();
+        layers.resolved()
+            .then(layer => runHousekeeping(remoteSSHResolver, logger, layer))
+            .catch(err => logger.trace(`Persistent terminal housekeeping failed: ${errorMessage(err)}`));
     });
 
     const locationHistory = new RemoteLocationHistory(context);
@@ -94,7 +116,7 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(vscode.commands.registerCommand('openremotessh.openEmptyWindowInCurrentWindow', () => promptOpenRemoteSSHWindow(true)));
     context.subscriptions.push(vscode.commands.registerCommand('openremotessh.openConfigFile', () => openSSHConfigFile()));
     context.subscriptions.push(vscode.commands.registerCommand('openremotessh.showLog', () => logger.show()));
-    context.subscriptions.push(vscode.commands.registerCommand(KILL_WORKSPACE_SESSIONS_COMMAND_ID, () => killWorkspaceSessions(() => resolveKillTarget(remoteSSHResolver, logger))));
+    context.subscriptions.push(vscode.commands.registerCommand(KILL_WORKSPACE_SESSIONS_COMMAND_ID, () => killWorkspaceSessions(() => resolveKillTarget(remoteSSHResolver, logger, layers))));
 
     // Paste a LOCAL screenshot into the focused REMOTE terminal: the clipboard lives on this
     // machine, the tool that needs the image (e.g. Claude Code) runs on the server, and
@@ -136,47 +158,49 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 /**
- * Wire tmux terminal provider and session reaper after remote resolution succeeds.
- * Gated on PR3 capability (tmux available) + PR5 setting (remote.SSH.tmux.enabled).
- * Constructs and registers TmuxTerminalProvider, SessionReaper with injected
- * Log, exec, clock; pushes disposables for cleanup.
+ * Wire the tmux terminal provider after remote resolution succeeds. Gated on the capability
+ * probe (tmux available) + `remote.SSH.tmux.enabled`. Constructs and registers
+ * TmuxTerminalProvider with injected Log, exec and state; the listeners it subscribes belong
+ * to the returned layer, which releases them on `dispose` (settings → off, folder change).
  *
- * Called from the resolver callback after resolve() completes. Returns a
- * {@link TmuxTerminalLayer} handle whose `refresh()` a later resolve (reconnect)
- * calls instead of wiring again, or `undefined` when a gate is unmet (capability
- * unavailable / setting off / not on a remote) or wiring throws — so the wrapping
- * {@link idempotentResolveHandler} retries wiring on the next resolve.
+ * Called by {@link TmuxLayerController}. Resolves the {@link TmuxTerminalLayer} handle whose
+ * `refresh()` a later resolve (reconnect) calls instead of wiring again, or `undefined` when a
+ * gate is unmet (capability unavailable / setting off / no folder) or wiring throws — so the
+ * controller retries wiring on the next resolve.
  */
-function wireTmuxTerminalLayer(
+async function wireTmuxTerminalLayer(
     context: vscode.ExtensionContext,
     resolver: RemoteSSHResolver,
     profileRegistration: TerminalProfileRegistration,
     logger: Log
-): TmuxTerminalLayer | undefined {
-    // Disposables this attempt has registered but not yet handed to the extension's
-    // lifetime. Declared out here so the catch can roll them back — see where it is
-    // filled below for why a retried attempt must not inherit the previous one's.
+): Promise<TmuxTerminalLayer | undefined> {
+    // Disposables this attempt has registered but not yet handed to the layer. Declared
+    // out here so the catch can roll them back — see where it is filled below for why a
+    // retried attempt must not inherit the previous one's.
     const wired: vscode.Disposable[] = [];
+    let terminalProvider: TmuxTerminalProvider | undefined;
     try {
-        // Read the three remote.SSH.tmux.* settings once, up front. `enabled` is read
-        // BEFORE the capability probe so an explicit `'on'` ("require tmux") can surface
-        // a user-visible error when the remote can't provide tmux, instead of silently
-        // skipping like `'auto'` does — see decideTmuxWiring.
+        // Read the remote.SSH.tmux.* settings up front. `enabled` is read BEFORE the
+        // capability probe so an explicit `'on'` ("require tmux") can surface a
+        // user-visible error when the remote can't provide tmux, instead of silently
+        // skipping like `'auto'` does — see decideTmuxWiring. A change while this attempt
+        // is in flight is the settings watcher's to apply (the controller counts an
+        // in-flight wiring as wired).
         const settings = readTmuxSettings();
 
-        // PR3 + PR5 gate combined: decide whether to wire from (enabled setting ×
-        // tmux availability). `'off'` → skip; unavailable under `'on'` → user error;
-        // unavailable under `'auto'` → silent skip; available (and not `'off'`) → wire.
+        // Decide whether to wire from (enabled setting × tmux availability). `'off'` → skip;
+        // unavailable under `'on'` → user error; unavailable under `'auto'` → silent skip;
+        // available (and not `'off'`) → wire.
         const capability = resolver.getTmuxCapability();
         const decision = decideTmuxWiring(settings.enabled, capability);
         if (decision === 'retry') {
             // Transient: the probe could not reach the remote in time. Not wiring returns
-            // undefined, so idempotentResolveHandler re-wires on the next resolve (which
-            // probes again). The default-profile setting is deliberately left alone — the
+            // undefined, so the controller re-wires on the next resolve (which probes
+            // again). The default-profile setting is deliberately left alone — the
             // fallback provider answers it with a plain shell meanwhile, and clearing then
             // re-writing the user's settings file over a blip would be pure churn.
             logger.info('Persistent terminals: the remote did not answer the capability check — plain shells for now, retrying on reconnect');
-            return;
+            return undefined;
         }
         if (decision === 'require-error') {
             // The one path that reaches the user: they required tmux but it isn't there.
@@ -186,44 +210,38 @@ function wireTmuxTerminalLayer(
             // connect, so "New Terminal" falls back to the base shell instead of a profile
             // we never registered.
             reconcileDefaultTerminalProfile(logger, false, resolver.getRemotePlatform());
-            return;
+            return undefined;
         }
         if (decision !== 'wire' || !capability?.available) {
             // `'skip'` (disabled, or unavailable under `'auto'`). The `!capability?.available`
             // clause is redundant given `decision === 'wire'` implies availability — it is
             // there only to re-narrow `capability` to non-undefined for the compiler below.
             reconcileDefaultTerminalProfile(logger, false, resolver.getRemotePlatform()); // clean up a stale tmux default, as above
-            return;
+            return undefined;
         }
 
-        // Session identity (host + workspace) — shared with the kill command via
-        // currentTmuxSessionContext() so both name this workspace's sessions identically.
-        const sessionContext = currentTmuxSessionContext();
-        if (!sessionContext) {
+        // Session identity (canonical host + workspace, plus the legacy one to adopt from) —
+        // shared with the kill command so both name this workspace's sessions identically.
+        const identity = await currentTmuxIdentity(logger);
+        if (!identity) {
             // No resolved remote SSH workspace folder to key sessions to (an empty remote
             // window, or a non-ssh-remote folder) — there is no stable host+workspace
             // identity, so wire nothing rather than fabricate one. Still reconcile the
             // default toward cleanup, since we are not wiring the layer here.
             reconcileDefaultTerminalProfile(logger, false, resolver.getRemotePlatform());
-            return;
+            return undefined;
         }
-        const { hostKey, workspaceKey } = sessionContext;
-        const cwd = workspaceKey;
 
         // exec resolves the resolver's *current* SSH connection at call time (see
         // lazyExec) — never captured — so a reconnect's fresh connection is picked up
-        // automatically and post-reconnect terminals/reaper hit the live channel
-        // instead of the dead pre-reconnect one (headline #3). Deadline-bounded, so a
-        // half-dead link can never leave "New Terminal" or the reaper waiting forever.
+        // automatically and post-reconnect terminals hit the live channel instead of the
+        // dead pre-reconnect one (headline #3). Deadline-bounded, so a half-dead link can
+        // never leave "New Terminal" waiting forever.
         const exec = tmuxExec(resolver);
         const openTerminal: OpenTerminal = (options) => vscode.window.createTerminal(options);
 
-        const terminalProvider = new TmuxTerminalProvider({
-            ctx: {
-                hostKey,
-                workspaceKey,
-                cwd,
-            },
+        const provider = new TmuxTerminalProvider({
+            ctx: identity,
             exec,
             state: context.workspaceState,
             openTerminal,
@@ -247,15 +265,15 @@ function wireTmuxTerminalLayer(
             handOff: settings.handOff,
             offerTakeOver: offerHandOff,
         });
+        terminalProvider = provider;
 
-        // These go into `wired`, not straight onto `context.subscriptions`, and are handed
-        // over only once every fallible step below has succeeded. The two looked equivalent,
-        // but this function is *retried*: `idempotentResolveHandler` re-wires on the next
-        // resolve whenever this one returns undefined, and the catch turns any throw past
-        // this point into exactly that. Listeners pushed onto the context outlive the failed
-        // attempt, so the retry stacks a SECOND pair pointing at a SECOND provider — two
-        // providers allocating slots against the same workspaceState and both reacting to
-        // every open/close, i.e. duplicated tabs and a kill-session for a slot the surviving
+        // These go into `wired`, and are handed to the layer only once every fallible step
+        // below has succeeded. This function is *retried*: the controller re-wires on the
+        // next resolve whenever this one resolves undefined, and the catch turns any throw
+        // past this point into exactly that. Listeners left behind by a failed attempt
+        // would stack a SECOND pair pointing at a SECOND provider — two providers
+        // allocating slots against the same workspaceState and both reacting to every
+        // open/close, i.e. duplicated tabs and a kill-session for a slot the surviving
         // provider still holds. The rollback in the catch releases them instead.
         //
         // Subscribe BEFORE initialize(). VS Code revives its persisted terminals around the
@@ -263,18 +281,19 @@ function wireTmuxTerminalLayer(
         // terminal that lands while reconcile is still awaiting a probe would otherwise go
         // unseen — leaving two tabs attached to one session. Subscribed first, it is caught
         // either by the reconcile-time sweep or by the duplicate guard in the handler.
-        wired.push(vscode.window.onDidOpenTerminal(t => terminalProvider.handleTerminalOpened(t)));
+        wired.push(vscode.window.onDidOpenTerminal(t => provider.handleTerminalOpened(t)));
         // Free a terminal's slot when it actually closes — the counterpart to
         // provideTerminalProfile()/reopen() allocating one. Without this a slot is
         // never released within a live window: every "New Terminal" after a close
         // mints a brand-new, ever-growing remote session instead of reattaching the
         // one just detached (found live in the 09 acceptance matrix's churn row).
-        wired.push(vscode.window.onDidCloseTerminal(t => terminalProvider.handleTerminalClosed(t)));
+        wired.push(vscode.window.onDidCloseTerminal(t => provider.handleTerminalClosed(t)));
 
-        // Initialize the provider (restore + adopt sessions from previous clients).
-        terminalProvider.initialize()
+        // Initialize the provider (adopt legacy-named sessions, restore + adopt sessions
+        // from previous clients).
+        provider.initialize()
             .catch((err) => {
-                logger.trace(`Failed to initialize tmux provider: ${err instanceof Error ? err.message : String(err)}`);
+                logger.trace(`Failed to initialize tmux provider: ${errorMessage(err)}`);
             });
 
         // Take over the contributed "tmux" profile id from the plain-shell fallback
@@ -285,7 +304,7 @@ function wireTmuxTerminalLayer(
         // contributed profile in package.json's contributes.terminal.profiles — owning an
         // id with no matching contribution is a silent no-op (no entry in the profile
         // picker, provider never invoked). See docs/idea/tmux-approach.md.
-        profileRegistration.use(terminalProvider);
+        profileRegistration.use(provider);
 
         // Make tmux the default so a plain "New Terminal" already lands on it — the whole
         // point of "invisible UX" (tmux-approach.md:33: "the default terminal on a resolved
@@ -297,71 +316,103 @@ function wireTmuxTerminalLayer(
         // skip returns above, so the default never points at an unregistered profile.
         reconcileDefaultTerminalProfile(logger, true, resolver.getRemotePlatform());
 
-        // Construct the session reaper (housekeeping for empty/detached sessions).
-        // Uses current time as the clock for age-based reap decisions.
-        const reaper = new SessionReaper({
-            exec,
-            now: () => Math.floor(Date.now() / 1000),
-            log: logger,
-            tmuxPath: capability.path,
-        });
-
-        // Run the reaper only when remote.SSH.tmux.reapOnConnect is set (default true) —
-        // the setting's contract is "clean up empty/dead sessions when connecting". Gates
-        // both the initial connect reap here and the reconnect refresh below. `label`
-        // (not `context`) avoids shadowing the ExtensionContext parameter.
-        const reapIfEnabled = (label: string): void => {
-            if (!settings.reapOnConnect) {
-                return;
-            }
-            reaper.reap()
-                .catch((err) => logger.trace(`${label}: ${err instanceof Error ? err.message : String(err)}`));
-        };
-
-        // Run reaper immediately on connect (cleanup leftover sessions).
-        reapIfEnabled('Session reaper failed');
-
         // Every fallible step is behind us, so this attempt is the one that keeps the
-        // listeners: hand them to the extension's lifetime. Until this point they belong to
-        // `wired` and the catch below releases them (see the comment where `wired` is
-        // declared for why a retry must not inherit them).
-        context.subscriptions.push(...wired.splice(0));
+        // listeners: they now belong to the layer, released by its `dispose`.
+        const listeners = wired.splice(0);
         // A closing window detaches its tmux clients (see `deactivate`), so another machine
         // can take the sessions at once instead of waiting out VS Code's 3 h pty grace.
-        detachOnClose = () => terminalProvider.detachAll();
+        const detach = (): Promise<void> => provider.detachAll();
+        detachOnClose = detach;
+
+        // Advisory and off the connect path: does this host end the terminals at logout?
+        if (!lifetimeChecked.has(identity.hostKey)) {
+            lifetimeChecked.add(identity.hostKey);
+            void maybeWarnTerminalLifetime(identity.hostKey, {
+                probe: () => probeLifetimeRisk(exec),
+                state: context.globalState,
+                show: (message, ...items) => vscode.window.showWarningMessage(message, ...items),
+                openDocs: url => void vscode.env.openExternal(vscode.Uri.parse(url)),
+                log: logger,
+            }).catch(err => logger.trace(`Terminal lifetime check failed: ${errorMessage(err)}`));
+        }
 
         logger.trace('Tmux terminal layer wired successfully');
 
-        // The reconnect handle: on a later resolve-success the provider/reaper are
-        // already registered and their lazy `exec` targets the fresh connection, so
-        // nothing is re-registered. Re-reconcile provider state (re-attach survivors,
-        // adopt orphans that appeared during the drop — reopen() is idempotent) and
-        // re-run the reaper to clear any corpses left by the disconnect.
         return {
+            identity,
+            // A reconnect, not a reload: same window, same tabs, so VS Code revives nothing
+            // and never calls the profile provider. Restore therefore has no reason to hold
+            // its queue open waiting to be claimed — see `initialize`. The provider and its
+            // lazy `exec` survive the reconnect, so nothing is re-registered.
             refresh: () => {
-                // A reconnect, not a reload: same window, same tabs, so VS Code revives
-                // nothing and never calls the profile provider. Restore therefore has no
-                // reason to hold its queue open waiting to be claimed — see `initialize`.
-                terminalProvider.initialize({ awaitRevive: false })
-                    .catch((err) => logger.trace(`Tmux provider refresh failed: ${err instanceof Error ? err.message : String(err)}`));
-                reapIfEnabled('Tmux reaper refresh failed');
+                provider.initialize({ awaitRevive: false })
+                    .catch((err) => logger.trace(`Tmux provider refresh failed: ${errorMessage(err)}`));
+            },
+            reconfigure: next => {
+                provider.configure({ historyLimit: next.historyLimit, handOff: next.handOff });
+                provider.initialize({ awaitRevive: false })
+                    .catch((err) => logger.trace(`Tmux provider reconfigure failed: ${errorMessage(err)}`));
+                reconcileDefaultTerminalProfile(logger, true, resolver.getRemotePlatform());
+            },
+            protectedSessions: async () => {
+                await provider.initialized.catch(() => undefined);
+                return provider.mappedSessionNames();
+            },
+            dispose: () => {
+                provider.dispose();
+                if (detachOnClose === detach) {
+                    detachOnClose = undefined;
+                }
+                profileRegistration.use(new FallbackTerminalProvider());
+                disposeAll(listeners);
             },
         };
     } catch (err) {
         // Wiring failure must never break the connection; log and continue. No layer
-        // is returned, so idempotentResolveHandler retries wiring on the next resolve —
-        // which is exactly why anything this attempt registered has to go first. `wired`
-        // is empty on the success path (handed to `context.subscriptions` above), so this
-        // only ever releases a half-built layer. `disposeAll` rethrows the first failing
-        // dispose, and that must not escape and mask `err`.
+        // is returned, so the controller retries wiring on the next resolve — which is
+        // exactly why anything this attempt registered has to go first. `wired` is empty
+        // on the success path (handed to the layer above), so this only ever releases a
+        // half-built layer. `disposeAll` rethrows the first failing dispose, and that must
+        // not escape and mask `err`.
+        terminalProvider?.dispose();
         try {
             disposeAll(wired);
         } catch (rollbackErr) {
-            logger.trace(`Tmux wiring rollback failed: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`);
+            logger.trace(`Tmux wiring rollback failed: ${errorMessage(rollbackErr)}`);
         }
-        logger.trace(`Tmux wiring failed: ${err instanceof Error ? err.message : String(err)}`);
+        logger.trace(`Tmux wiring failed: ${errorMessage(err)}`);
         return undefined;
     }
+}
+
+/** Hosts whose terminal lifetime this window has already checked — once per window. */
+const lifetimeChecked = new Set<string>();
+
+/**
+ * Connect-time housekeeping (`remote.SSH.tmux.reapOnConnect`, re-read on every resolve):
+ * kill this extension's dead and long-abandoned sessions on the remote. It runs whenever
+ * the remote has tmux — also with persistent terminals switched off, because that is exactly
+ * when sessions left from before would otherwise run unseen forever. The sessions this
+ * window is about to restore (its mapping, once reconcile has planned) are protected.
+ */
+async function runHousekeeping(resolver: RemoteSSHResolver, logger: Log, layer: TmuxTerminalLayer | undefined): Promise<void> {
+    const settings = readTmuxSettings();
+    if (!settings.reapOnConnect || !resolver.getTmuxCapability()?.available) {
+        return;
+    }
+    const protect = layer ? await layer.protectedSessions() : [];
+    await newReaper(resolver, logger, settings.orphanMaxAgeDays).reap({ protect });
+}
+
+/** A {@link SessionReaper} over the live connection, for housekeeping and the kill paths. */
+function newReaper(resolver: RemoteSSHResolver, logger: Log, orphanMaxAgeDays?: number): SessionReaper {
+    return new SessionReaper({
+        exec: tmuxExec(resolver),
+        now: () => Math.floor(Date.now() / 1000),
+        log: logger,
+        tmuxPath: resolver.getTmuxCapability()?.path,
+        orphanMaxAgeDays,
+    });
 }
 
 /** The wired provider's {@link TmuxTerminalProvider.detachAll}, for {@link deactivate}. One
@@ -393,22 +444,278 @@ export async function offerHandOff(): Promise<boolean> {
 }
 
 /**
- * A wired tmux terminal layer's reconnect handle. `refresh()` is what a later
- * resolve-success (reconnect) invokes in place of re-wiring: it re-reconciles
- * provider state and re-runs the reaper, but never re-registers the profile
- * provider / event handlers / default-profile write (those survive the reconnect).
+ * A wired tmux terminal layer. `refresh()` is what a later resolve-success (reconnect)
+ * invokes in place of re-wiring: it re-reconciles provider state but never re-registers the
+ * profile provider / event handlers / default-profile write (those survive the reconnect).
  */
-interface TmuxTerminalLayer {
+export interface TmuxTerminalLayer extends vscode.Disposable {
+    /** The (canonical) session identity the layer serves. */
+    readonly identity: TmuxSessionContext;
     refresh(): void;
+    /** Take changed settings without rebuilding (see `decideSettingsChange`'s `refresh`). */
+    reconfigure(settings: TmuxSettings): void;
+    /** Sessions housekeeping must not age out — this window's mapping, once planned. */
+    protectedSessions(): Promise<string[]>;
 }
 
 /**
- * Build the resolve-success callback that wires the tmux layer exactly once, then
- * on every later resolve (reconnect) refreshes the existing layer instead of
- * re-registering it. `wire` is injected (rather than called inline) so this
- * idempotency is unit-testable without the VS Code terminal surface; it returns
- * `undefined` while a gate is unmet, in which case wiring is retried next resolve.
+ * Owns the one tmux terminal layer of this window across resolves, settings changes and
+ * folder changes: wire it once, refresh it on every reconnect, rebuild or drop it when a
+ * setting or the folder says so. `wire` is injected so the lifecycle is unit-testable
+ * without the VS Code terminal surface; it resolves `undefined` while a gate is unmet, in
+ * which case wiring is retried on the next resolve.
+ *
+ * Wiring is asynchronous (the identity reads the SSH config), so two guards matter: a
+ * resolve arriving while wiring is in flight JOINS it rather than wiring a second layer, and
+ * a wiring superseded by `unwire`/`rewire` meanwhile disposes what it built instead of
+ * installing it — a layer nobody owns would keep allocating slots in the background.
  */
+export class TmuxLayerController {
+    private layer: TmuxTerminalLayer | undefined;
+    private wiring: Promise<TmuxTerminalLayer | undefined> | undefined;
+    /** Bumped by every unwire; a wiring started under an older value is stale. */
+    private generation = 0;
+
+    constructor(private readonly wire: () => Promise<TmuxTerminalLayer | undefined>) {
+    }
+
+    /** The live layer, if one is wired. */
+    get current(): TmuxTerminalLayer | undefined {
+        return this.layer;
+    }
+
+    /** A layer is wired, or being wired — either way a settings change must treat it as live. */
+    get wired(): boolean {
+        return this.layer !== undefined || this.wiring !== undefined;
+    }
+
+    /** A resolve succeeded: wire the first time, refresh after that (reconnect). */
+    resolved(): Promise<TmuxTerminalLayer | undefined> {
+        if (this.layer) {
+            this.layer.refresh();
+            return Promise.resolve(this.layer);
+        }
+        return this.wireNow();
+    }
+
+    /** Drop the current layer (if any) and wire a fresh one. */
+    rewire(): Promise<TmuxTerminalLayer | undefined> {
+        this.unwire();
+        return this.wireNow();
+    }
+
+    /** Drop the current layer, cancel an in-flight wiring, and hand back the dropped
+     * layer's identity (what the "still running" offer is about). */
+    unwire(): TmuxSessionContext | undefined {
+        this.generation++;
+        this.wiring = undefined;
+        const layer = this.layer;
+        this.layer = undefined;
+        layer?.dispose();
+        return layer?.identity;
+    }
+
+    private wireNow(): Promise<TmuxTerminalLayer | undefined> {
+        if (this.wiring) {
+            return this.wiring;
+        }
+        const generation = this.generation;
+        const settle = (layer: TmuxTerminalLayer | undefined): TmuxTerminalLayer | undefined => {
+            if (generation !== this.generation) {
+                layer?.dispose(); // superseded while wiring: nobody owns it
+                return undefined;
+            }
+            this.wiring = undefined;
+            this.layer = layer;
+            return layer;
+        };
+        this.wiring = Promise.resolve()
+            .then(() => this.wire())
+            .then(settle, () => settle(undefined));
+        return this.wiring;
+    }
+}
+
+/** The VS Code events {@link watchTmuxLayerInputs} listens to (injected for tests). */
+export interface TmuxLayerEvents {
+    onDidChangeConfiguration(listener: (e: { affectsConfiguration(section: string): boolean }) => void): vscode.Disposable;
+    onDidChangeWorkspaceFolders(listener: () => void): vscode.Disposable;
+}
+
+/** What the reactions to those events need — injected so they are unit-tested. */
+export interface TmuxLayerReactions {
+    readonly controller: TmuxLayerController;
+    readSettings(): TmuxSettings;
+    /** A resolved connection exists (before it, the first resolve wires anyway). */
+    connected(): boolean;
+    currentIdentity(): Promise<TmuxSessionContext | undefined>;
+    /** Remove a default-profile write of ours (the layer is going away). */
+    clearDefaultProfile(): void;
+    offerCleanup(identity: TmuxSessionContext): Promise<void>;
+    readonly log: { trace(message: string): void };
+}
+
+/**
+ * React to `remote.SSH.tmux.*` and workspace-folder changes without a reload. Settings: the
+ * pure {@link decideSettingsChange} picks the action. Folders: the identity is recomputed
+ * (still the first folder, by design) and the layer rebuilt onto it when it moved, or dropped
+ * when no folder is left — never left serving a stale identity. (VS Code restarts the
+ * extension host when the FIRST folder changes, so in practice only additions/removals of
+ * other folders reach this, and they leave the identity as it is.)
+ */
+export function watchTmuxLayerInputs(events: TmuxLayerEvents, reactions: TmuxLayerReactions): vscode.Disposable {
+    let settings = reactions.readSettings();
+    const subscriptions = [
+        events.onDidChangeConfiguration(e => {
+            if (!e.affectsConfiguration('remote.SSH.tmux')) {
+                return;
+            }
+            const next = reactions.readSettings();
+            const action = decideSettingsChange(settings, next, reactions.controller.wired);
+            settings = next;
+            reactions.log.trace(`Persistent terminal settings changed -> ${action}`);
+            applySettingsAction(action, next, reactions);
+        }),
+        events.onDidChangeWorkspaceFolders(() => {
+            recheckIdentity(reactions)
+                .catch(err => reactions.log.trace(`Persistent terminals: folder change failed: ${errorMessage(err)}`));
+        }),
+    ];
+    return { dispose: () => disposeAll(subscriptions) };
+}
+
+function applySettingsAction(action: ReturnType<typeof decideSettingsChange>, next: TmuxSettings, reactions: TmuxLayerReactions): void {
+    switch (action) {
+        case 'offer-cleanup': {
+            const identity = reactions.controller.unwire();
+            reactions.clearDefaultProfile();
+            if (identity) {
+                reactions.offerCleanup(identity)
+                    .catch(err => reactions.log.trace(`Persistent terminals: cleanup offer failed: ${errorMessage(err)}`));
+            }
+            break;
+        }
+        case 'rewire':
+            if (reactions.connected()) {
+                void reactions.controller.rewire();
+            }
+            break;
+        case 'refresh':
+            reactions.controller.current?.reconfigure(next);
+            break;
+        case 'none':
+            break;
+    }
+}
+
+async function recheckIdentity(reactions: TmuxLayerReactions): Promise<void> {
+    const layer = reactions.controller.current;
+    if (!layer) {
+        return; // nothing wired: the next resolve or settings change wires against the folders as they are
+    }
+    const next = await reactions.currentIdentity();
+    if (reactions.controller.current !== layer) {
+        return; // rewired or dropped meanwhile
+    }
+    if (!next) {
+        reactions.controller.unwire();
+        reactions.clearDefaultProfile();
+        return;
+    }
+    if (next.hostKey !== layer.identity.hostKey || next.workspaceKey !== layer.identity.workspaceKey) {
+        await reactions.controller.rewire();
+    }
+}
+
+/** Buttons of the offer that follows turning persistent terminals off. */
+export const CLOSE_BACKGROUND_TERMINALS = 'Close them';
+export const KEEP_BACKGROUND_TERMINALS = 'Keep';
+
+/** Text of that offer: plain language, no internals. */
+export function backgroundTerminalsMessage(count: number): string {
+    return count === 1
+        ? '1 background terminal from this workspace is still running.'
+        : `${count} background terminals from this workspace are still running.`;
+}
+
+/** The workspace's session identities: canonical, plus the legacy one sessions may still
+ * carry until adopted (the kill paths must cover both). */
+export function workspaceIdentities(identity: TmuxSessionContext): WorkspaceSessionIdentity[] {
+    const identities = [{ hostKey: identity.hostKey, workspaceKey: identity.workspaceKey }];
+    if (identity.legacy) {
+        identities.push({ hostKey: identity.legacy.hostKey, workspaceKey: identity.legacy.workspaceKey });
+    }
+    return identities;
+}
+
+/**
+ * After persistent terminals are switched off: if this workspace still has sessions running
+ * on the remote, say so once and offer to close them — otherwise they would run on where
+ * nothing in this window will show them again. "Close them" is the kill command's own path
+ * (`closeWorkspaceSessions`); anything else keeps them (connect-time housekeeping ages them
+ * out eventually).
+ */
+export async function offerBackgroundCleanup(
+    identity: TmuxSessionContext,
+    deps: {
+        readonly reaper: WorkspaceSessionKiller & { countWorkspaceSessions(identities: readonly WorkspaceSessionIdentity[]): Promise<number | undefined> };
+        ask(message: string, ...items: string[]): Thenable<string | undefined>;
+    },
+): Promise<void> {
+    const identities = workspaceIdentities(identity);
+    const count = await deps.reaper.countWorkspaceSessions(identities);
+    if (!count) {
+        return;
+    }
+    const choice = await deps.ask(backgroundTerminalsMessage(count), CLOSE_BACKGROUND_TERMINALS, KEEP_BACKGROUND_TERMINALS);
+    if (choice === CLOSE_BACKGROUND_TERMINALS) {
+        await closeWorkspaceSessions({ reaper: deps.reaper, identities });
+    }
+}
+
+/** The one-time warning for a host that ends a user's processes at logout. No internals. */
+export const LIFETIME_WARNING_MESSAGE =
+    'Terminals on this host may not survive a disconnect: the host ends your processes when you log out.';
+export const LIFETIME_LEARN_MORE = 'Learn more';
+export const LIFETIME_DOCS_URL =
+    'https://github.com/developerz-ai/open-remote-ssh-tmux/blob/main/docs/troubleshooting.md#terminals-closed-after-disconnect';
+/** globalState key: canonical host keys whose lifetime warning the user has dismissed. */
+const LIFETIME_DISMISSED_STATE_KEY = 'tmux.lifetimeWarningDismissed.v1';
+
+/**
+ * Warn, once per host, when the remote ends a user's processes at logout (systemd-logind
+ * `KillUserProcesses=yes`): every terminal then dies on disconnect, which is otherwise silent
+ * and looks like this extension failing. Detection only — no wrapper around the server start.
+ * Any answer to the notification (a button or closing it) is remembered in globalState, so a
+ * host is never warned about again; a host already dismissed is not even probed.
+ */
+export async function maybeWarnTerminalLifetime(
+    hostKey: string,
+    deps: {
+        probe(): Promise<LifetimeFacts>;
+        readonly state: { get<T>(key: string, defaultValue: T): T; update(key: string, value: unknown): Thenable<void> };
+        show(message: string, ...items: string[]): Thenable<string | undefined>;
+        openDocs(url: string): void;
+        readonly log: { trace(message: string): void };
+    },
+): Promise<void> {
+    if (deps.state.get<string[]>(LIFETIME_DISMISSED_STATE_KEY, []).includes(hostKey)) {
+        return;
+    }
+    const facts = await deps.probe();
+    deps.log.trace(`Terminal lifetime: KillUserProcesses=${facts.killUserProcesses ?? 'unknown'} `
+        + `Linger=${facts.linger ?? 'unknown'} -> ${facts.lifetimeRisk ? 'at risk' : 'ok'}`);
+    if (!facts.lifetimeRisk) {
+        return;
+    }
+    const choice = await deps.show(LIFETIME_WARNING_MESSAGE, LIFETIME_LEARN_MORE);
+    const dismissed = deps.state.get<string[]>(LIFETIME_DISMISSED_STATE_KEY, []);
+    await deps.state.update(LIFETIME_DISMISSED_STATE_KEY, [...dismissed.filter(key => key !== hostKey), hostKey]);
+    if (choice === LIFETIME_LEARN_MORE) {
+        deps.openDocs(LIFETIME_DOCS_URL);
+    }
+}
+
 /** Run `action` on the first call and never again. Used for the connect-time image sweep,
  * which is housekeeping for the whole window rather than per-connection work — running it
  * again on every reconnect would be pure noise. */
@@ -426,17 +733,6 @@ export function onceOnly(action: () => void): () => void {
 /** Best-effort message from an unknown thrown value, for log lines only. */
 function errorMessage(err: unknown): string {
     return err instanceof Error ? err.message : String(err);
-}
-
-export function idempotentResolveHandler(wire: () => TmuxTerminalLayer | undefined): () => void {
-    let layer: TmuxTerminalLayer | undefined;
-    return () => {
-        if (layer) {
-            layer.refresh(); // reconnect: refresh provider state + re-reap only, no re-register
-            return;
-        }
-        layer = wire();
-    };
 }
 
 /**
@@ -504,8 +800,11 @@ export interface TmuxSettings {
     readonly enabled: string;
     /** `remote.SSH.tmux.historyLimit`: scrollback lines for new sessions (default 50000). */
     readonly historyLimit: number;
-    /** `remote.SSH.tmux.reapOnConnect`: reap empty/dead sessions on (re)connect (default true). */
+    /** `remote.SSH.tmux.reapOnConnect`: reap dead and abandoned sessions on (re)connect (default true). */
     readonly reapOnConnect: boolean;
+    /** `remote.SSH.tmux.orphanMaxAgeDays`: days a detached session of ours may sit idle
+     * before housekeeping closes it (default 14; 0 = never). */
+    readonly orphanMaxAgeDays: number;
     /** `remote.SSH.tmux.handOff`: `'auto'` (default) | `'ask'` | `'never'` — what to do with
      * this workspace's sessions while another machine's client holds them (`slotState.ts`). */
     readonly handOff: HandOffPolicy;
@@ -534,10 +833,17 @@ export function readTmuxSettings(): TmuxSettings {
         // rejects would stop every terminal from opening (see clampHistoryLimit).
         historyLimit: clampHistoryLimit(config.get<unknown>('tmux.historyLimit', 50000)),
         reapOnConnect: config.get<boolean>('tmux.reapOnConnect', true),
+        // Read as `unknown`: a hand-edited value that is not a non-negative integer must not
+        // silently switch aging off (or on at a nonsense age) — it falls back to the default.
+        orphanMaxAgeDays: toOrphanMaxAgeDays(config.get<unknown>('tmux.orphanMaxAgeDays', DEFAULT_ORPHAN_MAX_AGE_DAYS)),
         // Read as `unknown`: an unrecognised hand-edited value falls back to the default.
         handOff: toHandOffPolicy(config.get<unknown>('tmux.handOff', 'auto')),
         setDefaultProfile: config.get<boolean>('tmux.setDefaultProfile', true),
     };
+}
+
+function toOrphanMaxAgeDays(value: unknown): number {
+    return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : DEFAULT_ORPHAN_MAX_AGE_DAYS;
 }
 
 /** What {@link decideTmuxWiring} resolves the (enabled × availability) matrix to:
@@ -735,35 +1041,85 @@ export function deriveTmuxSessionContext(folder: RemoteFolderUri | undefined): {
 }
 
 /**
- * Live (host, workspace) identity for the current window — the vscode-reading wrapper
- * over {@link deriveTmuxSessionContext}, using the first workspace folder's URI.
- * `undefined` when there is no resolved remote SSH workspace folder (a local window, an
- * empty remote window, or a non-`ssh-remote` folder). Shared by the terminal-layer
- * wiring and the kill command so both name this workspace's sessions identically.
+ * The SSH target `dest` really reaches, resolved through the user's SSH config exactly as
+ * the resolver connects (`authResolver.ts`: `HostName` with `%h` expanded, then `User` over
+ * the typed user over the local account, then `Port` over the typed port over 22). Pure +
+ * exported so the precedence is unit-tested; it must not drift from the resolver's.
  */
-function currentTmuxSessionContext(): { hostKey: string; workspaceKey: string } | undefined {
-    return deriveTmuxSessionContext(vscode.workspace.workspaceFolders?.[0]?.uri);
+export function resolveSshTarget(dest: SSHDestination, hostConfig: Readonly<Record<string, unknown>>, localUser: string): SshTarget {
+    const configured = (key: string): string | undefined => {
+        const value = hostConfig[key];
+        return typeof value === 'string' && value !== '' ? value : undefined;
+    };
+    const hostName = configured('HostName');
+    const port = parseInt(configured('Port') ?? '', 10);
+    return {
+        hostName: hostName ? expandTokens(hostName, { h: dest.hostname }) : dest.hostname,
+        user: configured('User') || dest.user || localUser,
+        port: Number.isInteger(port) && port > 0 ? port : (dest.port || 22),
+    };
 }
 
 /**
- * Build the kill command's target from live resolver state: a fresh {@link SessionReaper}
- * over {@link tmuxExec} (deadline-bounded, exit-code-reporting), plus the
- * (host, workspace) identity. Returns `undefined` when there is no connection or no
- * resolved remote SSH workspace folder, so the command no-ops safely instead of
- * throwing. Wiring only — the reaper owns all tmux/session logic.
+ * The provider's session context: the canonical identity (`canonicalHostKey` of the
+ * resolved target, `canonicalWorkspaceKey` of the folder path), the folder path as typed for
+ * the cwd, and the identity older versions used (`legacy`), whose sessions are adopted.
  */
-function resolveKillTarget(resolver: RemoteSSHResolver, logger: Log): WorkspaceKillTarget | undefined {
-    const context = currentTmuxSessionContext();
-    if (!resolver.getSSHConnection() || !context) {
+export function canonicalTmuxIdentity(legacy: { hostKey: string; workspaceKey: string }, target: SshTarget): TmuxSessionContext {
+    return {
+        hostKey: canonicalHostKey(target),
+        workspaceKey: canonicalWorkspaceKey(legacy.workspaceKey),
+        cwd: legacy.workspaceKey,
+        legacy: { hostKey: legacy.hostKey, workspaceKey: legacy.workspaceKey },
+    };
+}
+
+/**
+ * Live session identity for the current window, from the first workspace folder's URI and
+ * the user's SSH config. `undefined` when there is no resolved remote SSH workspace folder (a
+ * local window, an empty remote window, or a non-`ssh-remote` folder). Shared by the
+ * terminal-layer wiring and the kill command so both name this workspace's sessions
+ * identically. An unreadable SSH config degrades to the destination as typed (the resolver
+ * could not have connected through it either).
+ */
+async function currentTmuxIdentity(logger: Log): Promise<TmuxSessionContext | undefined> {
+    const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
+    const legacy = deriveTmuxSessionContext(folder);
+    if (!folder || !legacy) {
         return undefined;
     }
-    const reaper = new SessionReaper({
-        exec: tmuxExec(resolver),
-        now: () => Math.floor(Date.now() / 1000),
-        log: logger,
-        tmuxPath: resolver.getTmuxCapability()?.path,
-    });
-    return { reaper, hostKey: context.hostKey, workspaceKey: context.workspaceKey };
+    const dest = SSHDestination.parseEncoded(folder.authority.slice(`${REMOTE_SSH_AUTHORITY}+`.length));
+    let hostConfig: Readonly<Record<string, unknown>> = {};
+    try {
+        hostConfig = (await SSHConfiguration.loadFromFS()).getHostConfiguration(dest.hostname);
+    } catch (err) {
+        logger.trace(`Persistent terminals: could not read the SSH config for the session identity: ${errorMessage(err)}`);
+    }
+    return canonicalTmuxIdentity(legacy, resolveSshTarget(dest, hostConfig, localUserName()));
+}
+
+/** The local account name, the SSH user of last resort (as in the resolver). */
+function localUserName(): string {
+    try {
+        return os.userInfo().username;
+    } catch {
+        return '';
+    }
+}
+
+/**
+ * Build the kill command's target from live state: a fresh {@link SessionReaper} over
+ * {@link tmuxExec} plus this workspace's identities (the wired layer's, else computed).
+ * Returns `undefined` when there is no connection or no resolved remote SSH workspace
+ * folder, so the command no-ops safely instead of throwing. Wiring only — the reaper owns
+ * all tmux/session logic.
+ */
+async function resolveKillTarget(resolver: RemoteSSHResolver, logger: Log, layers: TmuxLayerController): Promise<WorkspaceKillTarget | undefined> {
+    if (!resolver.getSSHConnection()) {
+        return undefined;
+    }
+    const identity = layers.current?.identity ?? await currentTmuxIdentity(logger);
+    return identity ? { reaper: newReaper(resolver, logger), identities: workspaceIdentities(identity) } : undefined;
 }
 
 /** Window closing (or reloading): detach this window's tmux clients, bounded by

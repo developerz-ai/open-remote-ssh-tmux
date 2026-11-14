@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { PROBE_DEADLINE_MS, probeTmux } from '../../src/tmux/tmuxBootstrap';
+import { LIFETIME_PROBE_COMMAND, parseLifetimeFacts, PROBE_DEADLINE_MS, probeLifetimeRisk, probeTmux } from '../../src/tmux/tmuxBootstrap';
 
 // The capability probe is dependency-inverted: it takes an exec function (not an
 // `SSHConnection`), so the whole gate is unit-testable here with no ssh2. It
@@ -199,5 +199,51 @@ describe('probeTmux — unreachable (bounded, never breaks the connect)', () => 
 
     it('uses a five-second deadline', () => {
         expect(PROBE_DEADLINE_MS).toBe(5000);
+    });
+});
+
+describe('terminal lifetime facts (05 k: hosts that end a user\'s processes at logout)', () => {
+    // systemd-logind with `KillUserProcesses=yes` terminates the login session's scope —
+    // and the tmux server started from it — when the SSH connection closes. Every terminal
+    // then dies on disconnect, silently. We only detect and warn (no wrapper).
+
+    it('flags the risk when logind kills user processes at logout', () => {
+        expect(parseLifetimeFacts('KillUserProcesses=yes\nLinger=no\n')).toEqual({ killUserProcesses: true, linger: false, lifetimeRisk: true });
+    });
+
+    it('lingering does not protect the login session scope — still a risk', () => {
+        expect(parseLifetimeFacts('KillUserProcesses=yes\nLinger=yes\n').lifetimeRisk).toBe(true);
+    });
+
+    it('no risk on the common default (processes survive logout)', () => {
+        expect(parseLifetimeFacts('KillUserProcesses=no\nLinger=no\n')).toEqual({ killUserProcesses: false, linger: false, lifetimeRisk: false });
+    });
+
+    it('unknown (no loginctl, a non-systemd host, garbage) is not a risk', () => {
+        expect(parseLifetimeFacts('')).toEqual({ lifetimeRisk: false });
+        expect(parseLifetimeFacts('Failed to connect to bus: No such file or directory')).toEqual({ lifetimeRisk: false });
+        expect(parseLifetimeFacts('KillUserProcesses=maybe')).toEqual({ lifetimeRisk: false });
+    });
+
+    it('tolerates banner noise and CRLF', () => {
+        expect(parseLifetimeFacts('Welcome!\r\nKillUserProcesses=yes\r\n').lifetimeRisk).toBe(true);
+    });
+
+    it('asks logind only, with every call bounded and every failure silent', () => {
+        expect(LIFETIME_PROBE_COMMAND).toContain('loginctl show-session -p KillUserProcesses');
+        expect(LIFETIME_PROBE_COMMAND).toContain('loginctl show-user "$(id -un)" -p Linger');
+        expect(LIFETIME_PROBE_COMMAND).toContain('timeout');
+        expect(LIFETIME_PROBE_COMMAND).not.toContain('\n'); // one line: a csh login shell rejects newlines
+    });
+
+    it('probeLifetimeRisk runs the command and reads its answer', async () => {
+        const exec = vi.fn(async () => ({ stdout: 'KillUserProcesses=yes\nLinger=no\n', stderr: '', code: 0 }));
+
+        expect(await probeLifetimeRisk(exec)).toMatchObject({ lifetimeRisk: true });
+        expect(exec).toHaveBeenCalledWith(LIFETIME_PROBE_COMMAND);
+    });
+
+    it('probeLifetimeRisk reads a failed or rejected probe as "unknown", never throws', async () => {
+        expect(await probeLifetimeRisk(vi.fn(async () => { throw new Error('deadline'); }))).toEqual({ lifetimeRisk: false });
     });
 });

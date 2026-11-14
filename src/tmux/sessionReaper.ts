@@ -3,22 +3,24 @@ import {
     buildKillSession,
     buildListSessions,
     classifyTmuxFailure,
+    DEFAULT_ORPHAN_MAX_AGE_DAYS,
     readListSessionsResult,
+    reapVerdict,
     sessionSlot,
-    shouldReap,
     TMUX_BIN,
     TmuxSession,
 } from './tmuxSession';
 
 // Connect-time housekeeping — the anti-zombie backstop that complements the
 // terminal provider. On a successful resolve (and on manual refresh) it lists the
-// remote's tmux sessions and kills exactly the *dead, detached* ones THIS
-// extension owns: the corpses left when a pane's process exits but the session
-// lingers (`remain-on-exit`), which the provider's create/close path can't clean up
-// because no client is around to see them. The kill DECISION itself lives in the
-// session model (`shouldReap`, 02) — this module only orchestrates
-// list -> parse -> decide -> kill and keeps a count for one invisible log line, so
-// there is no tmux string concatenation outside 02.
+// remote's tmux sessions and kills two kinds THIS extension owns: the *corpses* left
+// when a pane's process exits but the session lingers (`remain-on-exit`), and the
+// *orphans* — detached sessions with no activity for `orphanMaxAgeDays` (a folder that
+// was renamed or never reopened leaves its sessions running where no window will ever
+// list, restore or adopt them). The kill DECISION itself lives in the session model
+// (`reapVerdict`) — this module only orchestrates list -> parse -> decide -> kill and
+// keeps the counts for one invisible log line, so there is no tmux string concatenation
+// outside the session model.
 //
 // Dependency-inverted (D in SOLID) and side-effect-narrow: the remote command
 // runner, an epoch-seconds clock (so reap decisions are deterministic and this
@@ -30,8 +32,8 @@ import {
 // "should tmux run at all?" in one place instead of smeared across collaborators.
 //
 // Conservative by construction: a foreign session, an attached session, a session
-// with a live pane (a detached long-running task — the whole point of the fork),
-// or a just-created one are all left untouched. Any probe failure degrades to
+// with a live pane still in use within the aging window (a detached long-running task —
+// the whole point of the fork), or a just-created one are all left untouched. Any probe failure degrades to
 // "reaped nothing" and never throws — reaping must never break the connect.
 // See docs/plans/2026/07/24/101-v1-tmux-release/04-terminal-profile.md (step 5).
 
@@ -59,6 +61,26 @@ export interface SessionReaperDeps {
     /** The probed tmux binary (`TmuxCapability.path`), so list/kill address the same tmux
      * the terminals launch. Undefined → a bare `tmux` on PATH. */
     readonly tmuxPath?: string;
+    /** `remote.SSH.tmux.orphanMaxAgeDays`. Default {@link DEFAULT_ORPHAN_MAX_AGE_DAYS};
+     * `0` disables aging (orphans are then only counted). */
+    readonly orphanMaxAgeDays?: number;
+}
+
+/** What one housekeeping pass did: sessions confirmed killed (corpses and aged orphans),
+ * and the detached live sessions of ours it found (`orphansTotal`) and left running
+ * (`orphansKept` — not old enough, aging off, or a kill that was not confirmed). */
+export interface ReapOutcome {
+    readonly killed: number;
+    readonly orphansKept: number;
+    readonly orphansTotal: number;
+}
+
+/** One (host, workspace) identity whose sessions a workspace-scoped operation covers. A
+ * workspace can have two: its canonical identity and the legacy (alias-keyed) one that
+ * older versions named sessions by, until those are adopted. */
+export interface WorkspaceIdentity {
+    readonly hostKey: string;
+    readonly workspaceKey: string;
 }
 
 /** Default startup grace: a dead owned session must be at least this old before
@@ -75,7 +97,8 @@ export interface WorkspaceKillOutcome {
 
 /**
  * Kills the sessions this extension owns. Two public operations:
- *   * `reap()` — connect-time housekeeping: only empty, detached, past-grace sessions.
+ *   * `reap()` — connect-time housekeeping: detached corpses past the grace, and detached
+ *     orphans idle past `orphanMaxAgeDays`.
  *   * `killWorkspaceSessions()` — the manual escape hatch: force-kill THIS workspace's
  *     sessions regardless of state (the "Kill Persistent Terminal Sessions" command).
  * Both share the same list -> filter -> kill spine and the same never-throw contract.
@@ -86,6 +109,7 @@ export class SessionReaper {
     private readonly log: TmuxLog;
     private readonly minAgeSeconds: number;
     private readonly tmuxPath: string;
+    private readonly orphanMaxAgeDays: number;
 
     constructor(deps: SessionReaperDeps) {
         this.exec = deps.exec;
@@ -93,60 +117,73 @@ export class SessionReaper {
         this.log = deps.log;
         this.minAgeSeconds = deps.minAgeSeconds ?? DEFAULT_REAP_GRACE_SECONDS;
         this.tmuxPath = deps.tmuxPath ?? TMUX_BIN;
+        this.orphanMaxAgeDays = deps.orphanMaxAgeDays ?? DEFAULT_ORPHAN_MAX_AGE_DAYS;
     }
 
     /**
-     * List -> parse -> decide -> kill. Returns the number of sessions reaped (0 when
-     * the list probe fails or nothing qualifies). Only dead-pane (corpse), detached,
-     * past-grace owned sessions qualify — the decision is `shouldReap` (02). Never
-     * throws: a failed `list-sessions` yields 0 and a trace line; a failed
-     * `kill-session` is traced and skipped so one dead target can't abort the rest
-     * (nor retry — no kill storm). Logs a single info line only when it actually
-     * reaped something (invisible UX — silence otherwise).
+     * List -> parse -> decide -> kill. Never throws: a failed `list-sessions` yields an
+     * all-zero outcome and a trace line; a failed `kill-session` is traced and skipped so
+     * one dead target can't abort the rest (nor retry — no kill storm). Logs one info line
+     * when there was anything to report (invisible UX — a log line, never UI).
+     *
+     * `protect` names sessions the caller is about to use (this window's own mapping after
+     * reconcile): they are neither killed nor counted, however old — a user returning after
+     * a long absence must find their terminals, not a reaper that got there first.
      */
-    async reap(): Promise<number> {
+    async reap(options: { protect?: readonly string[] } = {}): Promise<ReapOutcome> {
         const sessions = await this.listSessions();
         if (sessions === undefined) {
-            return 0; // list probe failed — already traced; never break the connect
+            return { killed: 0, orphansKept: 0, orphansTotal: 0 }; // already traced; never break the connect
         }
 
         const now = this.now();
-        const doomed = sessions.filter(session => shouldReap(session, now, { minAgeSeconds: this.minAgeSeconds }));
-
-        let reaped = 0;
-        for (const session of doomed) {
-            if (await this.kill(session.name)) {
-                reaped++;
+        const protect = new Set(options.protect ?? []);
+        const reapOptions = { minAgeSeconds: this.minAgeSeconds, orphanMaxAgeDays: this.orphanMaxAgeDays };
+        let killed = 0;
+        let orphansTotal = 0;
+        let orphansKilled = 0;
+        for (const session of sessions) {
+            if (protect.has(session.name)) {
+                continue;
+            }
+            const verdict = reapVerdict(session, now, reapOptions);
+            if (verdict === 'orphan' || verdict === 'reap-orphan') {
+                orphansTotal++;
+            }
+            if ((verdict === 'reap-corpse' || verdict === 'reap-orphan') && await this.kill(session.name)) {
+                killed++;
+                if (verdict === 'reap-orphan') {
+                    orphansKilled++;
+                }
             }
         }
 
-        if (reaped > 0) {
-            this.log.info(`tmux reaper: reaped ${reaped} dead session(s)`);
+        const outcome = { killed, orphansKept: orphansTotal - orphansKilled, orphansTotal };
+        if (outcome.killed > 0 || outcome.orphansKept > 0) {
+            this.log.info(`tmux housekeeping: ${outcome.killed} killed, ${outcome.orphansKept} old sessions kept`);
         }
-        return reaped;
+        return outcome;
     }
 
     /**
-     * Force-kill EVERY session of one (host, workspace) — the manual escape hatch
+     * Force-kill EVERY session of this workspace (each of its `identities`) — the manual escape hatch
      * behind the "Kill Persistent Terminal Sessions (this workspace)" command
      * (docs/idea/tmux-approach.md). Unlike `reap()`, it ignores attached/live/grace
      * state: the user explicitly asked to nuke this workspace's terminals, so a
      * session with a live window or a client still attached is killed too. Scope is
-     * held tight by `sessionSlot` (02) — only names that decode to a slot of THIS
-     * (host, workspace) qualify, so a sibling workspace on the same host or a foreign
+     * held tight by `sessionSlot` (02) — only names that decode to a slot of one of THESE
+     * identities qualify, so a sibling workspace on the same host or a foreign
      * session is never touched. Same fail-safe contract as `reap()`: a failed list
      * yields 0, a failed kill is traced and skipped, and it never throws (a command
      * must not surface an unhandled rejection). Resolves `undefined` when the sessions could
      * not be listed at all, otherwise how many were killed and how many could not be — so
      * the command can tell the user the real outcome, not just "killed 0".
      */
-    async killWorkspaceSessions(hostKey: string, workspaceKey: string): Promise<WorkspaceKillOutcome | undefined> {
-        const sessions = await this.listSessions();
-        if (sessions === undefined) {
+    async killWorkspaceSessions(identities: readonly WorkspaceIdentity[]): Promise<WorkspaceKillOutcome | undefined> {
+        const doomed = await this.workspaceSessions(identities);
+        if (doomed === undefined) {
             return undefined; // list probe failed — already traced; never throw from a command
         }
-
-        const doomed = sessions.filter(session => sessionSlot(session.name, hostKey, workspaceKey) !== undefined);
 
         let killed = 0;
         for (const session of doomed) {
@@ -159,6 +196,20 @@ export class SessionReaper {
             this.log.info(`tmux: killed ${killed} persistent session(s) for this workspace`);
         }
         return { killed, failed: doomed.length - killed };
+    }
+
+    /** How many sessions the workspace has (any state), or `undefined` when they could not be
+     * listed — what the "terminals are still running" offer counts. Kills nothing. */
+    async countWorkspaceSessions(identities: readonly WorkspaceIdentity[]): Promise<number | undefined> {
+        return (await this.workspaceSessions(identities))?.length;
+    }
+
+    /** The listed sessions that decode to a slot of one of `identities` (the full
+     * `code-<hash>-` prefix, so a sibling workspace or a foreign session never qualifies). */
+    private async workspaceSessions(identities: readonly WorkspaceIdentity[]): Promise<TmuxSession[] | undefined> {
+        const sessions = await this.listSessions();
+        return sessions?.filter(session =>
+            identities.some(({ hostKey, workspaceKey }) => sessionSlot(session.name, hostKey, workspaceKey) !== undefined));
     }
 
     /** Snapshot the remote's sessions, or `undefined` if the probe itself failed
