@@ -129,12 +129,15 @@ pivot, just swap the injection point in `terminalProvider.ts`.
   still required — this decision only settles *where the process spawns*,
   not the double-persistence question.
 
-## Ownership: let tmux own persistence
+## Ownership: tmux owns the process, VS Code owns the tab
 
-VS Code has its own persistent-terminal reconnection. Layering it on top of tmux
-double-persists. **Decide one owner — tmux** — and neutralise VS Code's for
-tmux-backed terminals, so re-attach behaviour is predictable (one of the SOLID
-"one reason to change" calls).
+The v1.0.0 design neutralised VS Code's persistent-terminal layer
+(an `isTransient` terminal) so tmux would be the only owner. That threw away split
+layouts on every reload, so it was reversed (1.1.0): VS Code persists and revives
+the *tabs* and their layout, tmux owns the *processes*, and every revive is
+answered by the profile provider with the same session — never a new one
+(`REVIVE_GRACE_MS` / `REVIVE_DEADLINE_MS` in `terminalProvider.ts` explain the
+ordering). One owner per concern, so re-attach is predictable.
 
 ## Session lifecycle — no zombies
 
@@ -156,10 +159,14 @@ strategy:
   `destroy-unattached on` — that would kill on detach and defeat persistence.
 - **Keep intentional long-lived sessions.** The Claude Code task session persists
   by design; only *empty/abandoned* sessions are candidates for cleanup.
-- **Housekeeping on connect.** On resolving a host, optionally prune sessions that
-  are empty or older than a threshold with no live processes; surface a count if
-  it grows unusually. A manual "kill session" affordance stays available for the
-  power case, but the default path must self-clean.
+- **Housekeeping on connect** (`remote.SSH.tmux.reapOnConnect`, shipped). Kills
+  sessions of ours whose pane is dead, and detached sessions of ours with no
+  activity for `remote.SSH.tmux.orphanMaxAgeDays` (default 14; `0` = never) — the
+  ones a renamed or abandoned folder leaves behind. Never an attached session,
+  never a name we did not mint, never this window's own mapped sessions. One Info
+  line reports the count: `tmux housekeeping: K killed, O old sessions kept`. The
+  manual "Kill Persistent Terminal Sessions (this workspace)" command stays for
+  the power case.
 
 The invariant: **one live session per (host, workspace, terminal-slot); zero
 sessions with no purpose.**
@@ -174,8 +181,11 @@ record of *why*, per the "write it down" house rule.
   resolved: terminal profile provider (Route A), confirmed to spawn on the
   remote regardless of `extensionKind` — see "Spike decision" above. **Shipped**
   in `src/tmux/terminalProvider.ts`.
-- **Naming / discovery.** Resolved as `code-<sha1_12(host + ' ' + workspacePath)>-<slot>`
-  — one deterministic namespace per (host, workspace), with a numeric `slot` for
+- **Naming / discovery.** Resolved as `code-<sha1_12(host + ' ' + workspacePath)>-<slot>`,
+  where host is the resolved `user@hostname:port` (lower-cased; since the hardening
+  sweep — before it, the SSH alias as typed) and the path is normalised (`//`
+  collapsed, trailing `/` dropped); sessions under the old name are renamed once —
+  one deterministic namespace per (host, workspace), with a numeric `slot` for
   multiple terminals in the same workspace (terminal 0, 1, 2, …). No user-facing
   name; the `code-` prefix is also the exact namespace the reaper is allowed to
   touch, so a user's own `main` session is never at risk. **Shipped** in
@@ -187,8 +197,9 @@ record of *why*, per the "write it down" house rule.
   terminal is always the sole client resizing the window in the common case).
   Multi-client concurrent-resize contention is accepted, undocumented tmux
   behaviour, not solved by this fork — see the multi-client rules in
-  [`persistence-model.md`](persistence-model.md). **Shipped** (the two
-  `set-option`s) in `buildAttachOrCreate(Argv)`.
+  [`persistence-model.md`](persistence-model.md). **Shipped** in
+  `buildAttachOrCreateArgv`; the full list of options it sets is under "What we
+  write to the user's tmux server" below.
 - **Claude Code specifically.** Resolved as *not* a first-class "attach to my
   long task" command — a well-known, deterministic session name is enough:
   `code-<hash>-0` (slot 0, the first terminal opened in a workspace) is where a
@@ -203,6 +214,32 @@ record of *why*, per the "write it down" house rule.
   connect never breaks. **Shipped** via the platform gate in
   `probeTmux` (`src/tmux/tmuxBootstrap.ts`), which short-circuits to
   `{available: false, reason: 'windows'}`.
+
+## What we write to the user's tmux server
+
+The terminals run in the user's own tmux server (the default socket), so anything
+we set is visible to their other sessions. The rule (`buildAttachOrCreateArgv`,
+`src/tmux/tmuxSession.ts`): **session-scoped where tmux allows it, and a
+server-wide value only replaces tmux's own default — never a value the user
+chose.** Nothing is ever written to `~/.tmux.conf`. Verified on tmux 2.6, 3.0a,
+3.4, 3.5a and 3.8 by the rig.
+
+Session-scoped, on our `code-*` sessions only, on every attach: `@orst_owner`
+(the hand-off owner tag), `remain-on-exit off`, `status off`, `history-limit`,
+`mouse on`, `prefix None`, `prefix2 None` (Ctrl-B reaches the program). Also
+session-scoped: `@orst_closed`, written by the per-connection close watch when the
+window's SSH connection ends and reset to `none` when it reconnects (user options
+are overwritten, never unset — unsetting one crashes tmux 2.6).
+
+Server-scoped, and when:
+
+| What | When | Why |
+|---|---|---|
+| global `history-limit` | tmux < 3.7 only: set to our value for the instant our pane is created, then put back to the user's exact value | before 3.7 a pane reads it only at creation, so a session value comes too late |
+| server user option `@orst_saved_hl` | tmux < 3.7: holds the user's value during that swap; left set afterwards (inert) | unsetting a global user option crashes the tmux 2.6 server |
+| `escape-time` → 10 ms | only while it is still 500, the pre-3.5 default | a lone Esc otherwise lags half a second in every TUI |
+| `set-clipboard` → `on` | only while it is still `external`, the default | drag-select in tmux reaches the local clipboard over OSC 52 |
+| root-table `PageUp` / `PageDown` bindings | only if the key is unbound | key tables are server-global; the bindings act only at a bare shell prompt (alternate screen and non-shell programs such as Claude Code keep the keys) |
 
 ## Deferred (not in this release)
 

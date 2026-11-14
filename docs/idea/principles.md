@@ -26,16 +26,18 @@ action. If using it requires knowing tmux is there, we've failed this principle.
 
 ## 4. tmux owns terminal lifetime — one owner, not two
 
-Terminal persistence lives in the tmux server, not the VS Code window and not the
-vscode-server. VS Code's own persistent-terminal layer must not double up on
-tmux's — pick tmux as the single owner so re-attach is predictable.
+The terminal *process* lives in the tmux server, not the VS Code window and not
+the vscode-server. VS Code still owns the *tab*: its terminal persistence restores
+tabs and split layout, and every tab it revives is answered with the same tmux
+session, never a new one. One owner per concern keeps re-attach predictable.
 
 ## 5. No zombie sessions
 
 Persistence is not an excuse to hoard. Re-opening the same host+workspace must
 re-attach the **same** session (deterministic naming + attach-or-create), never
-spawn a duplicate. Sessions whose processes have all exited get reaped;
-long-lived intentional ones (the Claude Code task) are kept. The user should
+spawn a duplicate. Sessions whose processes have all exited end with them, and
+detached ones nobody has used for `remote.SSH.tmux.orphanMaxAgeDays` are reaped
+on connect; sessions on screen anywhere (the Claude Code task) are kept. The user should
 never find a graveyard of orphaned sessions. See [`tmux-approach.md`](tmux-approach.md).
 
 ## 6. Keep the SSH transport; add, don't rip out
@@ -63,10 +65,11 @@ shell-injection paths in the commands/scripts we send to the remote.
 We track upstream `jeanp413/open-remote-ssh`. tmux changes stay isolated and
 well-labelled, and the tmux integration lives in its own module(s) (not bolted
 onto the SSH classes) so upstream fixes keep merging — which is also just good
-SRP (see `CLAUDE.md`).
+SRP (see `CLAUDE.md`). Where an upstream file has to change, the hunk is minimal and
+marked `Fork:`; merging is described in [`../upstream-sync.md`](../upstream-sync.md).
 
 ## 10. Keep it small
 
-The codebase is ~2.3k LOC and readable. Prefer deleting to abstracting;
+The codebase is ~9k lines of TypeScript and readable. Prefer deleting to abstracting;
 introduce an abstraction only when there's a second real consumer. One
 responsibility per module.

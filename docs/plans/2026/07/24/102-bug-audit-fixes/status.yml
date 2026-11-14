@@ -106,5 +106,8 @@ evidence:
       checked — it does not reference the F5/EDH gap (that documentation
       lives in ai-first.md, not roadmap.md) — left unchanged rather than
       adding an unrelated edit.
+# 2026-11-14: edh_matrix_rows stayed partial here. The F5/EDH matrix is re-run, with the
+# real-tmux rig, by docs/plans/2026/11/13/101-bulletproof-hardening-sweep/09-verify.md —
+# read that plan's results, not this file, for the current state.
 notes: "Findings pre-verified by 5 parallel audit agents (ssh core, server setup, tmux layer, UI/wiring, test coverage) on 2026-07-24; line refs were pre-fix. All 8 slices' tasks (1-43) complete across PRs #11-#19 plus this task's own real-tmux-verification fix. See docs/idea/ai-first.md for the current, honest F5/EDH empirical-proof status (partial: real-tmux mechanics verified with a real bug found+fixed; VS Code GUI rows still blocked on no desktop/display in this environment)."
 last_updated: 2026-07-24

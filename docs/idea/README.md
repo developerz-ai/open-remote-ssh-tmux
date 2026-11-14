@@ -23,6 +23,10 @@ open-remote-ssh's existing SSH transport.
 - [`principles.md`](principles.md) — the design principles that follow from the why.
 - [`ai-first.md`](ai-first.md) — how this repo is set up for AI agents; current
   state vs. target, and the gaps to close.
+- [`../troubleshooting.md`](../troubleshooting.md) — reading the log, the
+  notifications, and fixing terminals that do not survive a disconnect.
+- [`../upstream-sync.md`](../upstream-sync.md) — the fork point, which upstream
+  files carry our hunks, and how to merge upstream.
 - [`roadmap.md`](roadmap.md) — what's deliberately deferred past v1 (session
   manager UI, Claude Code first-class attach, mosh-over-tmux) and why.
 

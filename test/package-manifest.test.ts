@@ -208,10 +208,12 @@ describe('package.json manifest drift guard', () => {
         // Reverse of the guard above: catches a setting shipped in package.json that nobody
         // documented (the forward guard at :126 only catches docs promising a setting that
         // doesn't exist; this one catches a setting existing that docs never mention).
-        it('every remote.SSH.tmux.* setting in package.json is mentioned in docs/', () => {
+        // Plans don't count here either: a plan naming a setting documents nothing for users.
+        it('every remote.SSH.tmux.* setting in package.json is mentioned in README.md or docs/ (plans excluded)', () => {
             const docsDir = path.resolve(repoRoot, 'docs');
-            const allMarkdownFiles = collectAllMarkdownFiles(docsDir);
-            const docsContents = allMarkdownFiles.map(file => fs.readFileSync(file, 'utf8')).join('\n');
+            const plansDir = path.join(docsDir, 'plans') + path.sep;
+            const userDocs = [path.resolve(repoRoot, 'README.md'), ...collectAllMarkdownFiles(docsDir).filter(file => !file.startsWith(plansDir))];
+            const docsContents = userDocs.map(file => fs.readFileSync(file, 'utf8')).join('\n');
 
             const tmuxSettingKeys = Object.keys(properties).filter(key => key.startsWith('remote.SSH.tmux.'));
             expect(tmuxSettingKeys.length).toBeGreaterThan(0);
@@ -220,7 +222,7 @@ describe('package.json manifest drift guard', () => {
 
             expect(
                 undocumented,
-                `These remote.SSH.tmux.* settings exist in package.json but are never mentioned in docs/: ${undocumented.join(', ')}`
+                `These remote.SSH.tmux.* settings exist in package.json but are never mentioned in README.md or docs/: ${undocumented.join(', ')}`
             ).toEqual([]);
         });
 
@@ -408,8 +410,8 @@ describe('package.json manifest drift guard', () => {
         });
 
         it('documents both installation steps, npm PATH, and non-mutating help checks', () => {
-            const readme = fs.readFileSync(path.join(repoRoot, 'README.md'), 'utf8');
-            const maintenance = readme.split('### Maintenance tools (Linux/macOS)')[1]?.split('\n### ')[0];
+            const contributing = fs.readFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), 'utf8');
+            const maintenance = contributing.split('### Maintenance tools (Linux/macOS)')[1]?.split('\n### ')[0];
             expect(maintenance).toBeDefined();
             const text = maintenance!.replace(/\s+/g, ' ');
             expect(text).toContain('Complete maintenance setup requires **both** steps');
