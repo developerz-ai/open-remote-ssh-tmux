@@ -1,6 +1,7 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SLOT_MAPPING_STATE_KEY, TmuxTerminalProvider } from '../../src/tmux/terminalProvider';
-import { buildAttachOrCreateArgv, buildKillSession, escapeShellArg, sessionName } from '../../src/tmux/tmuxSession';
+import { createRemoteExec } from '../../src/tmux/remoteExec';
+import { buildAttachOrCreateArgv, buildKillSession, sessionName } from '../../src/tmux/tmuxSession';
 
 // The terminal provider is the user-facing heart of the fork: it decides which
 // tmux session (slot) each VS Code terminal maps to. Both hard invariants live
@@ -52,34 +53,60 @@ function fakeState(initial: Record<string, unknown> = {}) {
 const row = (sessionId: string, attached: boolean, windows = 1, created = 1700000000, paneDead = false): string =>
     `${sessionId} ${attached ? 1 : 0} ${windows} ${created} ${paneDead ? 1 : 0}`;
 
+/** The session names a batched `has-session` command asks about, in order. Matched on the
+ * EXACT `-t =<name>` target the real tmux uses, not a loose substring: a bare `includes(name)`
+ * mimicked the very prefix-match bug the `=` fix removes (it would report `code-<h>-01`
+ * present when only `code-<h>-0` exists). */
+const hasTargets = (command: string): string[] =>
+    [...command.matchAll(/has-session -t ='([^']*)'/g)].map(m => m[1]);
+
+/** One tagged answer line of the batched `has-session` command (`__has <i> <rc> <msg>`). */
+const hasLine = (index: number, code: number, message = ''): string => `__has ${index} ${code} ${message}`;
+
+/** A batched `has-session` reply: each asked-about name answered by `answer(name)`. */
+function hasReply(command: string, answer: (target: string) => { code: number; message?: string }) {
+    const stdout = hasTargets(command)
+        .map((target, index) => {
+            const { code, message } = answer(target);
+            return hasLine(index, code, message);
+        })
+        .join('\n');
+    return { stdout, stderr: '', code: 0 };
+}
+
 /**
- * An exec that answers `list-sessions` with the given rows and `has-session`
- * against a set of existing names (empty stderr = present; not-found stderr =
- * absent), mirroring how the real tmux CLI reports over `SSHConnection#exec`
- * (no exit code surfaced — status is read from stdout/stderr).
- *
- * `has-session` is matched on the EXACT `-t =<name>` target the real tmux uses,
- * not a loose substring of the whole command: a bare `includes(name)` mimicked the
- * very prefix-match bug the `=` fix removes (it would report `code-<h>-01` present
- * when only `code-<h>-0` exists). The `=` + trailing quote bound the token.
+ * A `RemoteExec` that answers `list-sessions` with the given rows and the batched
+ * `has-session` against a set of existing names (exit 0 = present; exit 1 + tmux's own
+ * "can't find session" = absent), mirroring what the real tmux CLI reports.
  */
 function fakeExec(opts: { list?: string[]; existing?: string[] } = {}) {
     const listOut = (opts.list ?? []).join('\n');
     const existing = new Set(opts.existing ?? []);
-    return vi.fn(async (command: string) => {
+    return vi.fn(async (command: string): Promise<ExecResult> => {
         if (command.includes('list-sessions')) {
-            return { stdout: listOut, stderr: '' };
+            return { stdout: listOut, stderr: '', code: 0 };
         }
         if (command.includes('has-session')) {
-            const present = [...existing].some(n => command.includes(`=${escapeShellArg(n)}`));
-            return present ? { stdout: '', stderr: '' } : { stdout: '', stderr: `can't find session` };
+            return hasReply(command, target => existing.has(target)
+                ? { code: 0 }
+                : { code: 1, message: `can't find session: ${target}` });
         }
-        return { stdout: '', stderr: '' };
+        return { stdout: '', stderr: '', code: 0 };
     });
+}
+
+/** What a fake exec may answer. `code` is optional so the many inline fakes below that only
+ * care about stdout keep reading naturally; it defaults to 0 (see `makeProvider`). */
+interface ExecResult {
+    readonly stdout: string;
+    readonly stderr: string;
+    readonly code?: number;
 }
 
 function makeProvider(over: {
     exec?: ReturnType<typeof fakeExec>;
+    /** A fully-formed `RemoteExec`, passed through untouched (e.g. one built by `createRemoteExec`). */
+    rawExec?: import('../../src/tmux/remoteExec').RemoteExec;
     state?: ReturnType<typeof fakeState>;
     opened?: LaunchOptions[];
     historyLimit?: number;
@@ -92,9 +119,11 @@ function makeProvider(over: {
     const opened = over.opened ?? [];
     const exec = over.exec ?? fakeExec();
     const state = over.state ?? fakeState();
+    const log = { info: vi.fn(), trace: vi.fn() };
     const provider = new TmuxTerminalProvider({
         ctx: { hostKey: HOST, workspaceKey: WS, cwd: CWD },
-        exec,
+        // `code` defaults to 0 so a fake that omits it reads as tmux succeeding.
+        exec: over.rawExec ?? (async (command: string) => ({ code: 0, ...await exec(command) })),
         state,
         // LaunchOptions is the subset this provider produces; narrow back to it for recording.
         openTerminal: (options: import('vscode').TerminalOptions): void => {
@@ -106,11 +135,11 @@ function makeProvider(over: {
         // the claim-driven tests below set it explicitly.
         reviveDeadlineMs: over.reviveDeadlineMs ?? over.reviveGraceMs ?? 0,
         reviveQuietMs: over.reviveQuietMs ?? 0,
-        log: { info: vi.fn(), trace: vi.fn() },
+        log,
         historyLimit: over.historyLimit,
         tmuxPath: over.tmuxPath,
     });
-    return { provider, opened, exec, state };
+    return { provider, opened, exec, state, log };
 }
 
 /** The options carried by a returned `TerminalProfile` (mock stores them as-is). */
@@ -192,21 +221,15 @@ describe('no-steal TOCTOU (re-probe immediately before returning)', () => {
     });
 });
 
-describe('no-steal guard survives a transient probe failure (snapshot retention)', () => {
-    // `attachedRemoteSlots` IS the no-steal guard. A *transient* `list-sessions`
-    // failure (network blip mid-session) must not silently disarm it: the last known
-    // snapshot is retained, so a new terminal still skips the slot another client
-    // holds instead of stealing it. Clearing the set on every failed probe would open
-    // exactly the steal the guard exists to prevent. Retention errs safe — a slot the
-    // other client has since detached stays guarded only until the next *successful*
-    // probe re-syncs it (self-healing, worst case a higher slot number, never a steal).
+describe('no-steal guard under a probe failure', () => {
+    // `attachedRemoteSlots` IS the no-steal guard. A *transient* `list-sessions` failure
+    // (network blip, missed deadline) must not silently disarm it — and guessing a slot from
+    // a stale snapshot is no better. When the remote cannot be asked, the new terminal gets
+    // a plain shell (this one terminal only) rather than a slot that might be someone else's.
 
-    it('retains the last attached-elsewhere snapshot when a later probe fails', async () => {
-        // First probe: slot 0 is attached by another client → seeds the guard. Every
-        // later probe throws. With the bug (clear-on-failure) the guard empties and the
-        // new terminal steals slot 0; with retention it still skips it → slot 1.
+    it('answers with a plain shell, not a guessed slot, when the snapshot cannot be taken', async () => {
         let listCalls = 0;
-        const exec = vi.fn(async (command: string) => {
+        const exec = vi.fn(async (command: string): Promise<ExecResult> => {
             if (command.includes('list-sessions')) {
                 listCalls++;
                 if (listCalls === 1) {
@@ -216,10 +239,41 @@ describe('no-steal guard survives a transient probe failure (snapshot retention)
             }
             return { stdout: '', stderr: '' };
         });
-        const { provider } = makeProvider({ exec });
+        const { provider, log } = makeProvider({ exec });
 
         await provider.initialize(); // seeds attachedRemoteSlots = {0} from the good snapshot
-        // The failing probes inside provideTerminalProfile must keep slot 0 guarded.
+        const options = optionsOf(await provider.provideTerminalProfile());
+
+        expect(options).toEqual({}); // VS Code's default shell
+        expect(log.info).toHaveBeenCalledTimes(1);
+        expect(String(log.info.mock.calls[0][0])).toMatch(/plain shell/);
+    });
+
+    it('treats a list tmux could not run (non-zero exit, no "no server") as unreachable', async () => {
+        const exec = vi.fn(async (command: string): Promise<ExecResult> => command.includes('list-sessions')
+            ? { stdout: '', stderr: 'sh: 1: tmux: not found', code: 127 }
+            : { stdout: '', stderr: '' });
+        const { provider } = makeProvider({ exec });
+
+        expect(optionsOf(await provider.provideTerminalProfile())).toEqual({});
+    });
+
+    it('keeps the slot chosen from a good snapshot when only the re-probe fails', async () => {
+        // The re-probe only narrows the TOCTOU window; losing it is no reason to drop to a
+        // plain shell when a fresh snapshot already said the slot is free.
+        let listCalls = 0;
+        const exec = vi.fn(async (command: string): Promise<ExecResult> => {
+            if (command.includes('list-sessions')) {
+                listCalls++;
+                if (listCalls === 1) {
+                    return { stdout: row(name(0), true), stderr: '' };
+                }
+                throw new Error('connection reset');
+            }
+            return { stdout: '', stderr: '' };
+        });
+        const { provider } = makeProvider({ exec });
+
         expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(1));
     });
 });
@@ -699,30 +753,138 @@ describe('readMapping (malformed persisted state, defensive parsing)', () => {
     });
 });
 
-describe('sessionExists (has-session stderr variants)', () => {
-    // sessionExists reads MISSING_SESSION_RE against stderr (no exit code is
-    // surfaced by exec). Every phrasing tmux actually uses for "not there" must
-    // prune the mapping, not just the one variant exercised elsewhere
-    // ("can't find session").
+describe('has-session verdicts (prune only on a confirmed absence)', () => {
+    // Existence is read from tmux's exit status AND message (`classifyTmuxFailure`). Every
+    // phrasing tmux actually uses for "not there" must prune the mapping; anything that only
+    // says "could not ask" — or that client and server disagree — must keep it, because the
+    // mapping is the only client-local record of which session belongs to which slot.
+    const mappedState = () => fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+    const answering = (code: number, message: string) => vi.fn(async (command: string): Promise<ExecResult> =>
+        command.includes('has-session')
+            ? hasReply(command, () => ({ code, message }))
+            : { stdout: '', stderr: '' });
+
     it.each([
+        `can't find session: placeholder`,
         `no server running on /tmp/tmux-1000/default`,
         `error connecting to /tmp/tmux-1000/default (No such file or directory)`,
-    ])('prunes a mapped slot whose has-session reports: %s', async (stderr) => {
-        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
-        const exec = vi.fn(async (command: string) => {
-            if (command.includes('list-sessions')) {
-                return { stdout: '', stderr: '' };
-            }
-            if (command.includes('has-session')) {
-                return { stdout: '', stderr };
-            }
-            return { stdout: '', stderr: '' };
+    ])('prunes a mapped slot whose has-session reports: %s', async (message) => {
+        const { provider } = makeProvider({ state: mappedState(), exec: answering(1, message) });
+
+        await provider.initialize();
+
+        expect(provider.mappedSlots()).toEqual([]); // pruned, not kept as a false survivor
+    });
+
+    it.each([
+        ['unreachable', `error connecting to /tmp/tmux-1000/default (Permission denied)`],
+        ['unreachable', ''],
+        ['incompatible', 'protocol version mismatch (client 8, server 7)'],
+    ])('keeps the mapping (and opens nothing) on an %s answer: %j', async (_verdict, message) => {
+        const state = mappedState();
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ state, opened, exec: answering(1, message) });
+
+        await provider.initialize();
+
+        expect(provider.mappedSlots()).toEqual([0]);
+        expect(state.get(SLOT_MAPPING_STATE_KEY)).toEqual({ '0': name(0) });
+        expect(opened).toEqual([]);
+    });
+
+    it('keeps the mapping when a slot\'s answer line never came back', async () => {
+        const exec = vi.fn(async (command: string): Promise<ExecResult> =>
+            command.includes('has-session') ? { stdout: 'banner only\n', stderr: '' } : { stdout: '', stderr: '' });
+        const { provider } = makeProvider({ state: mappedState(), exec });
+
+        await provider.initialize();
+
+        expect(provider.mappedSlots()).toEqual([0]);
+    });
+});
+
+describe('reconcile cost (two remote round-trips, however many slots)', () => {
+    it('asks about every mapped slot in ONE batched has-session call', async () => {
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0), '1': name(1), '2': name(2), '3': name(3) } });
+        const exec = fakeExec({
+            list: [0, 1, 2, 3].map(slot => row(name(slot), false)),
+            existing: [name(0), name(1), name(3)],
         });
         const { provider } = makeProvider({ state, exec });
 
         await provider.initialize();
 
-        expect(provider.mappedSlots()).toEqual([]); // pruned, not kept as a false survivor
+        const commands = exec.mock.calls.map(c => c[0]);
+        expect(commands.filter(c => c.includes('has-session'))).toHaveLength(1);
+        expect(hasTargets(commands.find(c => c.includes('has-session'))!)).toEqual([name(0), name(1), name(2), name(3)]);
+        expect(commands).toHaveLength(2); // list + batched has
+        expect(provider.mappedSlots()).toEqual([0, 1, 3]); // only the confirmed-absent slot pruned
+    });
+
+    it('skips the has-session round-trip entirely when nothing needs confirming', async () => {
+        const exec = fakeExec();
+        const { provider } = makeProvider({ exec });
+
+        await provider.initialize();
+
+        expect(exec.mock.calls.map(c => c[0]).filter(c => c.includes('has-session'))).toEqual([]);
+    });
+});
+
+describe('a remote that never answers (deadline-bounded)', () => {
+    // The production exec is `createRemoteExec(lazyExec, …)`: a half-dead link never closes
+    // the stream, so without a deadline "New Terminal" would spin forever.
+    const DEADLINE_MS = 8000;
+    const hung = () => createRemoteExec(() => new Promise(() => { /* never settles */ }), DEADLINE_MS);
+
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it('settles initialize() and keeps every mapping', async () => {
+        vi.useFakeTimers();
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const { provider } = makeProvider({ state, rawExec: hung() });
+
+        let settled = false;
+        void provider.initialize().then(() => { settled = true; });
+        await vi.advanceTimersByTimeAsync(2 * DEADLINE_MS);
+
+        expect(settled).toBe(true);
+        expect(provider.mappedSlots()).toEqual([0]);
+    });
+
+    it('settles provideTerminalProfile() with a plain shell and one info line', async () => {
+        vi.useFakeTimers();
+        const { provider, log } = makeProvider({ rawExec: hung() });
+
+        const pending = provider.provideTerminalProfile();
+        await vi.advanceTimersByTimeAsync(DEADLINE_MS);
+
+        expect(optionsOf(await pending)).toEqual({});
+        expect(log.info).toHaveBeenCalledTimes(1);
+        expect(String(log.info.mock.calls[0][0])).not.toMatch(/tmux/i);
+    });
+
+    it('frees nothing it did not claim: the next terminal after recovery gets slot 0', async () => {
+        vi.useFakeTimers();
+        let alive = false;
+        const rawExec = createRemoteExec(
+            command => alive
+                ? Promise.resolve({ stdout: command.includes('has-session') ? '' : '\n__rc=0\n', stderr: '' })
+                : new Promise(() => { /* hung */ }),
+            DEADLINE_MS,
+        );
+        const { provider } = makeProvider({ rawExec });
+
+        const first = provider.provideTerminalProfile();
+        await vi.advanceTimersByTimeAsync(DEADLINE_MS);
+        expect(optionsOf(await first)).toEqual({});
+
+        alive = true;
+        const second = provider.provideTerminalProfile();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(targetSession(optionsOf(await second))).toBe(name(0));
     });
 });
 
@@ -737,7 +899,7 @@ describe('folderName (tab title from a remote cwd, edge inputs)', () => {
     ])('titles cwd %s as %s', async (cwd, expected) => {
         const provider = new TmuxTerminalProvider({
             ctx: { hostKey: HOST, workspaceKey: WS, cwd },
-            exec: fakeExec(),
+            exec: async (command: string) => ({ code: 0, ...await fakeExec()(command) }),
             state: fakeState(),
             openTerminal: () => { /* not exercised */ },
             log: { info: vi.fn(), trace: vi.fn() },
@@ -1166,7 +1328,7 @@ describe('probe failures must not be read as "the session is gone"', () => {
 
     it('keeps the mapping when the existence probe cannot be delivered', async () => {
         const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
-        const exec = vi.fn(async (command: string) => {
+        const exec = vi.fn(async (command: string): Promise<ExecResult> => {
             if (command.includes('has-session')) {
                 throw new Error('channel closed');
             }

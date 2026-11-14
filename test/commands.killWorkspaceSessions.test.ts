@@ -15,9 +15,12 @@ const TMUX_JARGON = /tmux/i;
 const HOST = 'example.com';
 const WS = '/home/user/proj';
 
+/** What the reaper reports back: kill counts, or `undefined` when it could not list. */
+type Outcome = { killed: number; failed: number } | undefined;
+
 /** A target whose reaper records how it was invoked. */
-function fakeTarget() {
-    const kill = vi.fn(async () => 3);
+function fakeTarget(outcome: Outcome = { killed: 3, failed: 0 }) {
+    const kill = vi.fn(async (): Promise<Outcome> => outcome);
     const target: WorkspaceKillTarget = { reaper: { killWorkspaceSessions: kill }, hostKey: HOST, workspaceKey: WS };
     return { target, kill };
 }
@@ -26,6 +29,7 @@ beforeEach(() => {
     messageResponses.warning = undefined;
     shownMessages.warning.length = 0;
     shownMessages.information.length = 0;
+    shownMessages.error.length = 0;
 });
 
 describe('killWorkspaceSessions command handler', () => {
@@ -67,6 +71,46 @@ describe('killWorkspaceSessions command handler', () => {
 
         expect(shownMessages.error).toHaveLength(1);
         expect(shownMessages.information).toHaveLength(0); // no false "killed N" success message
+        expect(String(shownMessages.error[0][0])).not.toMatch(TMUX_JARGON);
+    });
+
+    it('reports the number actually killed', async () => {
+        const { target } = fakeTarget({ killed: 3, failed: 0 });
+        messageResponses.warning = KILL_SESSIONS_CONFIRM_LABEL;
+
+        await killWorkspaceSessions(() => target);
+
+        expect(shownMessages.information).toHaveLength(1);
+        expect(String(shownMessages.information[0][0])).toContain('Killed 3 ');
+    });
+
+    it('says how many could not be killed instead of claiming success for them', async () => {
+        const { target } = fakeTarget({ killed: 1, failed: 2 });
+        messageResponses.warning = KILL_SESSIONS_CONFIRM_LABEL;
+
+        await killWorkspaceSessions(() => target);
+
+        expect(shownMessages.information).toHaveLength(0);
+        expect(shownMessages.warning).toHaveLength(2); // the confirm, then the partial result
+        const message = String(shownMessages.warning[1][0]);
+        expect(message).toContain('Killed 1 ');
+        expect(message).toContain('2 ');
+        expect(message).not.toMatch(TMUX_JARGON);
+    });
+
+    it('reports an error, not "killed 0", when the sessions could not be listed', async () => {
+        const unreachable: Outcome = undefined;
+        const target: WorkspaceKillTarget = {
+            reaper: { killWorkspaceSessions: vi.fn(async () => unreachable) },
+            hostKey: HOST,
+            workspaceKey: WS,
+        };
+        messageResponses.warning = KILL_SESSIONS_CONFIRM_LABEL;
+
+        await killWorkspaceSessions(() => target);
+
+        expect(shownMessages.information).toHaveLength(0);
+        expect(shownMessages.error).toHaveLength(1);
         expect(String(shownMessages.error[0][0])).not.toMatch(TMUX_JARGON);
     });
 });

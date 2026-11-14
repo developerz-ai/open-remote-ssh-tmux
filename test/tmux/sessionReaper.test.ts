@@ -41,27 +41,36 @@ const row = (
 };
 
 /**
- * An exec that answers `list-sessions` with the given rows and `kill-session` with
- * success, recording every command. A test can force a rejection on the list probe
- * or on the kill of a specific session (models a dead channel — the real exec
- * surfaces no exit code, only stdout/stderr or a rejection).
+ * A `RemoteExec` that answers `list-sessions` with the given rows and `kill-session` with
+ * success (exit 0), recording every command. A test can force a rejection (dead channel /
+ * missed deadline) on the list probe or on the kill of a specific session, or make a kill
+ * come back with a non-zero exit status and an error message.
  */
-function fakeExec(opts: { list?: string[]; throwOnList?: boolean; throwKillFor?: string } = {}) {
+function fakeExec(opts: {
+    list?: string[];
+    throwOnList?: boolean;
+    throwKillFor?: string;
+    failKillFor?: { name: string; stderr: string; code: number | undefined };
+    listResult?: { stdout: string; stderr: string; code: number | undefined };
+} = {}) {
     const listOut = (opts.list ?? []).join('\n');
-    return vi.fn(async (command: string) => {
+    return vi.fn(async (command: string): Promise<{ stdout: string; stderr: string; code: number | undefined }> => {
         if (command.includes('list-sessions')) {
             if (opts.throwOnList) {
                 throw new Error('channel closed');
             }
-            return { stdout: listOut, stderr: '' };
+            return opts.listResult ?? { stdout: listOut, stderr: '', code: 0 };
         }
         if (command.includes('kill-session')) {
             if (opts.throwKillFor !== undefined && command.includes(opts.throwKillFor)) {
                 throw new Error('kill failed');
             }
-            return { stdout: '', stderr: '' };
+            if (opts.failKillFor !== undefined && command.includes(opts.failKillFor.name)) {
+                return { stdout: '', stderr: opts.failKillFor.stderr, code: opts.failKillFor.code };
+            }
+            return { stdout: '', stderr: '', code: 0 };
         }
-        return { stdout: '', stderr: '' };
+        return { stdout: '', stderr: '', code: 0 };
     });
 }
 
@@ -166,6 +175,48 @@ describe('reap — failure handling (never breaks the connect)', () => {
     });
 });
 
+describe('reap — a kill counts only when it landed', () => {
+    it('does not count a kill tmux refused (non-zero exit, session still there)', async () => {
+        const exec = fakeExec({
+            list: [row(ours(0), false, { paneDead: true }), row(ours(1), false, { paneDead: true })],
+            failKillFor: { name: ours(0), stderr: 'protocol version mismatch (client 8, server 7)', code: 1 },
+        });
+        const { reaper, log } = makeReaper({ exec });
+
+        expect(await reaper.reap()).toBe(1);
+        expect(log.trace).toHaveBeenCalled();
+    });
+
+    it('does not count a kill whose exit status never came back', async () => {
+        const exec = fakeExec({
+            list: [row(ours(0), false, { paneDead: true })],
+            failKillFor: { name: ours(0), stderr: '', code: undefined },
+        });
+        const { reaper, log } = makeReaper({ exec });
+
+        expect(await reaper.reap()).toBe(0);
+        expect(log.info).not.toHaveBeenCalled();
+    });
+
+    it('counts a session that was already gone when the kill arrived', async () => {
+        const exec = fakeExec({
+            list: [row(ours(0), false, { paneDead: true })],
+            failKillFor: { name: ours(0), stderr: `can't find session: ${ours(0)}`, code: 1 },
+        });
+        const { reaper } = makeReaper({ exec });
+
+        expect(await reaper.reap()).toBe(1);
+    });
+
+    it('reads a failed list (tmux not runnable) as "could not list", not as zero sessions', async () => {
+        const exec = fakeExec({ listResult: { stdout: '', stderr: 'sh: 1: tmux: not found', code: 127 } });
+        const { reaper, log } = makeReaper({ exec });
+
+        expect(await reaper.reap()).toBe(0);
+        expect(log.trace).toHaveBeenCalled();
+    });
+});
+
 describe('killWorkspaceSessions — force-kill this workspace (manual escape hatch)', () => {
     const OTHER_WS = '/home/user/other';
     /** An owned session name for a slot in a DIFFERENT workspace on the same host. */
@@ -182,10 +233,10 @@ describe('killWorkspaceSessions — force-kill this workspace (manual escape hat
         });
         const { reaper, log } = makeReaper({ exec });
 
-        const killed = await reaper.killWorkspaceSessions(HOST, WS);
+        const outcome = await reaper.killWorkspaceSessions(HOST, WS);
 
         expect(killCommands(exec)).toEqual([buildKillSession(ours(0)), buildKillSession(ours(1))]);
-        expect(killed).toBe(2);
+        expect(outcome).toEqual({ killed: 2, failed: 0 });
         expect(log.info).toHaveBeenCalledTimes(1);
     });
 
@@ -193,24 +244,24 @@ describe('killWorkspaceSessions — force-kill this workspace (manual escape hat
         const exec = fakeExec({ list: [row(ours(0), false, { created: NOW })] });
         const { reaper } = makeReaper({ exec, now: NOW });
 
-        expect(await reaper.killWorkspaceSessions(HOST, WS)).toBe(1);
+        expect(await reaper.killWorkspaceSessions(HOST, WS)).toEqual({ killed: 1, failed: 0 });
         expect(killCommands(exec)).toEqual([buildKillSession(ours(0))]);
     });
 
-    it('returns 0 and logs nothing when this workspace has no sessions', async () => {
+    it('reports nothing killed and logs nothing when this workspace has no sessions', async () => {
         const exec = fakeExec({ list: [row(otherWs(0), false), row('main', true)] });
         const { reaper, log } = makeReaper({ exec });
 
-        expect(await reaper.killWorkspaceSessions(HOST, WS)).toBe(0);
+        expect(await reaper.killWorkspaceSessions(HOST, WS)).toEqual({ killed: 0, failed: 0 });
         expect(killCommands(exec)).toEqual([]);
         expect(log.info).not.toHaveBeenCalled();
     });
 
-    it('returns 0 without throwing when list-sessions fails', async () => {
+    it('resolves undefined (could not list) without throwing when list-sessions fails', async () => {
         const exec = fakeExec({ throwOnList: true });
         const { reaper, log } = makeReaper({ exec });
 
-        await expect(reaper.killWorkspaceSessions(HOST, WS)).resolves.toBe(0);
+        await expect(reaper.killWorkspaceSessions(HOST, WS)).resolves.toBeUndefined();
         expect(killCommands(exec)).toEqual([]);
         expect(log.trace).toHaveBeenCalled();
     });
@@ -222,7 +273,18 @@ describe('killWorkspaceSessions — force-kill this workspace (manual escape hat
         });
         const { reaper } = makeReaper({ exec });
 
-        await expect(reaper.killWorkspaceSessions(HOST, WS)).resolves.toBe(1);
+        await expect(reaper.killWorkspaceSessions(HOST, WS)).resolves.toEqual({ killed: 1, failed: 1 });
         expect(killCommands(exec)).toEqual([buildKillSession(ours(0)), buildKillSession(ours(1))]);
+    });
+
+    it('counts a kill tmux refused as failed, not killed', async () => {
+        const exec = fakeExec({
+            list: [row(ours(0), false), row(ours(1), false)],
+            failKillFor: { name: ours(1), stderr: 'error connecting to /tmp/tmux-1000/default (Permission denied)', code: 1 },
+        });
+        const { reaper, log } = makeReaper({ exec });
+
+        await expect(reaper.killWorkspaceSessions(HOST, WS)).resolves.toEqual({ killed: 1, failed: 1 });
+        expect(log.info).toHaveBeenCalledWith(expect.stringContaining('1'));
     });
 });

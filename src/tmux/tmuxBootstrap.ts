@@ -10,13 +10,18 @@
 // (the resolver wiring) logs one line from `reason`, keeping this module a leaf.
 // See docs/plans/2026/07/24/101-v1-tmux-release/03-remote-bootstrap.md.
 
+import { withDeadline } from '../common/deadline';
+
 /** The single remote-exec capability the probe needs. Matches the shape of
  * `SSHConnection#exec` (whose extra optional params are compatible), but named as
  * its own abstraction so this module never imports `ssh2`/`ssh`. */
 export type TmuxExec = (command: string) => Promise<{ stdout: string; stderr: string }>;
 
-/** Why tmux terminals are unavailable, when they are. Absent when available. */
-export type TmuxUnavailableReason = 'windows' | 'not-installed' | 'too-old';
+/** Why tmux terminals are unavailable, when they are. Absent when available.
+ * `unreachable` is the one transient reason: the probe could not be asked (channel error
+ * or {@link PROBE_DEADLINE_MS} passed). Nothing is cached — the resolver probes again on
+ * the next resolve, and the wiring retries then (`idempotentResolveHandler`). */
+export type TmuxUnavailableReason = 'windows' | 'not-installed' | 'too-old' | 'unreachable';
 
 /** The capability decision for one remote. */
 export interface TmuxCapability {
@@ -49,6 +54,11 @@ const PROBE_COMMAND = `sh -c 'command -v tmux && tmux -V'`;
 const FLOOR_MAJOR = 2;
 const FLOOR_MINOR = 6;
 
+/** How long the probe may take. It is awaited inside the resolver's `resolve()`, so this is
+ * the most a hung channel can ever delay the base SSH connect — the bound lives here, in the
+ * probe, rather than at the (upstream-derived) call site. */
+export const PROBE_DEADLINE_MS = 5000;
+
 /**
  * Probe a remote for a usable tmux.
  *
@@ -62,19 +72,21 @@ const FLOOR_MINOR = 6;
  * @param exec dependency-inverted remote command runner.
  * @param platform remote platform as surfaced by `serverSetup` (`'windows'` for a
  *   Windows remote, otherwise a Unix label or `undefined`).
+ * @param deadlineMs how long to wait for the probe before settling as `unreachable`.
  */
-export async function probeTmux(exec: TmuxExec, platform?: string): Promise<TmuxCapability> {
+export async function probeTmux(exec: TmuxExec, platform?: string, deadlineMs = PROBE_DEADLINE_MS): Promise<TmuxCapability> {
     if (platform === 'windows') {
         return { available: false, reason: 'windows' };
     }
 
     let stdout: string;
     try {
-        ({ stdout } = await exec(PROBE_COMMAND));
+        ({ stdout } = await withDeadline(exec(PROBE_COMMAND), deadlineMs, 'tmux probe'));
     } catch {
-        // The probe channel failed — not a tmux problem, but tmux is unusable
-        // here. Degrade gracefully (terminals off) rather than break the connect.
-        return { available: false, reason: 'not-installed' };
+        // The probe channel failed or hung — not a tmux verdict, but tmux is unusable for
+        // this resolve. Degrade gracefully (terminals off) rather than break or stall the
+        // connect; `unreachable` (not `not-installed`) so the log says what happened.
+        return { available: false, reason: 'unreachable' };
     }
 
     const version = parseVersionToken(stdout);

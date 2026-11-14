@@ -1,7 +1,9 @@
+import type { RemoteExec } from './remoteExec';
 import {
     buildKillSession,
     buildListSessions,
-    parseListSessions,
+    classifyTmuxFailure,
+    readListSessionsResult,
     sessionSlot,
     shouldReap,
     TmuxSession,
@@ -20,7 +22,8 @@ import {
 // Dependency-inverted (D in SOLID) and side-effect-narrow: the remote command
 // runner, an epoch-seconds clock (so reap decisions are deterministic and this
 // module never calls `Date.now()` — CLAUDE.md), and a narrow logger are all
-// injected, so it imports neither `vscode` nor `ssh2`/`ssh` and stays a leaf.
+// injected, so it imports neither `vscode` nor `ssh2`/`ssh` and stays a leaf. The
+// runner is the deadline-bounded, exit-code-reporting `RemoteExec` (`remoteExec.ts`).
 // It is deliberately NOT capability-aware: the wiring (`extension.ts`) constructs
 // and invokes it only when the bootstrap probe said tmux is available (03), keeping
 // "should tmux run at all?" in one place instead of smeared across collaborators.
@@ -30,12 +33,6 @@ import {
 // or a just-created one are all left untouched. Any probe failure degrades to
 // "reaped nothing" and never throws — reaping must never break the connect.
 // See docs/plans/2026/07/24/101-v1-tmux-release/04-terminal-profile.md (step 5).
-
-/** The single remote-exec capability the reaper needs. Same shape as
- * `SSHConnection#exec`, declared locally (not imported) so this module stays a leaf
- * with no `ssh2`/`ssh` coupling — matching `tmuxBootstrap`/`terminalProvider`. No
- * exit code is surfaced; tmux status is read from stdout/stderr or a rejection. */
-export type RemoteExec = (command: string) => Promise<{ stdout: string; stderr: string }>;
 
 /** Epoch-seconds clock, injected so reap decisions are deterministic in tests and
  * this module never calls `Date.now()` inline (CLAUDE.md — a clock for reaping). */
@@ -64,6 +61,13 @@ export interface SessionReaperDeps {
  * the reaper touches it. Small — our sessions only show a dead pane once the
  * process has truly exited — but non-zero to survive a create/list race. */
 export const DEFAULT_REAP_GRACE_SECONDS = 10;
+
+/** What a forced workspace kill achieved: sessions confirmed gone, and sessions it targeted
+ * but could not confirm killed (still there, or the answer never came back). */
+export interface WorkspaceKillOutcome {
+    readonly killed: number;
+    readonly failed: number;
+}
 
 /**
  * Kills the sessions this extension owns. Two public operations:
@@ -126,12 +130,14 @@ export class SessionReaper {
      * (host, workspace) qualify, so a sibling workspace on the same host or a foreign
      * session is never touched. Same fail-safe contract as `reap()`: a failed list
      * yields 0, a failed kill is traced and skipped, and it never throws (a command
-     * must not surface an unhandled rejection). Returns the number killed.
+     * must not surface an unhandled rejection). Resolves `undefined` when the sessions could
+     * not be listed at all, otherwise how many were killed and how many could not be — so
+     * the command can tell the user the real outcome, not just "killed 0".
      */
-    async killWorkspaceSessions(hostKey: string, workspaceKey: string): Promise<number> {
+    async killWorkspaceSessions(hostKey: string, workspaceKey: string): Promise<WorkspaceKillOutcome | undefined> {
         const sessions = await this.listSessions();
         if (sessions === undefined) {
-            return 0; // list probe failed — already traced; never throw from a command
+            return undefined; // list probe failed — already traced; never throw from a command
         }
 
         const doomed = sessions.filter(session => sessionSlot(session.name, hostKey, workspaceKey) !== undefined);
@@ -146,27 +152,39 @@ export class SessionReaper {
         if (killed > 0) {
             this.log.info(`tmux: killed ${killed} persistent session(s) for this workspace`);
         }
-        return killed;
+        return { killed, failed: doomed.length - killed };
     }
 
     /** Snapshot the remote's sessions, or `undefined` if the probe itself failed
      * (distinct from "zero sessions", which is a normal empty array). */
     private async listSessions(): Promise<TmuxSession[] | undefined> {
         try {
-            const { stdout } = await this.exec(buildListSessions());
-            return parseListSessions(stdout);
+            const result = await this.exec(buildListSessions());
+            const sessions = readListSessionsResult(result);
+            if (sessions === undefined) {
+                this.log.trace(`tmux reaper: list-sessions failed (rc ${result.code ?? 'unknown'}): ${result.stderr.trim()}`);
+            }
+            return sessions;
         } catch (err) {
             this.log.trace(`tmux reaper: list-sessions failed: ${errorText(err)}`);
             return undefined;
         }
     }
 
-    /** Kill one session; true iff the command was delivered. A rejection (dead
-     * channel) is traced and swallowed so the remaining reaps still run. */
+    /** Kill one session; true iff it is confirmed gone — tmux exited 0, or reported the
+     * session already absent. A delivered command is NOT proof: tmux can refuse it (protocol
+     * skew, socket permissions) and the exit status can fail to come back. Anything else,
+     * a rejection (dead channel / missed deadline) included, is traced and swallowed so the
+     * remaining kills still run. */
     private async kill(name: string): Promise<boolean> {
         try {
-            await this.exec(buildKillSession(name));
-            return true;
+            const { stderr, code } = await this.exec(buildKillSession(name));
+            const verdict = code === 0 ? 'killed' : classifyTmuxFailure(stderr, code);
+            if (verdict === 'killed' || verdict === 'absent') {
+                return true;
+            }
+            this.log.trace(`tmux reaper: kill-session ${name} not confirmed (${verdict}, rc ${code ?? 'unknown'})`);
+            return false;
         } catch (err) {
             this.log.trace(`tmux reaper: kill-session ${name} failed: ${errorText(err)}`);
             return false;

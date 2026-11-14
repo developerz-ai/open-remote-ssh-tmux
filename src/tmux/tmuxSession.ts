@@ -8,7 +8,8 @@ import { escapeShellArg } from '../common/shellQuote';
 export { escapeShellArg };
 
 // The session model — pure logic, the heart of the "no zombies" guarantee. It
-// owns the session/list/has/kill/new-session command-line builders; the only
+// owns the session/list/has/kill/new-session command-line builders (and the pure
+// reading of their answers, `classifyTmuxFailure`); the only
 // other tmux command sites are `tmuxBootstrap.ts`'s PROBE_COMMAND and the
 // `TMUX_BIN` shellPath in `terminalProvider.ts`. No `vscode`/`ssh2`/`ssh` imports
 // so it is fully unit-testable. Every user-influenced string routed into a
@@ -290,6 +291,86 @@ export function buildKillSession(name: string): string {
     return `tmux kill-session -t =${escapeShellArg(name)}`;
 }
 
+/** Tag on each answer line of {@link buildHasSessionsCommand}. */
+const HAS_TAG = '__has';
+
+/**
+ * One remote round-trip that asks `has-session` for every name — reconcile used to pay one
+ * sequential round-trip per mapped slot (~400 ms each in the field). Each name is probed
+ * with {@link buildHasSession} (exact `=name` target, escaped), its output captured, and its
+ * exit status and message printed on one line tagged with the name's INDEX, so the answer
+ * never depends on echoing a name back. Joined with `; ` rather than newlines: the whole
+ * line travels inside a single-quoted `sh -c` argument, and a csh login shell rejects a
+ * newline inside quotes. Parse with {@link parseHasSessions}.
+ */
+export function buildHasSessionsCommand(names: readonly string[]): string {
+    return names
+        .map((name, index) => `r=$(${buildHasSession(name)} 2>&1); printf '${HAS_TAG} %s %s %s\\n' ${index} "$?" "$r"`)
+        .join('; ');
+}
+
+/** One name's answer from {@link buildHasSessionsCommand}: tmux's exit status (`undefined`
+ * when no line came back for it) and its first line of output (empty on success). */
+export interface HasSessionAnswer {
+    readonly code: number | undefined;
+    readonly message: string;
+}
+
+/** Read {@link buildHasSessionsCommand} output back into one answer per name, in the order
+ * the names were given. Untagged lines (login banners, a multi-line error's tail) and
+ * out-of-range indexes are ignored; a name with no line reads as `code: undefined`. */
+export function parseHasSessions(stdout: string, count: number): HasSessionAnswer[] {
+    const answers: HasSessionAnswer[] = Array.from({ length: count }, () => ({ code: undefined, message: '' }));
+    const lineRe = new RegExp(`^${HAS_TAG} (\\d+) (\\d+) ?(.*)$`);
+    for (const line of stdout.split('\n')) {
+        const match = lineRe.exec(line);
+        if (!match) {
+            continue;
+        }
+        const index = parseInt(match[1], 10);
+        if (index < count) {
+            answers[index] = { code: parseInt(match[2], 10), message: match[3].trim() };
+        }
+    }
+    return answers;
+}
+
+/** What one tmux targeting command's outcome says about its session. Only `absent` is
+ * proof the session is gone; `unreachable` (could not ask / unexplained failure) and
+ * `incompatible` (client and server tmux disagree) say nothing about it. */
+export type TmuxTargetVerdict = 'present' | 'absent' | 'unreachable' | 'incompatible';
+
+/** tmux's "that session / that server is not there" messages. `error connecting … (No such
+ * file or directory)` is how tmux 3.4 reports a missing socket (verified) — no server, so
+ * nothing to find — and `Connection refused` a dead server's stale socket. Any other
+ * `error connecting` (e.g. `Permission denied`) is a reachability problem, not absence. */
+const ABSENT_RE = /can't find session|session not found|no server running|error connecting to .*\((?:No such file or directory|Connection refused)\)/;
+
+/** A client/server protocol skew (the tmux binary was upgraded under a running server). */
+const INCOMPATIBLE_RE = /protocol version mismatch/;
+
+/**
+ * Classify a tmux targeting command (`has-session`, `kill-session`) by exit status and
+ * message. Pure. Errs towards `unreachable`: a missing exit status, an empty message, or
+ * an unrecognised error (tmux not on PATH, a shell error) never reads as `absent`, because
+ * `absent` is what licenses dropping a mapping — dropping one wrongly strands a live session.
+ */
+export function classifyTmuxFailure(stderr: string, code: number | undefined): TmuxTargetVerdict {
+    if (code === undefined) {
+        return 'unreachable';
+    }
+    if (code === 0) {
+        return 'present';
+    }
+    if (ABSENT_RE.test(stderr)) {
+        return 'absent';
+    }
+    if (INCOMPATIBLE_RE.test(stderr)) {
+        return 'incompatible';
+    }
+    return 'unreachable';
+}
+
 /**
  * Parse `buildListSessions` output into typed rows. Tolerant by design: empty
  * output, whitespace-only, and the `no server running …` message all mean "zero
@@ -325,6 +406,23 @@ export function parseListSessions(stdout: string): TmuxSession[] {
         });
     }
     return sessions;
+}
+
+/**
+ * Read a `buildListSessions` run by its exit status: the sessions when tmux answered (exit 0,
+ * or a "no server running" style failure — no server simply means no sessions), `undefined`
+ * when the list could not be read at all. Callers must keep the two apart: treating "could
+ * not list" as "zero sessions" clears the no-steal guard and hides a dead link.
+ */
+export function readListSessionsResult(result: {
+    readonly stdout: string;
+    readonly stderr: string;
+    readonly code: number | undefined;
+}): TmuxSession[] | undefined {
+    if (result.code === 0 || classifyTmuxFailure(result.stderr, result.code) === 'absent') {
+        return parseListSessions(result.stdout);
+    }
+    return undefined;
 }
 
 /**

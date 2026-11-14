@@ -107,7 +107,9 @@ export const KILL_WORKSPACE_SESSIONS_COMMAND_ID = 'openremotessh.tmux.killWorksp
  * count. `SessionReaper` satisfies it structurally.
  */
 export interface WorkspaceSessionKiller {
-    killWorkspaceSessions(hostKey: string, workspaceKey: string): Promise<number>;
+    /** Resolves how many sessions were killed and how many could not be, or `undefined`
+     * when the sessions could not be listed at all. */
+    killWorkspaceSessions(hostKey: string, workspaceKey: string): Promise<{ killed: number; failed: number } | undefined>;
 }
 
 /**
@@ -152,10 +154,21 @@ export async function killWorkspaceSessions(resolveTarget: () => WorkspaceKillTa
     // `SessionReaper` never rejects, but nothing here guarantees every current or
     // future implementation upholds that. Guard the call so a rejection surfaces
     // as one plain-language message instead of an unhandled promise rejection.
+    // The message reports what actually happened on the remote: a kill counts only once the
+    // reaper confirmed it, and an unreachable remote is an error — never a cheerful "Killed 0".
+    let outcome: { killed: number; failed: number } | undefined;
     try {
-        const killed = await target.reaper.killWorkspaceSessions(target.hostKey, target.workspaceKey);
-        vscode.window.showInformationMessage(`Remote-SSH: Killed ${killed} persistent terminal session(s) for this workspace.`);
+        outcome = await target.reaper.killWorkspaceSessions(target.hostKey, target.workspaceKey);
     } catch {
+        outcome = undefined;
+    }
+    if (!outcome) {
         vscode.window.showErrorMessage('Remote-SSH: Failed to kill persistent terminal sessions for this workspace.');
+    } else if (outcome.failed > 0) {
+        vscode.window.showWarningMessage(
+            `Remote-SSH: Killed ${outcome.killed} persistent terminal session(s) for this workspace; ${outcome.failed} could not be killed.`,
+        );
+    } else {
+        vscode.window.showInformationMessage(`Remote-SSH: Killed ${outcome.killed} persistent terminal session(s) for this workspace.`);
     }
 }
