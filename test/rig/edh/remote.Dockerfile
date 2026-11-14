@@ -29,12 +29,21 @@ FROM ${RIG_IMAGE}
 COPY --from=reh /reh /opt/vscodium-reh
 # Install path = $HOME/<serverDataFolderName>/bin/<commit> (server-setup.sh: SERVER_DIR),
 # both values read from the REH's own product.json so a version bump needs no edit here.
-RUN useradd --create-home --shell /bin/bash wedh \
-  && product=/opt/vscodium-reh/product.json \
+#
+# `wpw` is the base-experience password-auth user: same REH, but sshd accepts ONLY a
+# password for it (the Match block below; the rig drop-in turns passwords off for everyone
+# else). It has no password in the image — row 51 sets a random one per run with chpasswd.
+RUN product=/opt/vscodium-reh/product.json \
   && commit=$(sed -n 's/^[[:space:]]*"commit":[[:space:]]*"\([0-9a-f]*\)".*/\1/p' "${product}") \
   && data=$(sed -n 's/^[[:space:]]*"serverDataFolderName":[[:space:]]*"\([^"]*\)".*/\1/p' "${product}") \
   && test -n "${commit}" && test -n "${data}" \
-  && install -d -o wedh -g wedh "/home/wedh/${data}" "/home/wedh/${data}/bin" /home/wedh/ws \
-  && cp -a /opt/vscodium-reh "/home/wedh/${data}/bin/${commit}" \
-  && chown -R wedh:wedh "/home/wedh/${data}" \
-  && echo "edh: REH ${commit} installed under /home/wedh/${data}"
+  && for user in wedh wpw; do \
+    useradd --create-home --shell /bin/bash "${user}" \
+    && install -d -o "${user}" -g "${user}" "/home/${user}/${data}" "/home/${user}/${data}/bin" "/home/${user}/ws" \
+    && cp -a /opt/vscodium-reh "/home/${user}/${data}/bin/${commit}" \
+    && chown -R "${user}:${user}" "/home/${user}/${data}" \
+    || exit 1; \
+  done \
+  && printf '\nMatch User wpw\n  PasswordAuthentication yes\n  AuthenticationMethods password\n' >> /etc/ssh/sshd_config \
+  && sshd -t \
+  && echo "edh: REH ${commit} installed under /home/{wedh,wpw}/${data}"
