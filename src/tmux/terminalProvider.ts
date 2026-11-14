@@ -1483,21 +1483,18 @@ function delay(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-/** `TerminalExitStatus` as it looks from VS Code 1.71, which added `reason` +
- * `TerminalExitReason`. The pinned 1.70.2 typings (`update:dts` in package.json) predate
- * the property — the declared shape has only `code` — so {@link exitReason} reads it
- * through this structural view: an intersection with the real type, not a redefinition.
- * At runtime a 1.70 host simply lacks the property and it reads as `undefined`, which is
- * exactly how the callers below must (and do) treat it. */
+/** `TerminalExitStatus` with `reason` (added in VS Code 1.71) declared optional. The
+ * engines floor (^1.90.0) always has it, but {@link exitReason} keeps reading it through
+ * this structural view so a host that omits it reads as `undefined` — exactly how the
+ * callers below must (and do) treat an unknown reason. */
 type TerminalExitStatusWithReason = vscode.TerminalExitStatus & {
     /** Upstream numeric `TerminalExitReason`: Unknown=0, Shutdown=1, Process=2, User=3. */
     readonly reason?: number;
 };
 
 /** `TerminalExitReason.User` (upstream 1.71+: "The user closed the terminal"). Written as
- * a literal rather than referencing `vscode.TerminalExitReason.User`: the enum only exists
- * from VS Code 1.71 and this extension declares `engines.vscode: ^1.70.2`, so on a 1.70 host
- * the enum object is undefined and dereferencing it would throw inside an event handler. */
+ * a literal rather than referencing `vscode.TerminalExitReason.User`, so no host that lacks
+ * the enum object can make this event handler throw on dereferencing it. */
 const EXIT_REASON_USER = 3;
 
 /** `TerminalExitReason.Shutdown` (upstream 1.71+: the window closed or reloaded). A literal
@@ -1505,10 +1502,8 @@ const EXIT_REASON_USER = 3;
 const EXIT_REASON_SHUTDOWN = 1;
 
 /** The terminal's exit reason as a plain number — upstream `TerminalExitReason`
- * (Unknown=0, Shutdown=1, Process=2, User=3) — when the host reports one. `undefined`
- * when it does not: `exitStatus.reason` only exists from VS Code 1.71 and the pinned
- * 1.70.2 typings predate it (the declared `TerminalExitStatus` has only `code`), so the
- * property is reached through {@link TerminalExitStatusWithReason}. */
+ * (Unknown=0, Shutdown=1, Process=2, User=3) — when the host reports one, `undefined`
+ * when it does not (read through {@link TerminalExitStatusWithReason}). */
 function exitReason(terminal: vscode.Terminal): number | undefined {
     return (terminal.exitStatus as TerminalExitStatusWithReason | undefined)?.reason;
 }
@@ -1516,11 +1511,10 @@ function exitReason(terminal: vscode.Terminal): number | undefined {
 /** Whether a closed terminal was closed *by the user*, as opposed to a window
  * reload/shutdown or the shell process exiting — the one case that kills the session.
  *
- * `exitStatus.reason` is absent on hosts older than 1.71 (`engines.vscode` is ^1.70.2), and
- * there the reason is simply unknowable. The two possible mistakes are not symmetric:
- * wrongly keeping a session costs one stale terminal that the next reconcile re-attaches,
- * wrongly killing one destroys work that cannot be recovered. So an absent reason means
- * "not a user close". */
+ * When the host reports no `exitStatus.reason`, the reason is simply unknowable. The two
+ * possible mistakes are not symmetric: wrongly keeping a session costs one stale terminal
+ * that the next reconcile re-attaches, wrongly killing one destroys work that cannot be
+ * recovered. So an absent reason means "not a user close". */
 function isUserClose(terminal: vscode.Terminal): boolean {
     return exitReason(terminal) === EXIT_REASON_USER;
 }

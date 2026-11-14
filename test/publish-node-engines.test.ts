@@ -387,12 +387,12 @@ describe('publish runtime engine contract', () => {
             expect(fs.readFileSync(path.join(root, '.nvmrc'), 'utf8').trim()).toBe('v20.20.2');
         });
 
-        it('leaves the extension\'s engines.vscode untouched and declares no node engine', () => {
+        it('keeps the extension\'s engines.vscode floor and declares no node engine', () => {
             const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')) as {
                 engines: Record<string, string>;
             };
 
-            expect(pkg.engines.vscode).toBe('^1.70.2');
+            expect(pkg.engines.vscode).toBe('^1.90.0');
             expect(pkg.engines.node, 'the extension must not declare a node engine').toBeUndefined();
         });
     });

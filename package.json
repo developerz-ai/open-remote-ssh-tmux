@@ -13,7 +13,7 @@
 		"url": "https://github.com/developerz-ai/open-remote-ssh-tmux/issues"
 	},
 	"engines": {
-		"vscode": "^1.70.2"
+		"vscode": "^1.90.0"
 	},
 	"main": "./lib/extension.js",
 	"scripts": {
@@ -26,7 +26,7 @@
 		"clean": "rimraf lib out *.vsix",
 		"compile:src": "tsc -b && npm run compile:test",
 		"compile:test": "tsc -p tsconfig.test.json",
-		"lint": "eslint",
+		"lint": "eslint --max-warnings 0",
 		"lint:all": "npm run lint:package && npm audit && npm run ci:lint && npm run lint",
 		"lint:fix": "eslint --fix",
 		"lint:package": "fixpack",
@@ -35,13 +35,14 @@
 		"prepare": "husky; npm run lint:package",
 		"release": "release-it",
 		"test": "vitest run --project unit",
+		"test:coverage": "vitest run --project unit --coverage",
 		"test:tmux": "test/rig/run.sh",
 		"test:tmux:one": "test/rig/run.sh --one",
 		"test:watch": "vitest --project unit",
 		"update:artifacts": "artifact update",
 		"update:ci": "PINACT_MIN_AGE=7 pinact run --update",
 		"update:deps": "taze --all",
-		"update:dts": "dts dev 1.70.2 && dts 1.70.2",
+		"update:dts": "dts dev 1.90.0 && dts 1.90.0",
 		"vscode:prepublish": "npm run build",
 		"watch:src": "tsc-watch -p . --onSuccess 'npm run bundle:dev'"
 	},
@@ -66,6 +67,7 @@
 		"@types/webpack": "5.28.5",
 		"@typescript-eslint/eslint-plugin": "8.61.0",
 		"@typescript-eslint/parser": "8.61.0",
+		"@vitest/coverage-v8": "4.1.12",
 		"@vscode/dts": "0.4.1",
 		"@vscode/vsce": "3.9.2",
 		"@zokugun/artifact": "0.13.1",

@@ -160,6 +160,27 @@ describe('pull-request and main CI', () => {
         expect(pack).toBeLessThan(contents);
     });
 
+    it.each(ciWorkflows)('enforces the coverage ratchet on Linux in %s', (name) => {
+        const job = jobBlock(readWorkflow(name), 'check');
+        expect(job, `${name} has no \`check\` job`).toBeDefined();
+        indexOrFail(job!, 'npm run test:coverage', name);
+    });
+
+    // Windows-only code (ProxyCommand splitting, the PowerShell install path, path
+    // handling) otherwise never executes in CI.
+    it.each(ciWorkflows)('runs the unit suite on Windows and macOS in %s', (name) => {
+        const job = jobBlock(readWorkflow(name), 'unit-os');
+        expect(job, `${name} has no \`unit-os\` job`).toBeDefined();
+
+        expect(job).toContain('runs-on: ${{ matrix.os }}');
+        expect(job).toMatch(/os:\s*\[windows-latest, macos-latest\]/);
+        expect(job).toContain('persist-credentials: false');
+        expect(job).toContain('core.autocrlf false');
+        const install = indexOrFail(job!, 'npm ci', name);
+        const test = indexOrFail(job!, 'npm test', name);
+        expect(install).toBeLessThan(test);
+    });
+
     // npm audit and zizmor judge the outside world (new advisories, new rules),
     // so they would red a PR that changed nothing. They run on a schedule instead.
     it.each(ciWorkflows)('keeps registry- and rule-dependent audits out of %s', (name) => {

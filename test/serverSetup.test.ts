@@ -281,7 +281,9 @@ describe('generateBashInstallScript', () => {
 // EFFECTIVE argv by running the generated preamble through a real bash — the
 // old assertions only looked at the `SERVER_DATA_DIR=` line, which is exactly
 // why the defect shipped.
-describe('generateBashInstallScript (effective argv)', () => {
+// The bash install script only ever runs on a Unix remote; a Windows CI runner has no
+// trustworthy `bash` (it may resolve to WSL's launcher), so this runs on Linux/macOS.
+describe.skipIf(process.platform === 'win32')('generateBashInstallScript (effective argv)', () => {
     function effectiveFlagArgv(script: string): string[] {
         const lines = script.split('\n');
         // Everything above `LISTENING_ON=` is pure variable assignment (no

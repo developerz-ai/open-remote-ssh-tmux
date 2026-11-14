@@ -822,7 +822,8 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                 this.tunnels.push(tunnelConfig);
 
                 // Enable ports view
-                vscode.commands.executeCommand('setContext', 'forwardedPortsViewEnabled', true);
+                // Fork: fire-and-forget — a context key never blocks resolving the authority.
+                void vscode.commands.executeCommand('setContext', 'forwardedPortsViewEnabled', true);
 
                 this.labelFormatterDisposable?.dispose();
                 this.labelFormatterDisposable = vscode.workspace.registerResourceLabelFormatter({
@@ -896,7 +897,9 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                 };
                 const server: net.Server = net.createServer()
                     .on('error', reject)
-                    .on('connection', async (socket: net.Socket) => {
+                    // Fork: `net.Server` ignores the listener's return value; the body
+                    // catches every failure itself, so the promise is safe to drop.
+                    .on('connection', (socket: net.Socket) => void (async () => {
                         try {
                             const socksConn = await SocksClient.createConnection(socksOptions);
                             // An unhandled 'error' on either end of the pipe (e.g. ECONNRESET) would
@@ -916,7 +919,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                             this.logger.info(`SOCKS connection to 127.0.0.1:${remotePort} failed: ${error instanceof Error ? error.message : String(error)}`);
                             socket.destroy();
                         }
-                    })
+                    })())
                     .on('listening', () => resolve(server))
                     // Fork: loopback only (no host = every interface).
                     .listen(localPort, '127.0.0.1');
@@ -937,7 +940,9 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
             });
             disposables.push({
                 dispose: () => {
-                    this.sshConnection?.closeTunnel(tunnelConfig.name);
+                    // Fork: fire-and-forget — closing a named tunnel never rejects, and
+                    // `dispose` is synchronous by contract.
+                    void this.sshConnection?.closeTunnel(tunnelConfig.name);
                     this.logger.trace(`Tunnel ${tunnelConfig.name} closed`);
                 }
             });
@@ -1120,7 +1125,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                     return callback({
                         type: 'keyboard-interactive',
                         username: sshUser,
-                        prompt: async (_name, _instructions, _instructionsLang, prompts, finish) => {
+                        prompt: (_name, _instructions, _instructionsLang, prompts, finish) => void (async () => {
                             // Same fire-and-forget hazard as the outer handler: ssh2 calls
                             // `prompt` without awaiting it, so a throw here (e.g.
                             // showInputBox rejecting) would otherwise leave `finish` never
@@ -1155,7 +1160,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                                 keyboardRetryCount = 0;
                                 finish(buildKeyboardInteractiveFinish(prompts.length, [], true).finishWith);
                             }
-                        }
+                        })()
                     });
                 }
 

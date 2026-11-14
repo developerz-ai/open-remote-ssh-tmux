@@ -33,9 +33,10 @@ jobs:
         run: |
           npm run build
 
+      # The unit suite under the coverage thresholds in vitest.config.ts.
       - name: Test
         run: |
-          npm test
+          npm run test:coverage
 
       # Not the full local gate: the dependency-advisory and workflow audits judge the
       # outside world (new advisories, new rules) and so could red a change that touched
@@ -76,6 +77,45 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+  unit-os:
+    # The unit suite on the other client platforms the extension runs on: Windows-only
+    # code (ProxyCommand splitting, the PowerShell install path, path handling) otherwise
+    # never executes in CI. Linux runs it in `check`, under the coverage ratchet.
+    name: unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      # The Windows runner checks out CRLF by default; the repo and its tests are LF.
+      - name: Keep LF line endings
+        run: |
+          git config --global core.autocrlf false
+
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js environment
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+
+      # No git hooks on a CI runner; `prepare` (husky) is POSIX-shell shaped anyway.
+      - name: Install dependencies
+        run: |
+          npm ci
+        env:
+          HUSKY: '0'
+
+      - name: Test
+        run: |
+          npm test
 
   package:
     # Release packaging runs vsce on Node 22 (its locked toolchain needs >= 22.13, see

@@ -267,7 +267,9 @@ describe('remote commands: one sh -c word, whatever the login shell is', () => {
     });
 });
 
-describe('remote commands: run for real through a POSIX shell', () => {
+// The remote is always POSIX (tmux and this bridge are Unix-only); a Windows CI runner has no
+// `sh` to stand in for it, and the structural tests above still run there.
+describe.skipIf(process.platform === 'win32')('remote commands: run for real through a POSIX shell', () => {
     // What sshd does with an exec request: `$SHELL -c '<command>'`. sh stands in for the
     // login shell here; the structural test above covers the shells CI does not have.
     let scratch: string | undefined;

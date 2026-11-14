@@ -139,7 +139,8 @@ export async function pasteClipboardImage(deps: PasteImageDeps): Promise<boolean
             return false;
         }
         if (capture.bytes.byteLength > MAX_IMAGE_BYTES) {
-            vscode.window.showErrorMessage(`Clipboard image is too large to upload (${Math.round(capture.bytes.byteLength / 1048576)} MB).`);
+            // Not awaited: the message resolves only when dismissed, and never rejects.
+            void vscode.window.showErrorMessage(`Clipboard image is too large to upload (${Math.round(capture.bytes.byteLength / 1048576)} MB).`);
             return true;
         }
 
@@ -166,7 +167,8 @@ export async function pasteClipboardImage(deps: PasteImageDeps): Promise<boolean
         // failure with nothing sensible to fall back to, so say it out loud rather than
         // performing a text paste the user did not ask for.
         deps.log.info(`clipboard image paste failed: ${errorText(err)}`);
-        vscode.window.showErrorMessage(`Could not paste the image into the remote terminal: ${errorText(err)}`);
+        // Not awaited: the message resolves only when dismissed, and never rejects.
+        void vscode.window.showErrorMessage(`Could not paste the image into the remote terminal: ${errorText(err)}`);
         return true;
     } finally {
         await rm(localPath, { force: true }).catch(() => { /* best-effort temp cleanup */ });

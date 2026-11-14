@@ -1,12 +1,22 @@
 // @ts-check
 
 import { defineConfig, globalIgnores } from 'eslint/config';
-// import typescriptEslintEslintPlugin from '@typescript-eslint/eslint-plugin';
 import jsdoc from 'eslint-plugin-jsdoc';
-// import tsParser from '@typescript-eslint/parser';
 import stylistic from '@stylistic/eslint-plugin';
 import eslint from '@eslint/js';
 import tseslint from 'typescript-eslint';
+
+// The repo's own CommonJS tooling scripts run on plain Node; there is no `globals`
+// dependency, so name the handful they use rather than adding one.
+const nodeCommonJsGlobals = {
+    __dirname: 'readonly',
+    __filename: 'readonly',
+    Buffer: 'readonly',
+    console: 'readonly',
+    module: 'writable',
+    process: 'readonly',
+    require: 'readonly',
+};
 
 export default defineConfig(
     eslint.configs.recommended,
@@ -17,40 +27,35 @@ export default defineConfig(
         '**/out/',
         '**/lib/',
         '**/*.d.ts',
-        '**/*.js',
+        // Deliberately-broken input for test/eslint-gate.test.ts, which lints it on its own.
+        'test/fixtures/lint/',
     ]),
     {
         plugins: {
             '@stylistic': stylistic,
-            // '@typescript-eslint': typescriptEslintEslintPlugin,
             jsdoc,
         },
-        // languageOptions: {
-        //     parser: tsParser,
-        //     ecmaVersion: 6,
-        //     sourceType: 'module',
-        // },
         rules: {
-            'constructor-super': 'warn',
-            curly: 'warn',
-            eqeqeq: 'warn',
-            'no-buffer-constructor': 'warn',
-            'no-caller': 'warn',
-            'no-case-declarations': 'warn',
-            'no-debugger': 'warn',
-            'no-duplicate-case': 'warn',
-            'no-duplicate-imports': 'warn',
-            'no-eval': 'warn',
-            'no-async-promise-executor': 'warn',
-            'no-extra-semi': 'warn',
-            'no-new-wrappers': 'warn',
+            'constructor-super': 'error',
+            curly: 'error',
+            eqeqeq: 'error',
+            'no-buffer-constructor': 'error',
+            'no-caller': 'error',
+            'no-case-declarations': 'error',
+            'no-debugger': 'error',
+            'no-duplicate-case': 'error',
+            'no-duplicate-imports': 'error',
+            'no-eval': 'error',
+            'no-async-promise-executor': 'error',
+            'no-extra-semi': 'error',
+            'no-new-wrappers': 'error',
             'no-redeclare': 'off',
-            'no-sparse-arrays': 'warn',
-            'no-throw-literal': 'warn',
-            'no-unsafe-finally': 'warn',
-            'no-unused-labels': 'warn',
+            'no-sparse-arrays': 'error',
+            'no-throw-literal': 'error',
+            'no-unsafe-finally': 'error',
+            'no-unused-labels': 'error',
             'no-restricted-globals': [
-                'warn',
+                'error',
                 'name',
                 'length',
                 'event',
@@ -61,13 +66,13 @@ export default defineConfig(
                 'orientation',
                 'context',
             ],
-            'no-var': 'warn',
-            'jsdoc/no-types': 'warn',
+            'no-var': 'error',
+            'jsdoc/no-types': 'error',
             semi: 'off',
-            '@stylistic/semi': 'warn',
-            '@stylistic/member-delimiter-style': 'warn',
+            '@stylistic/semi': 'error',
+            '@stylistic/member-delimiter-style': 'error',
             '@typescript-eslint/naming-convention': [
-                'warn',
+                'error',
                 {
                     selector: 'class',
                     format: ['PascalCase'],
@@ -75,12 +80,52 @@ export default defineConfig(
             ],
             quotes: 'off',
             '@stylistic/quotes': [
-                'warn',
+                'error',
                 'single',
                 {
-                    allowTemplateLiterals: true,
+                    allowTemplateLiterals: 'always',
                 }
             ],
+        },
+    },
+    {
+        // Type-aware rules for the shipped code: a dropped promise in the extension host
+        // is an unhandled rejection nobody sees, and a non-exhaustive switch over a union
+        // silently ignores a new member. The lint fixture opts in too, so
+        // test/eslint-gate.test.ts can prove this block fails the run.
+        files: ['src/**/*.ts', 'test/fixtures/lint/**/*.ts'],
+        languageOptions: {
+            parserOptions: {
+                projectService: true,
+                tsconfigRootDir: import.meta.dirname,
+            },
+        },
+        rules: {
+            // VS Code's API returns `Thenable`, not `Promise`; without this the rule
+            // misses exactly the calls the extension makes most.
+            '@typescript-eslint/no-floating-promises': ['error', { checkThenables: true }],
+            '@typescript-eslint/no-misused-promises': 'error',
+            '@typescript-eslint/switch-exhaustiveness-check': [
+                'error',
+                { considerDefaultExhaustiveForUnions: true },
+            ],
+        },
+    },
+    {
+        // The repo's own CommonJS tooling (build config, maintenance scripts): a light
+        // correctness pass. JSDoc types are these files' only type annotations under
+        // `// @ts-check`, and the TS house style is not imposed on them — webpack.config.js
+        // is upstream's and must not be reformatted.
+        files: ['**/*.js'],
+        languageOptions: {
+            sourceType: 'commonjs',
+            globals: nodeCommonJsGlobals,
+        },
+        rules: {
+            '@typescript-eslint/no-require-imports': 'off',
+            'jsdoc/no-types': 'off',
+            '@stylistic/quotes': 'off',
+            '@stylistic/semi': 'off',
         },
     },
 ]);

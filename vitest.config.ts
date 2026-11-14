@@ -16,6 +16,21 @@ export default defineConfig({
         },
     },
     test: {
+        // `npm run test:coverage` (unit project only). Every `src/` file is reported so
+        // untested upstream code shows up as such; only the fork's own modules are gated.
+        coverage: {
+            provider: 'v8',
+            include: ['src/**/*.ts'],
+            exclude: ['src/**/*.d.ts'],
+            reporter: ['text-summary', 'text'],
+            // A ratchet: each is the measured baseline rounded down. Raise them as tests
+            // land; never lower one to make a change pass.
+            thresholds: {
+                'src/tmux/**': { statements: 96, branches: 94, functions: 94, lines: 97 },
+                'src/clipboard/**': { statements: 34, branches: 33, functions: 39, lines: 35 },
+                'src/common/**': { statements: 92, branches: 76, functions: 93, lines: 92 },
+            },
+        },
         projects: [
             {
                 extends: true,
