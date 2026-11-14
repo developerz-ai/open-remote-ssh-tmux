@@ -119,7 +119,8 @@ jobs:
 
           echo "VSIX_NAME=$VSIX_NAME" >> $GITHUB_ENV
           echo "CHECKSUM=$CHECKSUM" >> $GITHUB_ENV
-          echo "$CHECKSUM" > "$VSIX_NAME.sha256"
+          # sha256sum -c format (`<hash>  <file>`), as the README tells users to verify with.
+          sha256sum "$VSIX_NAME" > "$VSIX_NAME.sha256"
 
       - name: Get Changelog
         if: env.RELEASE_EXISTS == 'no'
