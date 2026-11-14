@@ -1,0 +1,43 @@
+plan: 101-bulletproof-hardening-sweep
+title: Bulletproof hardening sweep (terminals, connection, tests, release)
+status: not_started        # not_started | in_progress | blocked | complete | superseded
+created_by: sebi
+worked_by: ""              # who is executing it; empty = unclaimed
+owner: sebi
+percent: 0                 # 0–100, overall completion
+current_focus: "01-real-tmux-rig.md"
+slices:                    # one row per <NN>-<aspect>.md slice
+  - file: 01-real-tmux-rig.md
+    status: not_started      # not_started | in_progress | complete
+    percent: 0
+  - file: 02-exec-deadlines.md
+    status: not_started
+    percent: 0
+  - file: 03-handoff-ownership.md
+    status: not_started
+    percent: 0
+  - file: 04-tmux-command-hardening.md
+    status: not_started
+    percent: 0
+  - file: 05-session-lifecycle.md
+    status: not_started
+    percent: 0
+  - file: 06-connection-security.md
+    status: not_started
+    percent: 0
+  - file: 07-ci-release-gates.md
+    status: not_started
+    percent: 0
+  - file: 08-docs-truth.md
+    status: not_started
+    percent: 0
+  - file: 09-verify.md
+    status: not_started
+    percent: 0
+evidence: []               # commits/PRs proving progress, e.g. ["#42", "abc1234"]
+notes: >-
+  Based on an audit of v1.2.0 (code read, VSCodium logs 2026-11-04..13, live remote tmux state).
+  Owner decisions pending before slice 03 ships: hand-off policy default (auto | ask | never) and
+  whether to wrap the tmux server start for systemd lifetime (slice 05 k). Items marked [S] in the
+  slices must be reproduced on the rig before any fix.
+last_updated: 2026-11-13
