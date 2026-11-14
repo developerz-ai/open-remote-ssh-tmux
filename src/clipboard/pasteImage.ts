@@ -8,6 +8,7 @@ import {
     bracketedPaste,
     buildCleanupCommand,
     buildLocalCaptureCandidates,
+    buildRemoteHomeCommand,
     buildRemoteMkdirCommand,
     MKDIR_OK_MARKER,
     remoteImageDir,
@@ -258,12 +259,10 @@ function runCaptureCandidate(candidate: CaptureCandidate, outPath: string): Prom
  * stdout, a restricted shell, `id` off PATH, a Windows remote). Since `SSHConnection#exec`
  * surfaces no exit code, a failed probe is indistinguishable from an odd one, so the only
  * safe answer to "I could not determine where this user's home is" is to refuse the upload.
- *
- * `printf` rather than `echo` because `echo` mangles a home path containing a backslash on
- * some shells; the result is validated as a plain absolute path before it is used.
+ * The result is validated as a plain absolute path before it is used.
  */
 async function resolveRemoteHome(exec: RemoteExec): Promise<string> {
-    const { stdout } = await exec('printf %s "$HOME"');
+    const { stdout } = await exec(buildRemoteHomeCommand());
     // A login shell can print a banner before the value, so take the last non-empty line
     // rather than the whole of stdout.
     const home = stdout.split('\n').map(line => line.trim()).filter(Boolean).pop() ?? '';
