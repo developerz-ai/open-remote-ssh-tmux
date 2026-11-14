@@ -11,7 +11,7 @@ import SSHDestination from './ssh/sshDestination';
 import SSHConnection, { SSHTunnelConfig } from './ssh/sshConnection';
 import SSHConfiguration from './ssh/sshConfig';
 import { gatherIdentityFiles } from './ssh/identityFiles';
-import { verifyKnownHost, hostKeyIdentity, type HostKeyVerdict } from './ssh/hostfile';
+import { verifyKnownHost, knownHostsFiles, knownHostsLookupName, type HostKeyVerdict } from './ssh/hostfile';
 import { untildify, exists as fileExists } from './common/files';
 import { findRandomPort } from './common/ports';
 import { disposeAll } from './common/disposable';
@@ -22,6 +22,7 @@ import { isNullable } from '@zokugun/is-it-type';
 import { ServerVersion } from './serverConfig';
 import { probeTmux, type TmuxCapability } from './tmux/tmuxBootstrap';
 import { applyEnvCollection } from './common/envCollection';
+import { withDeadline } from './common/deadline';
 
 const PASSWORD_RETRY_COUNT = 3;
 const PASSPHRASE_RETRY_COUNT = 3;
@@ -306,6 +307,88 @@ export function drainProxyCommandStderr(stderr: stream.Readable | null | undefin
         // but stop; the resolver already surfaces the failure through the child's
         // own 'error' handler and the destroyed sock.
     });
+}
+
+/** Fork: ssh2 keepalive when the ssh config sets none (15 s × 3 → a dead link is noticed in ~45 s). */
+const DEFAULT_KEEPALIVE_INTERVAL_S = 15;
+const DEFAULT_KEEPALIVE_COUNT_MAX = 3;
+
+/**
+ * ssh2 keepalive settings from OpenSSH's `ServerAliveInterval` (seconds; `0` disables,
+ * as in OpenSSH) and `ServerAliveCountMax`, else the defaults above. Without any, ssh2
+ * never noticed a half-dead link (sleep, NAT drop): every channel open on it — a
+ * terminal's exec, VS Code's SOCKS reconnect — waited forever.
+ */
+export function keepaliveConfig(serverAliveInterval: string | undefined, serverAliveCountMax: string | undefined): { keepaliveInterval: number; keepaliveCountMax: number } {
+    const whole = (value: string | undefined) => value !== undefined && /^\d+$/.test(value.trim()) ? parseInt(value, 10) : undefined;
+    return {
+        keepaliveInterval: (whole(serverAliveInterval) ?? DEFAULT_KEEPALIVE_INTERVAL_S) * 1000,
+        keepaliveCountMax: whole(serverAliveCountMax) || DEFAULT_KEEPALIVE_COUNT_MAX,
+    };
+}
+
+/**
+ * Open the channel through ProxyJump hop `hop` to the next hop (or the destination),
+ * bounded: on a half-dead hop the channel open is never answered. The hop's own
+ * connect (auth, which may prompt) stays governed by its `readyTimeout`.
+ */
+export async function openProxyJumpStream<T>(
+    hop: { connect(): Promise<unknown>; forwardOut(srcIP: string, srcPort: number, destIP: string, destPort: number): Promise<T> },
+    destIP: string,
+    destPort: number,
+    timeoutMs: number
+): Promise<T> {
+    await hop.connect();
+    return withDeadline(hop.forwardOut('127.0.0.1', 0, destIP, destPort), timeoutMs, `ProxyJump channel to ${destIP}:${destPort}`);
+}
+
+/** A ProxyCommand refused before spawning; not retryable (the config will not change). */
+export class ProxyCommandRejectedError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'ProxyCommandRejectedError';
+    }
+}
+
+// cmd.exe metacharacters (plus line breaks): inside a `%x` token they would be
+// command syntax, not text — see buildProxyCommandSpawn().
+const CMD_METACHARACTERS = /[&|<>^%"!()\r\n]/;
+
+/**
+ * How to spawn a ProxyCommand: argv split ({@link splitProxyCommand}), `%h %n %p %r`
+ * expanded ({@link expandTokens}). A Windows `.bat`/`.cmd` must run through cmd.exe
+ * (`shell: true`, verbatim args), where a token value from the remote authority — a
+ * link, a workspace file — containing `&`, `|`, `%`, `"`, … would be command syntax
+ * (`ssh-remote+x&calc` ran `calc`). Such a value is refused before it reaches cmd.
+ *
+ * Arguments are quoted only when they contain a space, as upstream did: a `.bat` sees
+ * its quotes in `%1`, so quoting every argument would break working scripts. With the
+ * authority tokens vetted, what remains unquoted is the user's own config text.
+ */
+export function buildProxyCommandSpawn(
+    value: string | string[],
+    tokens: { h: string; n: string; p: string; r: string },
+    windows: boolean = isWindows
+): { command: string; args: string[]; options: cp.SpawnOptionsWithoutStdio } {
+    let args = splitProxyCommand(value, windows).map((arg) => expandTokens(arg, tokens));
+    let command = args.shift()!;
+    let options: cp.SpawnOptionsWithoutStdio = {};
+    if (windows && /\.(bat|cmd)$/.test(command)) {
+        for (const [token, tokenValue] of Object.entries(tokens)) {
+            if (CMD_METACHARACTERS.test(tokenValue)) {
+                throw new ProxyCommandRejectedError(`Refusing to run a .bat/.cmd ProxyCommand: the %${token} value contains a cmd.exe metacharacter`);
+            }
+        }
+        command = `"${command}"`;
+        args = args.map((arg) => arg.includes(' ') ? `"${arg}"` : arg);
+        options = { shell: true, windowsHide: true, windowsVerbatimArguments: true };
+    }
+    return { command, args, options };
+}
+
+/** The ProxyCommand for the log: its arguments can carry tokens or credentials. */
+export function redactedProxyCommandLine(command: string, args: readonly string[]): string {
+    return `${command} (${args.length} argument(s) redacted)`;
 }
 
 /** The one thing teardown needs of an `SSHConnection`. */
@@ -607,10 +690,12 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                             sock: proxyStream,
                             username: proxyUser,
                             readyTimeout: connectTimeout * 1000,
+                            // Fork: notice a half-dead hop instead of waiting on it forever.
+                            ...keepaliveConfig(proxyHostConfig['ServerAliveInterval'], proxyHostConfig['ServerAliveCountMax']),
                             strictVendor: false,
                             agentForward: proxyAgentForward,
                             agent: proxyAgent,
-                            hostVerifier: this.buildHostVerifier(proxyHostName, proxyPort),
+                            hostVerifier: this.buildHostVerifier(proxyHostName, proxyPort, proxyHostConfig),
                             authHandler: (arg0, arg1, arg2) => (proxyAuthHandler(arg0, arg1, arg2), undefined)
                         });
                         this.proxyConnections.push(proxyConnection);
@@ -618,21 +703,16 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                         const nextProxyJump = i < proxyJumps.length - 1 ? proxyJumps[i + 1] : undefined;
                         const destIP = nextProxyJump ? (nextProxyJump[1]['HostName'] || nextProxyJump[0].hostname) : sshHostName;
                         const destPort = nextProxyJump ? resolveHopPort(nextProxyJump[1]['Port'], nextProxyJump[0].port) : sshPort;
-                        proxyStream = await proxyConnection.forwardOut('127.0.0.1', 0, destIP, destPort);
+                        // Fork: bounded — an unanswered channel open on a dead hop hung the connect.
+                        proxyStream = await openProxyJumpStream(proxyConnection, destIP, destPort, connectTimeout * 1000);
                     }
                 } else if (!isProxyDisabled(sshHostConfig['ProxyCommand'] as unknown as string | string[] | undefined)) {
-                    let proxyArgs = splitProxyCommand(sshHostConfig['ProxyCommand'] as unknown as string | string[])
-                        .map((arg) => expandTokens(arg, { h: sshHostName, n: sshDest.hostname, p: sshPort.toString(), r: sshUser }));
-                    let proxyCommand = proxyArgs.shift()!;
+                    // Fork: argv construction extracted (cmd.exe injection guard) — see buildProxyCommandSpawn().
+                    const { command: proxyCommand, args: proxyArgs, options } = buildProxyCommandSpawn(
+                        sshHostConfig['ProxyCommand'] as unknown as string | string[],
+                        { h: sshHostName, n: sshDest.hostname, p: sshPort.toString(), r: sshUser });
 
-                    let options = {};
-                    if (isWindows && /\.(bat|cmd)$/.test(proxyCommand)) {
-                        proxyCommand = `"${proxyCommand}"`;
-                        proxyArgs = proxyArgs.map((arg) => arg.includes(' ') ? `"${arg}"` : arg);
-                        options = { shell: true, windowsHide: true, windowsVerbatimArguments: true };
-                    }
-
-                    this.logger.trace(`Spawning ProxyCommand: ${proxyCommand} ${proxyArgs.join(' ')}`);
+                    this.logger.trace(`Spawning ProxyCommand: ${redactedProxyCommandLine(proxyCommand, proxyArgs)}`);
 
                     const child = cp.spawn(proxyCommand, proxyArgs, options);
                     proxyStream = stream.Duplex.from({ readable: child.stdout, writable: child.stdin });
@@ -667,10 +747,12 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                     sock: proxyStream,
                     username: sshUser,
                     readyTimeout: connectTimeout * 1000,
+                    // Fork: notice a half-dead link instead of waiting on it forever.
+                    ...keepaliveConfig(sshHostConfig['ServerAliveInterval'], sshHostConfig['ServerAliveCountMax']),
                     strictVendor: false,
                     agentForward,
                     agent,
-                    hostVerifier: this.buildHostVerifier(sshHostName, sshPort),
+                    hostVerifier: this.buildHostVerifier(sshHostName, sshPort, sshHostConfig),
                     authHandler: (arg0, arg1, arg2) => (sshAuthHandler(arg0, arg1, arg2), undefined),
                 });
                 await this.sshConnection.connect();
@@ -782,7 +864,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                     }
                 }
 
-                if (e instanceof ServerInstallError || !(e instanceof Error)) {
+                if (e instanceof ServerInstallError || e instanceof ProxyCommandRejectedError || !(e instanceof Error)) {
                     throw vscode.RemoteAuthorityResolverError.NotAvailable(e instanceof Error ? e.message : String(e));
                 } else {
                     throw vscode.RemoteAuthorityResolverError.TemporarilyNotAvailable(e.message);
@@ -829,12 +911,15 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                             // socket was never wired to anything — nothing else owns it. Left
                             // alone it stays open forever and the client just hangs. Destroy
                             // it, same as the equivalent path in `sshConnection.addTunnel`.
-                            this.logger.error(`Error while creating SOCKS connection`, error);
+                            // Fork: one Info line — field logs show this only for a connection
+                            // VS Code made on a link that had just died, which it recovers from.
+                            this.logger.info(`SOCKS connection to 127.0.0.1:${remotePort} failed: ${error instanceof Error ? error.message : String(error)}`);
                             socket.destroy();
                         }
                     })
                     .on('listening', () => resolve(server))
-                    .listen(localPort);
+                    // Fork: loopback only (no host = every interface).
+                    .listen(localPort, '127.0.0.1');
             });
             disposables.push({
                 dispose: () => forwardingServer.close(() => {
@@ -870,8 +955,14 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
      * logic is the pure, unit-tested `verifyKnownHost`; this only adds the vscode
      * UI and bridges ssh2's key argument (see below).
      */
-    private buildHostVerifier(host: string, port: number): NonNullable<ssh2.ConnectConfig['hostVerifier']> {
-        const identity = hostKeyIdentity(host, port);
+    private buildHostVerifier(
+        host: string,
+        port: number,
+        // Fork: the known-hosts files and HostKeyAlias OpenSSH would use for this host.
+        hostConfig: { UserKnownHostsFile?: string | string[]; GlobalKnownHostsFile?: string | string[]; HostKeyAlias?: string }
+    ): NonNullable<ssh2.ConnectConfig['hostVerifier']> {
+        const identity = knownHostsLookupName(host, port, hostConfig.HostKeyAlias);
+        const files = knownHostsFiles(hostConfig.UserKnownHostsFile, hostConfig.GlobalKnownHostsFile);
         return (keyHash, callback) => {
             // We never set `hostHash`, so ssh2 hands us the raw wire-format host-key
             // Buffer here even though @types/ssh2 declares the parameter `string`.
@@ -882,7 +973,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                 host: identity,
                 key,
                 promptForUnknownHost: (id, fingerprint) => this.promptNewHostKey(id, fingerprint),
-            }).then(
+            }, files).then(
                 ({ verdict, verified }) => {
                     // A refusal is otherwise silent — ssh2 just fails the connect and the
                     // user sees "Could not establish connection" with no reason. Each

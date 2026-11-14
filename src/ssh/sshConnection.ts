@@ -8,6 +8,7 @@ import { Client, ClientChannel, ClientErrorExtensions, ExecOptions, ShellOptions
 import { Server } from 'net';
 import { SocksConnectionInfo, createServer as createSocksServer } from 'simple-socks';
 import { escapeShellArg } from '../common/shellQuote';
+import { withDeadline } from '../common/deadline';
 
 export interface SSHConnectConfig extends ConnectConfig {
     /** Optional Unique ID attached to ssh connection. */
@@ -71,10 +72,15 @@ function joinShellQuoted(params?: Array<string>): string {
     return Array.isArray(params) ? ' ' + params.map(escapeShellArg).join(' ') : '';
 }
 
+/** Fork: how long `close()` waits for its tunnel servers before ending the client anyway. */
+const CLOSE_TUNNELS_DEADLINE_MS = 2000;
+
 export default class SSHConnection extends EventEmitter {
     public config: SSHConnectConfig;
 
     private activeTunnels: { [index: string]: SSHTunnelConfig & { server: Server } } = {};
+    // Fork: sockets each tunnel accepted, so `closeTunnel` can destroy them — see there.
+    private tunnelSockets: { [index: string]: Set<net.Socket> } = {};
     private __$connectPromise: Promise<SSHConnection> | null = null;
     private __retries: number = 0;
     private __err: Error & ClientErrorExtensions & { code?: string } | null = null;
@@ -118,9 +124,11 @@ export default class SSHConnection extends EventEmitter {
                     }
                     let stdout = '';
                     let stderr = '';
+                    // Fork: `.on('error', reject)` — a channel 'error' without 'close'
+                    // hung this promise forever (and was an uncaught exception).
                     stream.on('close', function () {
                         return resolve({ stdout, stderr });
-                    }).on('data', function (data: Buffer | string) {
+                    }).on('error', reject).on('data', function (data: Buffer | string) {
                         stdout += data.toString();
                     }).stderr.on('data', function (data: Buffer | string) {
                         stderr += data.toString();
@@ -214,7 +222,8 @@ export default class SSHConnection extends EventEmitter {
      */
     close(): Promise<void> {
         this.emit(SSHConstants.CHANNEL.SSH, SSHConstants.STATUS.BEFOREDISCONNECT);
-        return this.closeTunnel().then(() => {
+        // Fork: bounded, so a dead link can never stop the client below from being ended.
+        return withDeadline(this.closeTunnel(), CLOSE_TUNNELS_DEADLINE_MS, 'closing SSH tunnels').catch(() => undefined).then(() => {
             if (this.sshConnection) {
                 this.sshConnection.end();
                 // Without this, `__$connectPromise` still holds the settled (now
@@ -281,7 +290,9 @@ export default class SSHConnection extends EventEmitter {
                         resolve(this.connect());
                     }, this.config.reconnectDelay);
                 } else {
-                    reject(this.__err);
+                    // Fork: a close with no prior 'error' left `__err` null, and a null
+                    // rejection surfaced to the user as the error text "null".
+                    reject(this.__err ?? new Error('SSH connection closed before it was ready'));
                 }
             }).connect(this.config);
         });
@@ -379,7 +390,12 @@ export default class SSHConnection extends EventEmitter {
                 }
 
                 SSHTunnelConfig.localPort = SSHTunnelConfig.localPort || 0;
-                server.on('listening', () => {
+                const sockets = new Set<net.Socket>();
+                this.tunnelSockets[SSHTunnelConfig.name!] = sockets;
+                server.on('connection', (socket: net.Socket) => {
+                    sockets.add(socket);
+                    socket.on('close', () => sockets.delete(socket));
+                }).on('listening', () => {
                     SSHTunnelConfig.localPort = (server.address() as net.AddressInfo).port;
                     this.activeTunnels[SSHTunnelConfig.name!] = Object.assign({}, { server }, SSHTunnelConfig);
                     this.emit(SSHConstants.CHANNEL.TUNNEL, SSHConstants.STATUS.CONNECT, { SSHTunnelConfig: SSHTunnelConfig });
@@ -389,7 +405,9 @@ export default class SSHConnection extends EventEmitter {
                     server.close();
                     reject(err);
                     delete this.activeTunnels[SSHTunnelConfig.name!];
-                }).listen(SSHTunnelConfig.localPort);
+                // Fork: loopback only. No host means every interface, and the SOCKS
+                // tunnel is an unauthenticated relay into the remote's network.
+                }).listen(SSHTunnelConfig.localPort, '127.0.0.1');
             });
         }
     }
@@ -406,6 +424,12 @@ export default class SSHConnection extends EventEmitter {
                     SSHConstants.STATUS.BEFOREDISCONNECT,
                     { SSHTunnelConfig: tunnel }
                 );
+                // Fork: `server.close` only calls back once every accepted socket has
+                // ended; one waiting on a dead link never does. Drop them.
+                for (const socket of this.tunnelSockets[name] ?? []) {
+                    socket.destroy();
+                }
+                delete this.tunnelSockets[name];
                 tunnel.server.close(() => {
                     this.emit(
                         SSHConstants.CHANNEL.TUNNEL,

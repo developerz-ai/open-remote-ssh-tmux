@@ -83,6 +83,18 @@ describe('SSHConfiguration.loadFromFS', () => {
         expect(hostConfig['ProxyJump']).toBe('bastion');
     });
 
+    // Read by the host verifier (known-hosts files, HostKeyAlias) and the connect config
+    // (keepalive); OpenSSH keywords are case-insensitive, so the lookups need canonical names.
+    it('normalizes the known-hosts and keepalive directives', async () => {
+        const config = await loadFromContent('host foo\n    userknownhostsfile ~/kh\n    globalknownhostsfile /etc/kh\n    hostkeyalias box\n    serveraliveinterval 30\n    serveralivecountmax 5\n');
+        const hostConfig = config.getHostConfiguration('foo');
+        expect(hostConfig['UserKnownHostsFile']).toEqual(expect.anything());
+        expect(hostConfig['GlobalKnownHostsFile']).toEqual(expect.anything());
+        expect(hostConfig['HostKeyAlias']).toBe('box');
+        expect(hostConfig['ServerAliveInterval']).toBe('30');
+        expect(hostConfig['ServerAliveCountMax']).toBe('5');
+    });
+
     it('inlines an Include directive\'s matched files in place', async () => {
         tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ssh-config-test-'));
         const includedPath = path.join(tmpDir, 'included.conf');
