@@ -2,7 +2,7 @@
 	"name": "open-remote-ssh-tmux",
 	"displayName": "Open Remote - SSH (tmux)",
 	"description": "Remote development over SSH with tmux-backed persistent terminals that survive disconnects and follow you between machines.",
-	"version": "1.4.1",
+	"version": "1.4.2",
 	"publisher": "developerz-ai",
 	"license": "MIT",
 	"repository": {

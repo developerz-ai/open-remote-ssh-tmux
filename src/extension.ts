@@ -1021,8 +1021,10 @@ export function reconcileDefaultTerminalProfile(logger: Log, wiring: boolean, re
 
 /** How long wiring waits for the default-profile write to land ({@link reconcileDefaultTerminalProfile}).
  * The write goes to the remote's settings file, so a hung remote must not hold the layer
- * unwired: past this the layer wires anyway and the write lands whenever it does. */
-export const DEFAULT_PROFILE_WRITE_DEADLINE_MS = 5000;
+ * unwired: past this the layer wires anyway and the write lands whenever it does. 15 s, not 5:
+ * on a real-latency link the first write to a folder's settings took ~6 s (plan 101 field
+ * replay), and a shorter cap wired before tmux was the default terminal. */
+export const DEFAULT_PROFILE_WRITE_DEADLINE_MS = 15000;
 
 /** The minimal slice of a `vscode.Uri` {@link deriveTmuxSessionContext} reads — the
  * workspace folder's scheme, resolved authority, and remote path. `vscode.Uri` is
