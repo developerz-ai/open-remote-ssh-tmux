@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { addHostToHostFile, checkNewHostInHostkeys, hostKeyFingerprint, hostKeyIdentity, verifyHostKey, verifyKnownHost } from '../../src/ssh/hostfile';
+import { addHostToHostFile, checkNewHostInHostkeys, hostKeyFingerprint, hostKeyIdentity, knownHostsFiles, knownHostsLookupName, verifyHostKey, verifyKnownHost } from '../../src/ssh/hostfile';
 
 // Unit coverage for hostfile.ts — the sole owner of ~/.ssh/known_hosts reads and
 // writes for host-key verification. Every test injects a temp known_hosts path so
@@ -445,5 +445,121 @@ describe('verifyKnownHost', () => {
 
         expect(result).toEqual({ verdict: 'unknown', verified: true });
         expect(await checkNewHostInHostkeys('h.example', file)).toBe(false);
+    });
+});
+
+// OpenSSH reads every `UserKnownHostsFile` and `GlobalKnownHostsFile` (default
+// `~/.ssh/known_hosts ~/.ssh/known_hosts2` and `/etc/ssh/ssh_known_hosts
+// /etc/ssh/ssh_known_hosts2`), records new keys only in the first user file, and
+// never writes the global files. We used to read `~/.ssh/known_hosts` alone, so a key
+// an admin distributed system-wide, or one in a custom file, prompted as unknown.
+describe('verifyKnownHost across user and global files', () => {
+    const keyA = wireHostKey('ssh-ed25519', 'alpha-key-payload');
+    const keyB = wireHostKey('ssh-ed25519', 'bravo-key-payload');
+    let tmpDir: string;
+
+    afterEach(async () => {
+        if (tmpDir) {
+            await fs.promises.rm(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    async function files(user: string[], global: string[]): Promise<{ user: string[]; global: string[] }> {
+        tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'hostfile-multi-test-'));
+        const write = async (content: string, i: number, kind: string) => {
+            const file = path.join(tmpDir, `${kind}_${i}`);
+            await fs.promises.writeFile(file, content);
+            return file;
+        };
+        return {
+            user: await Promise.all(user.map((c, i) => write(c, i, 'user'))),
+            global: await Promise.all(global.map((c, i) => write(c, i, 'global'))),
+        };
+    }
+
+    const never = async (): Promise<boolean> => {
+        throw new Error('must not prompt');
+    };
+
+    it('finds a key in a custom (second) UserKnownHostsFile', async () => {
+        const f = await files(['', khLine('h.example', keyA) + '\n'], []);
+
+        const result = await verifyKnownHost({ host: 'h.example', key: keyA, promptForUnknownHost: never }, f);
+
+        expect(result).toEqual({ verdict: 'known', verified: true });
+    });
+
+    it('finds a key in a global known-hosts file', async () => {
+        const f = await files([''], [khLine('h.example', keyA) + '\n']);
+
+        const result = await verifyKnownHost({ host: 'h.example', key: keyA, promptForUnknownHost: never }, f);
+
+        expect(result).toEqual({ verdict: 'known', verified: true });
+    });
+
+    it('refuses a key the global file revokes even though the user file trusts it', async () => {
+        const f = await files([khLine('h.example', keyA) + '\n'], [`@revoked ${khLine('h.example', keyA)}\n`]);
+
+        const result = await verifyKnownHost({ host: 'h.example', key: keyA, promptForUnknownHost: never }, f);
+
+        expect(result).toEqual({ verdict: 'revoked', verified: false });
+    });
+
+    it('refuses a key that mismatches the global record', async () => {
+        const f = await files([''], [khLine('h.example', keyA) + '\n']);
+
+        const result = await verifyKnownHost({ host: 'h.example', key: keyB, promptForUnknownHost: never }, f);
+
+        expect(result).toEqual({ verdict: 'mismatch', verified: false });
+    });
+
+    it('records a new key in the first user file only, never in a global file', async () => {
+        const f = await files(['', ''], ['']);
+
+        const result = await verifyKnownHost({ host: 'h.example', key: keyA, promptForUnknownHost: async () => true }, f);
+
+        expect(result).toEqual({ verdict: 'unknown', verified: true });
+        expect(await checkNewHostInHostkeys('h.example', f.user[0])).toBe(false);
+        expect(await fs.promises.readFile(f.user[1], 'utf8')).toBe('');
+        expect(await fs.promises.readFile(f.global[0], 'utf8')).toBe('');
+    });
+
+    it('skips a missing file instead of failing', async () => {
+        const f = await files([khLine('h.example', keyA) + '\n'], []);
+
+        const result = await verifyKnownHost(
+            { host: 'h.example', key: keyA, promptForUnknownHost: never },
+            { user: [...f.user, path.join(tmpDir, 'absent')], global: [path.join(tmpDir, 'absent_global')] },
+        );
+
+        expect(result).toEqual({ verdict: 'known', verified: true });
+    });
+});
+
+describe('knownHostsFiles', () => {
+    it('defaults to the OpenSSH user and global files', () => {
+        const f = knownHostsFiles(undefined, undefined);
+        expect(f.user).toEqual([path.join(os.homedir(), '.ssh', 'known_hosts'), path.join(os.homedir(), '.ssh', 'known_hosts2')]);
+        expect(f.global.length).toBeGreaterThan(0);
+    });
+
+    it('takes configured files (string or list), expanding ~', () => {
+        const f = knownHostsFiles(['~/a', '/b'], '/etc/c');
+        expect(f.user).toEqual([path.join(os.homedir(), 'a'), '/b']);
+        expect(f.global).toEqual(['/etc/c']);
+    });
+
+    it('treats `none` as no files', () => {
+        expect(knownHostsFiles('none', 'none')).toEqual({ user: [], global: [] });
+    });
+});
+
+describe('knownHostsLookupName', () => {
+    it('uses HostKeyAlias verbatim when set (OpenSSH ignores the port then)', () => {
+        expect(knownHostsLookupName('10.0.0.1', 2222, 'box')).toBe('box');
+    });
+
+    it('falls back to the host/port identity', () => {
+        expect(knownHostsLookupName('h', 2222, undefined)).toBe(hostKeyIdentity('h', 2222));
     });
 });

@@ -2,18 +2,45 @@ import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import Log from '../src/common/logger';
+import { DeadlineError } from '../src/common/deadline';
 import { escapePowerShellArg, escapeShellArg } from '../src/common/shellQuote';
+import type SSHConnection from '../src/ssh/sshConnection';
 import {
     compileTemplate,
     escapeCustomInstallPath,
     findServerInstallPath,
     generateBashInstallScript,
     generatePowerShellInstallScript,
+    installCodeServer,
+    INSTALL_DEADLINE_MS,
+    logInstallScript,
+    parseListeningOn,
     parseServerInstallOutput,
+    PLATFORM_DETECT_DEADLINE_MS,
     redactConnectionToken,
+    ServerInstallError,
     ServerInstallOptions,
 } from '../src/serverSetup';
+
+// `installCodeServer` reads the local product.json and fetches release metadata before
+// it execs the install script; neither is under test here, so pin both.
+vi.mock('../src/serverConfig', async (importOriginal) => ({
+    ...await importOriginal<typeof import('../src/serverConfig')>(),
+    getVSCodeServerConfig: vi.fn(async () => ({
+        version: '1.0.0',
+        commit: 'deadbeef',
+        quality: 'stable',
+        release: '1',
+        serverApplicationName: 'codium-server',
+        serverDataFolderName: '.vscodium-server',
+        serverValidation: 'strict',
+    })),
+}));
+vi.mock('../src/fetchRelease', () => ({
+    fetchRelease: vi.fn(async () => ({ version: '1.0.0', build: '1' })),
+}));
 
 // `compileTemplate` reads `<extensionPath>/src/scripts/<templateName>` off
 // disk, so tests write throwaway template files into a tmpdir shaped like
@@ -459,5 +486,107 @@ describe('redactConnectionToken', () => {
         const token = script.match(/SERVER_CONNECTION_TOKEN='([^']+)'/)?.[1];
         expect(token).toBeTruthy();
         expect(redactConnectionToken(script)).not.toContain(token!);
+    });
+});
+
+// A `listeningOn==` line missing from the install output crashed on
+// `undefined.match` — a TypeError, which the resolver classes as retryable, so VS Code
+// retried the same broken install forever. It is a ServerInstallError (not retried).
+describe('parseListeningOn', () => {
+    it('parses a port', () => {
+        expect(parseListeningOn('1234')).toBe(1234);
+    });
+
+    it('keeps a socket path as a string', () => {
+        expect(parseListeningOn('/tmp/vscode-server-sock-x')).toBe('/tmp/vscode-server-sock-x');
+    });
+
+    it('throws a ServerInstallError when the value is missing or empty', () => {
+        expect(() => parseListeningOn(undefined)).toThrow(ServerInstallError);
+        expect(() => parseListeningOn('')).toThrow(ServerInstallError);
+    });
+});
+
+// The full install script was dumped into the log on every connect (37x in one field
+// log). It is logged once per session; a later identical script logs a hash line.
+describe('logInstallScript', () => {
+    function lines(log: Log): string[] {
+        return (log as unknown as { output: { lines: string[] } }).output.lines;
+    }
+
+    it('logs the script once, then only a hash line for the same script', () => {
+        const log = new Log('test');
+        const seen = new Set<string>();
+        const first = generateBashInstallScript(baseOptions({ id: 'aaaaaaaaaaaaaaaaaaaaaaaa' }), extensionPath);
+        const again = generateBashInstallScript(baseOptions({ id: 'bbbbbbbbbbbbbbbbbbbbbbbb' }), extensionPath);
+
+        logInstallScript(log, first, 'aaaaaaaaaaaaaaaaaaaaaaaa', seen);
+        const afterFirst = lines(log).length;
+        logInstallScript(log, again, 'bbbbbbbbbbbbbbbbbbbbbbbb', seen);
+
+        const added = lines(log).slice(afterFirst);
+        expect(added).toHaveLength(1);
+        expect(added[0]).toMatch(/sha256:[0-9a-f]{12}/);
+        expect(added[0]).not.toContain('Server installation script');
+    });
+
+    it('logs a changed script in full again', () => {
+        const log = new Log('test');
+        const seen = new Set<string>();
+
+        logInstallScript(log, generateBashInstallScript(baseOptions(), extensionPath), 'script-id-123', seen);
+        const afterFirst = lines(log).length;
+        logInstallScript(log, generateBashInstallScript(baseOptions({ commit: 'cafef00d' }), extensionPath), 'script-id-123', seen);
+
+        expect(lines(log).length - afterFirst).toBe(2);
+    });
+
+    it('never logs the connection token', () => {
+        const log = new Log('test');
+        const script = generateBashInstallScript(baseOptions(), extensionPath);
+        const token = script.match(/SERVER_CONNECTION_TOKEN="([^"]+)"/)![1];
+
+        logInstallScript(log, script, 'script-id-123', new Set());
+
+        expect(lines(log).join('\n')).not.toContain(token);
+    });
+});
+
+// Platform detection and the install itself awaited a remote exec with no bound: a
+// half-dead link hung the connect forever. Detection is short; the install ceiling is
+// generous, because a real install on a slow link can take many minutes.
+describe('installCodeServer deadlines', () => {
+    const never = () => new Promise<never>(() => { /* the remote never answers */ });
+
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    function install(conn: Partial<SSHConnection>, platform: string | undefined) {
+        return installCodeServer(conn as SSHConnection, undefined, 'match', [], [], platform, false, undefined, new Log('test'), extensionPath);
+    }
+
+    it('gives up on a hung `uname -s`', async () => {
+        vi.useFakeTimers();
+        const result = install({ exec: never }, undefined);
+        const assertion = expect(result).rejects.toBeInstanceOf(DeadlineError);
+
+        await vi.advanceTimersByTimeAsync(PLATFORM_DETECT_DEADLINE_MS);
+
+        await assertion;
+    });
+
+    it('lets a slow install run for minutes, then gives up at the ceiling', async () => {
+        vi.useFakeTimers();
+        let settled = false;
+        const result = install({ exec: never }, 'linux');
+        result.catch(() => undefined).finally(() => { settled = true; });
+
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+        expect(settled).toBe(false);
+
+        const assertion = expect(result).rejects.toBeInstanceOf(DeadlineError);
+        await vi.advanceTimersByTimeAsync(INSTALL_DEADLINE_MS);
+        await assertion;
     });
 });

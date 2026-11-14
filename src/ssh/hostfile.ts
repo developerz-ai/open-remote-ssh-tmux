@@ -3,9 +3,15 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { isNodeError } from '@zokugun/is-it-type';
+import { untildify } from '../common/files';
+import { isWindows } from '../common/platform';
 
 const PATH_SSH_USER_DIR = path.join(os.homedir(), '.ssh');
 const KNOW_HOST_FILE = path.join(PATH_SSH_USER_DIR, 'known_hosts');
+// OpenSSH's defaults when `UserKnownHostsFile` / `GlobalKnownHostsFile` are unset.
+const DEFAULT_USER_KNOWN_HOSTS_FILES = [KNOW_HOST_FILE, path.join(PATH_SSH_USER_DIR, 'known_hosts2')];
+const SYSTEM_SSH_DIR = isWindows ? path.resolve(process.env.ALLUSERSPROFILE || 'C:\\ProgramData', 'ssh') : '/etc/ssh';
+const DEFAULT_GLOBAL_KNOWN_HOSTS_FILES = [path.join(SYSTEM_SSH_DIR, 'ssh_known_hosts'), path.join(SYSTEM_SSH_DIR, 'ssh_known_hosts2')];
 const HASH_MAGIC = '|1|';
 const HASH_DELIM = '|';
 
@@ -192,6 +198,58 @@ export function hostKeyIdentity(host: string, port: number): string {
 }
 
 /**
+ * The name a host's key is looked up and recorded under: `HostKeyAlias` verbatim when
+ * set (OpenSSH then ignores the port too), else {@link hostKeyIdentity}.
+ */
+export function knownHostsLookupName(host: string, port: number, hostKeyAlias: string | undefined): string {
+    return hostKeyAlias || hostKeyIdentity(host, port);
+}
+
+/**
+ * The known_hosts files for a host, as OpenSSH uses them: every file is read, a new
+ * key is recorded only in the first `user` file, `global` files are never written.
+ */
+export interface KnownHostsFiles {
+    readonly user: readonly string[];
+    readonly global: readonly string[];
+}
+
+/**
+ * Resolve `UserKnownHostsFile` / `GlobalKnownHostsFile` (string or list, `~` expanded,
+ * `none` = no file) to {@link KnownHostsFiles}, defaulting each to OpenSSH's files.
+ * `%`-token expansion (`%d`, `%u`, ...) is not supported.
+ */
+export function knownHostsFiles(userKnownHostsFile: string | string[] | undefined, globalKnownHostsFile: string | string[] | undefined): KnownHostsFiles {
+    const resolve = (value: string | string[] | undefined, defaults: string[]) => {
+        if (value === undefined) {
+            return defaults;
+        }
+        return ([] as string[]).concat(value).filter((file) => file.toLowerCase() !== 'none').map(untildify);
+    };
+    return {
+        user: resolve(userKnownHostsFile, DEFAULT_USER_KNOWN_HOSTS_FILES),
+        global: resolve(globalKnownHostsFile, DEFAULT_GLOBAL_KNOWN_HOSTS_FILES),
+    };
+}
+
+/** All files' content, in order; a missing file reads as empty, any other error throws. */
+async function readKnownHostsFiles(files: readonly string[]): Promise<string> {
+    const contents = await Promise.all(files.map(async (file) => {
+        try {
+            return await fs.promises.readFile(file, { encoding: 'utf8' });
+        } catch (e) {
+            // No such file → nothing on file. Any other error (e.g. EACCES) is genuine —
+            // rethrow so the verifier fails closed rather than accepting an unverifiable key.
+            if (isNodeError(e) && e.code === 'ENOENT') {
+                return '';
+            }
+            throw e;
+        }
+    }));
+    return contents.join('\n');
+}
+
+/**
  * OpenSSH-style SHA256 host-key fingerprint (`SHA256:` + unpadded base64), shown
  * in the first-connect consent prompt so the user can compare it out-of-band.
  */
@@ -235,21 +293,14 @@ export async function verifyKnownHost(
         key: Buffer;
         promptForUnknownHost: (host: string, fingerprint: string) => Promise<boolean>;
     },
-    knownHostsFile: string = KNOW_HOST_FILE,
+    knownHosts: string | KnownHostsFiles = knownHostsFiles(undefined, undefined),
 ): Promise<{ verdict: HostKeyVerdict; verified: boolean }> {
     const { host, key, promptForUnknownHost } = params;
+    // A single path is the one file read and written, as before.
+    const files = typeof knownHosts === 'string' ? { user: [knownHosts], global: [] } : knownHosts;
 
-    let content = '';
-    try {
-        content = await fs.promises.readFile(knownHostsFile, { encoding: 'utf8' });
-    } catch (e) {
-        // No known_hosts yet (fresh machine) → treat as empty (verdict 'unknown').
-        // Any other error (e.g. EACCES) is genuine — rethrow so the verifier fails
-        // closed rather than silently accepting an unverifiable key.
-        if (!(isNodeError(e) && e.code === 'ENOENT')) {
-            throw e;
-        }
-    }
+    // One verdict over every file's records: a revocation in any file still wins.
+    const content = await readKnownHostsFiles([...files.user, ...files.global]);
 
     const verdict = verifyHostKey(host, key, content);
     if (verdict !== 'unknown') {
@@ -257,8 +308,9 @@ export async function verifyKnownHost(
     }
 
     const accepted = await promptForUnknownHost(host, hostKeyFingerprint(key));
-    if (accepted) {
-        await addHostToHostFile(host, key, hostKeyType(key), knownHostsFile);
+    // `UserKnownHostsFile none` leaves nowhere to record it: accepted for this connect only.
+    if (accepted && files.user.length) {
+        await addHostToHostFile(host, key, hostKeyType(key), files.user[0]);
     }
     return { verdict, verified: accepted };
 }

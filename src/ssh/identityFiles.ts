@@ -6,6 +6,10 @@ import type { ParsedKey } from 'ssh2-streams';
 import * as ssh2 from 'ssh2';
 import { untildify, exists as fileExists } from '../common/files';
 import Log from '../common/logger';
+import { withDeadline } from '../common/deadline';
+
+/** Fork: listing agent identities is a local round-trip; a hung agent must not hang the connect. */
+const AGENT_LOOKUP_DEADLINE_MS = 10_000;
 
 const homeDir = os.homedir();
 const PATH_SSH_CLIENT_ID_DSA = path.join(homeDir, '.ssh', '/id_dsa');
@@ -37,7 +41,7 @@ export interface SSHKey {
 }
 
 // From https://github.com/openssh/openssh-portable/blob/acb2059febaddd71ee06c2ebf63dcf211d9ab9f2/sshconnect2.c#L1689-L1690
-export async function gatherIdentityFiles(identityFiles: string[], sshAgentSock: string | undefined, identitiesOnly: boolean, logger: Log) {
+export async function gatherIdentityFiles(identityFiles: string[], sshAgentSock: string | undefined, identitiesOnly: boolean, logger: Log, agentDeadlineMs: number = AGENT_LOOKUP_DEADLINE_MS) {
     identityFiles = identityFiles.map(untildify).map(i => i.replace(/\.pub$/, ''));
     if (identityFiles.length === 0) {
         identityFiles.push(...DEFAULT_IDENTITY_FILES);
@@ -88,7 +92,7 @@ export async function gatherIdentityFiles(identityFiles: string[], sshAgentSock:
             throw new Error(`SSH_AUTH_SOCK environment variable not defined`);
         }
 
-        sshAgentParsedKeys = await new Promise<ParsedKey[]>((resolve, reject) => {
+        sshAgentParsedKeys = await withDeadline(new Promise<ParsedKey[]>((resolve, reject) => {
             const sshAgent = new ssh2.OpenSSHAgent(sshAgentSock);
             sshAgent.getIdentities((err, publicKeys) => {
                 if (err) {
@@ -97,9 +101,11 @@ export async function gatherIdentityFiles(identityFiles: string[], sshAgentSock:
                     resolve(publicKeys || []);
                 }
             });
-        });
+        }), agentDeadlineMs, 'ssh-agent identity lookup');
     } catch (e) {
-        logger.error(`Couldn't get identities from OpenSSH agent`, e);
+        // Fork: Info, one line — auth carries on with the file identities, so this is
+        // not an error (field logs showed ECONNRESET at Error before a good connect).
+        logger.info(`Couldn't get identities from OpenSSH agent: ${e instanceof Error ? e.message : String(e)}`);
     }
 
     const sshAgentKeys: SSHKey[] = sshAgentParsedKeys.map(parsedKey => {
