@@ -34,6 +34,10 @@ until ssh-keyscan -T 2 -t ed25519 "${EDH_REMOTE_HOST}" > "${home}/.ssh/known_hos
   sleep 1
 done
 chown pc:pc "${home}/.ssh/known_hosts"
+# Pristine copies: rows that edit ~/.ssh (ProxyJump, password, host-key prompt) are undone by
+# lib.sh reset_client before the next row.
+install -d -m 0755 /etc/edh-client/ssh
+install -m 0644 "${home}/.ssh/config" "${home}/.ssh/known_hosts" /etc/edh-client/ssh/
 
 # -nolisten tcp: the X server must not show up as a listener in row 32's audit.
 runuser -u pc -- Xvfb :99 -screen 0 1600x1000x24 -nolisten tcp >/tmp/xvfb.log 2>&1 &

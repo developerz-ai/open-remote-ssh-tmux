@@ -5,5 +5,7 @@
 	{ "key": "ctrl+alt+shift+f4", "command": "workbench.action.terminal.kill" },
 	{ "key": "ctrl+alt+shift+f5", "command": "workbench.action.terminal.focus" },
 	{ "key": "ctrl+alt+shift+f6", "command": "openremotessh.openEmptyWindow" },
-	{ "key": "ctrl+alt+shift+f7", "command": "workbench.view.remote" }
+	{ "key": "ctrl+alt+shift+f7", "command": "workbench.view.remote" },
+	{ "key": "ctrl+alt+shift+f8", "command": "notifications.clearAll" },
+	{ "key": "ctrl+alt+shift+f9", "command": "remote.tunnel.forwardCommandPalette" }
 ]

@@ -10,6 +10,7 @@
 	"git.enabled": false,
 	"window.restoreWindows": "none",
 	"window.confirmBeforeClose": "never",
+	"window.dialogStyle": "custom",
 	"terminal.integrated.confirmOnExit": "never",
 	"terminal.integrated.confirmOnKill": "never",
 	"terminal.integrated.showExitAlert": false,
@@ -18,9 +19,13 @@
 		"workbench.action.closeWindow",
 		"workbench.action.terminal.new",
 		"workbench.action.terminal.kill",
+		"notifications.clearAll",
+		"remote.tunnel.forwardCommandPalette",
 		"-workbench.action.toggleSidebarVisibility"
 	],
 	"remote.SSH.remotePlatform": {
-		"edh-remote": "linux"
+		"edh-remote": "linux",
+		"edh-viajump": "linux",
+		"edh-pw": "linux"
 	}
 }

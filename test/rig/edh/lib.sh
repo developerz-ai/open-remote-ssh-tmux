@@ -16,6 +16,10 @@ EDH_EXT=/home/pc/ext
 # VSCodium 1.14x writes its logs under XDG state, not under --user-data-dir.
 EDH_LOGS=/home/pc/.local/state/VSCodium
 EDH_DISPLAY=:99
+# What codium_open/connect open: ssh-remote+<EDH_CONNECT_HOST><EDH_CONNECT_WS>. A row that
+# connects elsewhere (another ssh config alias, a hostile folder name) overrides these.
+EDH_CONNECT_HOST=${EDH_HOST}
+EDH_CONNECT_WS=${EDH_WS}
 
 ROW_FAILURES=0
 
@@ -61,8 +65,37 @@ pty_plain_count() { pty_children | grep -vc '^tmux' || true; }
 
 # Wipe the remote between rows: every process of the workspace user (vscode-server, pty
 # host, tmux server, its sshd sessions) and every per-row file.
+# Also undone: the remote extensions a row installed, a user ~/.tmux.conf, hostile folders,
+# and the password user's processes and workspace state.
 reset_remote() {
-  rroot 'pkill -CONT -u wedh 2>/dev/null; pkill -KILL -u wedh 2>/dev/null; sleep 0.5; rm -rf /home/wedh/ws/.vscode /tmp/edh-* /tmp/tmux-*; true'
+  rroot 'for u in wedh wpw; do pkill -CONT -u "$u"; pkill -KILL -u "$u"; done 2>/dev/null; sleep 0.5
+    rm -rf /home/wedh/ws/.vscode /home/wpw/ws/.vscode /home/wedh/.vscodium-server/extensions \
+      /home/wedh/.tmux.conf /home/wedh/ws/edh-* /home/wedh/hostile-* /tmp/edh-* /tmp/tmux-*; true'
+}
+
+# The remote container for a variant (`base`, or a target of remote-variants.Dockerfile).
+remote_image() {
+  if [[ $1 == base ]]; then
+    echo "orst-edh-remote:${EDH_TMUX_VERSION}"
+  else
+    echo "orst-edh-remote-$1:${EDH_TMUX_VERSION}"
+  fi
+}
+
+# (Re)start the remote container as variant $1 under the same name and network alias, unless
+# it already runs that variant. Variants share the base image's host keys, so the clients'
+# pinned known_hosts entry stays valid.
+ensure_remote() {
+  local variant=$1 current
+  current=$(timeout 10 docker inspect -f '{{index .Config.Labels "orst-edh-variant"}}|{{.State.Running}}' \
+    "${EDH_REMOTE}" 2>/dev/null || true)
+  [[ "${current}" == "${variant}|true" ]] && return 0
+  note "remote: starting variant ${variant}"
+  timeout 60 docker rm -f "${EDH_REMOTE}" >/dev/null 2>&1 || true
+  timeout 60 docker run -d --init --name "${EDH_REMOTE}" --network "${EDH_NET}" --network-alias "${EDH_HOST}" \
+    --label orst-edh-variant="${variant}" -e RIG_AUTHORIZED_KEY="$(cat "${EDH_KEY}.pub")" \
+    "$(remote_image "${variant}")" >/dev/null || return 1
+  wait_until "remote sshd up" 30 "timeout 10 docker exec ${EDH_REMOTE} pgrep -x sshd"
 }
 
 # --- client side -----------------------------------------------------------------------
@@ -104,20 +137,36 @@ cx() {
 
 # Kill VSCodium and start from an empty user-data dir seeded with the driver's settings and
 # keybindings (extensions stay installed in their own dir).
+# ~/.ssh/config and known_hosts go back to what the entrypoint wrote (rows 50-52 edit them).
 reset_client() {
   local c=$1
-  timeout 20 docker exec "${c}" sh -c "pkill -KILL -f '[/]opt/vscodium/' 2>/dev/null; sleep 0.5; rm -rf ${EDH_UDD} ${EDH_LOGS}; install -d -o pc -g pc ${EDH_UDD} ${EDH_UDD}/User && install -o pc -g pc -m 0644 /etc/edh-client/settings.json /etc/edh-client/keybindings.json ${EDH_UDD}/User/" >/dev/null
+  timeout 20 docker exec "${c}" sh -c "pkill -KILL -f '[/]opt/vscodium/' 2>/dev/null; sleep 0.5; rm -rf ${EDH_UDD} ${EDH_LOGS}; install -d -o pc -g pc ${EDH_UDD} ${EDH_UDD}/User && install -o pc -g pc -m 0644 /etc/edh-client/settings.json /etc/edh-client/keybindings.json ${EDH_UDD}/User/ && install -o pc -g pc -m 0600 /etc/edh-client/ssh/config /etc/edh-client/ssh/known_hosts /home/pc/.ssh/" >/dev/null
 }
 
 codium_running() { timeout 10 docker exec "$1" pgrep -f '/opt/vscodium/codium' >/dev/null 2>&1; }
 
-# Open the remote workspace in a new VSCodium on client $1 (returns at once).
+# Percent-encode a path for a URI (RFC 3986 unreserved characters and `/` stay as they are).
+uri_path() {
+  local s=$1 out='' ch i
+  local LC_ALL=C
+  for ((i = 0; i < ${#s}; i++)); do
+    ch=${s:i:1}
+    case ${ch} in
+      [A-Za-z0-9/._~-]) out+=${ch} ;;
+      *) printf -v ch '%%%02X' "'${ch}"; out+=${ch} ;;
+    esac
+  done
+  printf '%s' "${out}"
+}
+
+# Open the remote workspace (EDH_CONNECT_HOST, EDH_CONNECT_WS) in a new VSCodium on client $1
+# (returns at once).
 codium_open() {
   local c=$1
   timeout 30 docker exec -d -u pc -e DISPLAY="${EDH_DISPLAY}" "${c}" \
     codium --user-data-dir "${EDH_UDD}" --extensions-dir "${EDH_EXT}" \
     --no-sandbox --disable-gpu --password-store=basic --log trace \
-    --folder-uri "vscode-remote://ssh-remote+${EDH_HOST}${EDH_WS}"
+    --folder-uri "vscode-remote://ssh-remote+${EDH_CONNECT_HOST}$(uri_path "${EDH_CONNECT_WS}")"
 }
 
 # Start VSCodium on client $1 with the driver's flags and any extra arguments (a local folder,
@@ -170,10 +219,22 @@ show_remote_explorer() { key "$1" ctrl+alt+shift+F7; }
 
 # Flip remote.SSH.tmux.enabled in client $1's user settings (application scope) while the
 # window is running — VS Code picks the file change up live, like a Settings UI edit.
-set_tmux_enabled() {
-  local c=$1 value=$2
-  cx "${c}" sh -c "f=${EDH_UDD}/User/settings.json; grep -v '\"remote.SSH.tmux.enabled\"' \"\$f\" | sed '1a\\
-	\"remote.SSH.tmux.enabled\": \"${value}\",' > \"\$f.new\" && mv \"\$f.new\" \"\$f\""
+set_tmux_enabled() { set_setting "$1" remote.SSH.tmux.enabled "\"$2\""; }
+
+# Set user setting $2 to the JSON value $3 in client $1's settings.json (replacing an earlier
+# line for the same key); before a launch or live.
+set_setting() {
+  local c=$1 name=$2 value=${3//\"/\\\"}
+  cx "${c}" sh -c "f=${EDH_UDD}/User/settings.json; grep -v '\"${name}\"' \"\$f\" | sed '1a\\
+	\"${name}\": ${value},' > \"\$f.new\" && mv \"\$f.new\" \"\$f\""
+}
+
+# Run a command by typing its title into the Command Palette of client $1's window.
+palette() {
+  local c=$1 title=$2
+  key "${c}" ctrl+shift+p || return 1
+  sleep 1.5 # stimulus timing: the palette's input takes focus
+  type_line "${c}" "${title}"
 }
 
 # Every "Remote - SSH" output-channel log of client $1, oldest first, concatenated.
@@ -209,6 +270,10 @@ wait_until() {
   note "timed out after ${secs}s waiting for: ${what}"
   return 1
 }
+
+# Resolves of the remote authority client $1 has logged (the first connect is 1; every
+# reconnect and every reload adds one).
+resolve_count() { log_count "$1" 'Resolving ssh remote authority'; }
 
 # Wait until client $1's window has connected and wired the tmux layer at least $2 times
 # in total (a reload re-wires in a new extension host, so the count grows by one).
@@ -262,6 +327,8 @@ wait_prompt() {
 
 # Does session $1's full scrollback contain $2?
 pane_has() { rsh "tmux capture-pane -p -S - -t '=$1:' | grep -qF -- '$2'"; }
+# Does it hold $2 as a whole line — a command's output, not the typed command echoing it?
+pane_has_line() { rsh "tmux capture-pane -p -S - -t '=$1:' | grep -qxF -- '$2'"; }
 
 # Wait until the remote state stops changing for $1 seconds (bounded by $2).
 wait_stable() {

@@ -30,6 +30,8 @@ fi
 EDH_VSIX=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 shift
 tmux_version=${EDH_TMUX:-3.4}
+EDH_TMUX_VERSION=${tmux_version}
+export EDH_TMUX_VERSION
 
 rows=("$@")
 if [[ ${#rows[@]} -eq 0 ]]; then
@@ -51,12 +53,15 @@ EDH_NET=orst-edh-net-${run_id}
 EDH_REMOTE=orst-edh-remote-${run_id}
 EDH_PC=orst-edh-pc-${run_id}
 EDH_LAPTOP=orst-edh-laptop-${run_id}
+# Row 50 (ProxyJump) only: the jump host, and the network only it and the remote are on.
+EDH_JUMP=orst-edh-jump-${run_id}
+EDH_NET2=orst-edh-net2-${run_id}
 EDH_KEY=${work}/id_ed25519
-export EDH_OUT EDH_NET EDH_REMOTE EDH_PC EDH_LAPTOP EDH_KEY EDH_VSIX
+export EDH_OUT EDH_NET EDH_NET2 EDH_REMOTE EDH_PC EDH_LAPTOP EDH_JUMP EDH_KEY EDH_VSIX
 
 cleanup() {
-  timeout 60 docker rm -f "${EDH_PC}" "${EDH_LAPTOP}" "${EDH_REMOTE}" >/dev/null 2>&1 || true
-  timeout 30 docker network rm "${EDH_NET}" >/dev/null 2>&1 || true
+  timeout 60 docker rm -f "${EDH_PC}" "${EDH_LAPTOP}" "${EDH_REMOTE}" "${EDH_JUMP}" >/dev/null 2>&1 || true
+  timeout 30 docker network rm "${EDH_NET}" "${EDH_NET2}" >/dev/null 2>&1 || true
   rm -rf "${work}"
 }
 trap cleanup EXIT
@@ -72,14 +77,18 @@ timeout 1800 docker build --file "${edh_dir}/remote.Dockerfile" \
   --build-arg RIG_IMAGE="orst-tmux-rig:${tmux_version}" \
   --build-arg VSCODIUM_VERSION="${VSCODIUM_VERSION}" --build-arg REH_SHA256="${REH_SHA256}" \
   --tag "orst-edh-remote:${tmux_version}" "${edh_dir}" >>"${EDH_OUT}/build.log" 2>&1
+for variant in notmux logind; do
+  timeout 600 docker build --file "${edh_dir}/remote-variants.Dockerfile" \
+    --build-arg BASE="orst-edh-remote:${tmux_version}" --target "${variant}" \
+    --tag "orst-edh-remote-${variant}:${tmux_version}" "${edh_dir}" >>"${EDH_OUT}/build.log" 2>&1
+done
 timeout 1800 docker build --file "${edh_dir}/client.Dockerfile" \
   --build-arg VSCODIUM_VERSION="${VSCODIUM_VERSION}" --build-arg VSCODIUM_SHA256="${VSCODIUM_SHA256}" \
   --tag orst-edh-client "${edh_dir}" >>"${EDH_OUT}/build.log" 2>&1
 
 ssh-keygen -q -t ed25519 -N '' -C orst-edh -f "${EDH_KEY}"
 timeout 30 docker network create "${EDH_NET}" >/dev/null
-timeout 60 docker run -d --init --name "${EDH_REMOTE}" --network "${EDH_NET}" --network-alias "${EDH_HOST}" \
-  -e RIG_AUTHORIZED_KEY="$(cat "${EDH_KEY}.pub")" "orst-edh-remote:${tmux_version}" >/dev/null
+ensure_remote base
 
 results="${EDH_OUT}/results.tsv"
 : > "${results}"
@@ -89,6 +98,9 @@ for row in "${rows[@]}"; do
   export EDH_ROW_DIR
   mkdir -p "${EDH_ROW_DIR}"
   note "=== row ${row}"
+  # A row that needs another kind of host says so in its header (remote-variants.Dockerfile).
+  variant=$(sed -n 's/^# edh: remote=\([a-z]*\)$/\1/p' "${edh_dir}/rows/${row}.sh")
+  ensure_remote "${variant:-base}"
   # Two-machine rows say so in their header; everything else runs on the PC only.
   ensure_client "${EDH_PC}"
   if grep -q '^# edh: machines=2' "${edh_dir}/rows/${row}.sh"; then
