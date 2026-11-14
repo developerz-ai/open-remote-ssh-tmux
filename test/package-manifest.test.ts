@@ -142,9 +142,12 @@ describe('package.json manifest drift guard', () => {
         });
 
         it('every remote.SSH.tmux.* setting mentioned in docs/ exists in package.json', () => {
-            // Collect all `remote.SSH.tmux.*` setting names from docs/
+            // Collect all `remote.SSH.tmux.*` setting names from docs/. Plans under
+            // docs/plans/ are excluded: they propose settings that do not exist *yet*
+            // (a plan is a work order, not a promise to users).
             const docsDir = path.resolve(repoRoot, 'docs');
-            const allMarkdownFiles = collectAllMarkdownFiles(docsDir);
+            const plansDir = path.join(docsDir, 'plans') + path.sep;
+            const allMarkdownFiles = collectAllMarkdownFiles(docsDir).filter(file => !file.startsWith(plansDir));
 
             const mentionedSettingsInDocs = new Set<string>();
             const tmuxSettingRegex = /remote\.SSH\.tmux\.\w+/g;
