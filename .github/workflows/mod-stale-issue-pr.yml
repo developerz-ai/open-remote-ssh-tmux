@@ -6,6 +6,7 @@ on:
 
 permissions:
   issues: write
+  pull-requests: write   # stale-pr-* marks and closes pull requests too
 
 jobs:
   stale:

@@ -42,38 +42,52 @@ jobs:
           node-version: '22'
           package-manager-cache: false
 
-      # - name: Update package.json
-      #   run: |
-      #     TIME_PATCH="$(date +%-y)$(printf "%04d" $(($(date +%-j) * 24 + $(date +%-H))))"
-      #     VERSION="${VERSION#v}-$TIME_PATCH"
-      #     echo "Using version: $VERSION"
-
-      #     jq --arg version "$VERSION" '.version = $version | .preview = true' package.json > package.json.tmp
-      #     mv package.json.tmp package.json
-
-      #     jq -r '"version: \(.version)\npreview: \(.preview)"' package.json
-
-      #     echo "RELEASE_TAG=v$VERSION" >> $GITHUB_ENV
-      - name: Update package.json
-        run: |
-          jq '.preview = true' package.json > package.json.tmp
-          mv package.json.tmp package.json
-
-          npx bumpp --no-push prerelease --yes --current-version "$VERSION" || true
-
-          jq -r '"version: \(.version)\npreview: \(.preview)"' package.json
-
-          VERSION="$(jq -r .version package.json)"
-
-          echo "RELEASE_TAG=v$VERSION" >> $GITHUB_ENV
-
-      - name: Check packaging Node compatibility
-        run: node .github/scripts/check-packaging-node.js
-
-      - name: Build
+      - name: Install dependencies
         run: |
           npm ci
 
+      # After `npm ci`: the guard reads the lockfile with `semver`, which it requires
+      # from node_modules.
+      - name: Check packaging Node compatibility
+        run: node .github/scripts/check-packaging-node.js
+
+      # Next prerelease of the newest tag (v1.2.0 -> 1.2.1-beta.0 -> 1.2.1-beta.1), with the
+      # locked `semver` CLI: no registry fetch, and no version tool committing or tagging
+      # behind our back. A computed tag that already exists is refused rather than released
+      # over: that would re-point an existing (possibly stable) release at this build.
+      - name: Update package.json
+        run: |
+          PREVIEW_VERSION="$(npx --no semver -i prerelease --preid beta "${VERSION#v}")"
+          RELEASE_TAG="v${PREVIEW_VERSION}"
+
+          if git rev-parse -q --verify "refs/tags/${RELEASE_TAG}" >/dev/null; then
+            echo "::error::Tag ${RELEASE_TAG} already exists; refusing to release over it"
+            exit 1
+          fi
+
+          jq --arg version "${PREVIEW_VERSION}" '.version = $version | .preview = true' package.json > package.json.tmp
+          mv package.json.tmp package.json
+
+          jq -r '"version: \(.version)\npreview: \(.preview)"' package.json
+
+          echo "RELEASE_TAG=${RELEASE_TAG}" >> "$GITHUB_ENV"
+
+      # The same gates a pull request passes: nothing is released that did not build,
+      # test and lint.
+      - name: Build
+        run: |
+          npm run build
+
+      - name: Test
+        run: |
+          npm test
+
+      - name: Lint code
+        run: |
+          npm run lint
+
+      - name: Package
+        run: |
           npm run package
 
           VSIX_NAME=$(ls *.vsix)
@@ -84,7 +98,7 @@ jobs:
           echo "$CHECKSUM" > "$VSIX_NAME.sha256"
 
       - name: Release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2 # zizmor: ignore[superfluous-actions]
         with:
           files: |
             ${{ env.VSIX_NAME }}
@@ -98,7 +112,7 @@ jobs:
             ## What's Changed
 
             ## Installation
-            1. [Download the .vsix file](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ env.VERSION }}/${{ env.VSIX_NAME }})
+            1. [Download the .vsix file](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ env.RELEASE_TAG }}/${{ env.VSIX_NAME }})
             2. In your editor, open the Command Palette (<kbd>Meta</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>)
             3. Type `Install from VSIX` and select the downloaded file
 
