@@ -218,6 +218,22 @@
 					"minimum": 0,
 					"maximum": 1000000
 				},
+				"remote.SSH.tmux.handOff": {
+					"type": "string",
+					"markdownDescription": "What to do when this workspace's terminals are still open on another machine. `auto` (default): if that machine has been idle for two minutes (its window was closed, crashed or went to sleep), move the terminals here without asking; otherwise offer to take them over. `ask`: always offer, never move them without a click. `never`: leave them on the other machine.",
+					"scope": "application",
+					"default": "auto",
+					"enum": [
+						"auto",
+						"ask",
+						"never"
+					],
+					"enumDescriptions": [
+						"Take over terminals from an idle machine silently; offer to take over from an active one.",
+						"Always offer; never take over without a click.",
+						"Never take over terminals from another machine."
+					]
+				},
 				"remote.SSH.tmux.reapOnConnect": {
 					"type": "boolean",
 					"description": "Automatically clean up empty and dead tmux sessions when connecting to a remote.",

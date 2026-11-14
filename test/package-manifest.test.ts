@@ -144,6 +144,24 @@ describe('package.json manifest drift guard', () => {
             expect(reapOnConnect.default).toBe(true);
         });
 
+        it('declares remote.SSH.tmux.handOff with the documented default', () => {
+            const handOff = properties['remote.SSH.tmux.handOff'];
+            expect(handOff).toBeDefined();
+            expect(handOff.type).toBe('string');
+            expect(handOff.default).toBe('auto');
+            // Same values toHandOffPolicy accepts; anything else falls back to the default.
+            expect(handOff.enum).toEqual(['auto', 'ask', 'never']);
+            expect((handOff.enumDescriptions as string[]).length).toBe(3);
+            // Invisible UX: the setting describes machines and terminals, never tmux.
+            expect(String(handOff.markdownDescription)).not.toMatch(/tmux|detach|session/i);
+        });
+
+        it('every declared remote.SSH.tmux.handOff enum value is understood by src/tmux/slotState.ts', () => {
+            const slotStateSrc = fs.readFileSync(path.resolve(srcDir, 'tmux', 'slotState.ts'), 'utf8');
+            const values = properties['remote.SSH.tmux.handOff'].enum as string[];
+            expect(values.filter(value => !slotStateSrc.includes(`'${value}'`))).toEqual([]);
+        });
+
         it('every remote.SSH.tmux.* setting mentioned in docs/ exists in package.json', () => {
             // Collect all `remote.SSH.tmux.*` setting names from docs/. Plans under
             // docs/plans/ are excluded: they propose settings that do not exist *yet*

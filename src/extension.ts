@@ -14,6 +14,8 @@ import { TerminalProfileRegistration } from './tmux/profileRegistration';
 import { pasteClipboardImage, sweepOldImages } from './clipboard/pasteImage';
 import { SessionReaper } from './tmux/sessionReaper';
 import { clampHistoryLimit } from './tmux/tmuxSession';
+import { resolveClientId } from './tmux/clientIdentity';
+import { toHandOffPolicy, type HandOffPolicy } from './tmux/slotState';
 import { prepareEnvCollection } from './common/envCollection';
 import { disposeAll } from './common/disposable';
 
@@ -239,6 +241,11 @@ function wireTmuxTerminalLayer(
             // Scrollback lines for new sessions (remote.SSH.tmux.historyLimit); the
             // provider caps its `new-session` history buffer to this.
             historyLimit: settings.historyLimit,
+            // Who this window is on the remote: a hash of the machine id plus a per-window
+            // nonce (never the raw machineId), tagged onto every session it attaches.
+            clientId: resolveClientId(vscode.env.machineId, context.workspaceState),
+            handOff: settings.handOff,
+            offerTakeOver: offerHandOff,
         });
 
         // These go into `wired`, not straight onto `context.subscriptions`, and are handed
@@ -319,6 +326,9 @@ function wireTmuxTerminalLayer(
         // `wired` and the catch below releases them (see the comment where `wired` is
         // declared for why a retry must not inherit them).
         context.subscriptions.push(...wired.splice(0));
+        // A closing window detaches its tmux clients (see `deactivate`), so another machine
+        // can take the sessions at once instead of waiting out VS Code's 3 h pty grace.
+        detachOnClose = () => terminalProvider.detachAll();
 
         logger.trace('Tmux terminal layer wired successfully');
 
@@ -352,6 +362,34 @@ function wireTmuxTerminalLayer(
         logger.trace(`Tmux wiring failed: ${err instanceof Error ? err.message : String(err)}`);
         return undefined;
     }
+}
+
+/** The wired provider's {@link TmuxTerminalProvider.detachAll}, for {@link deactivate}. One
+ * per extension host (= per window); unset until the tmux layer has wired. */
+let detachOnClose: (() => Promise<void>) | undefined;
+
+/** How long a closing window waits for its tmux clients to detach. Short: VS Code is holding
+ * the window open for it, and a detach that misses it is covered by the other machine's
+ * staleness rule (`slotState.ts`) a couple of minutes later. */
+export const DETACH_ON_CLOSE_DEADLINE_MS = 1500;
+
+/** Run `detach` for at most `ms`, never rejecting — a window close must never fail or hang
+ * on a remote command. */
+export function detachBeforeExit(detach: () => Promise<void>, ms = DETACH_ON_CLOSE_DEADLINE_MS): Promise<void> {
+    return withDeadline(detach(), ms, 'detach on close').catch(() => undefined);
+}
+
+/** Text of the take-over offer: one non-modal notification, no tmux wording. */
+export const HAND_OFF_OFFER_MESSAGE = 'This workspace\'s terminals are open on another machine.';
+export const HAND_OFF_TAKE_OVER = 'Take over';
+export const HAND_OFF_NOT_NOW = 'Not now';
+
+/** Ask whether to take this workspace's terminals over from another machine still using them
+ * (`remote.SSH.tmux.handOff` `auto`/`ask`). Only an explicit click on "Take over" counts;
+ * dismissing the notification is "not now". */
+export async function offerHandOff(): Promise<boolean> {
+    const choice = await vscode.window.showInformationMessage(HAND_OFF_OFFER_MESSAGE, HAND_OFF_TAKE_OVER, HAND_OFF_NOT_NOW);
+    return choice === HAND_OFF_TAKE_OVER;
 }
 
 /**
@@ -468,6 +506,9 @@ export interface TmuxSettings {
     readonly historyLimit: number;
     /** `remote.SSH.tmux.reapOnConnect`: reap empty/dead sessions on (re)connect (default true). */
     readonly reapOnConnect: boolean;
+    /** `remote.SSH.tmux.handOff`: `'auto'` (default) | `'ask'` | `'never'` — what to do with
+     * this workspace's sessions while another machine's client holds them (`slotState.ts`). */
+    readonly handOff: HandOffPolicy;
     /** `remote.SSH.tmux.setDefaultProfile`: may the layer write
      * `terminal.integrated.defaultProfile.<platform>` at Workspace scope (default true)?
      * That write lands in `.vscode/settings.json` INSIDE the user's remote folder — a
@@ -493,6 +534,8 @@ export function readTmuxSettings(): TmuxSettings {
         // rejects would stop every terminal from opening (see clampHistoryLimit).
         historyLimit: clampHistoryLimit(config.get<unknown>('tmux.historyLimit', 50000)),
         reapOnConnect: config.get<boolean>('tmux.reapOnConnect', true),
+        // Read as `unknown`: an unrecognised hand-edited value falls back to the default.
+        handOff: toHandOffPolicy(config.get<unknown>('tmux.handOff', 'auto')),
         setDefaultProfile: config.get<boolean>('tmux.setDefaultProfile', true),
     };
 }
@@ -723,5 +766,9 @@ function resolveKillTarget(resolver: RemoteSSHResolver, logger: Log): WorkspaceK
     return { reaper, hostKey: context.hostKey, workspaceKey: context.workspaceKey };
 }
 
-export function deactivate() {
+/** Window closing (or reloading): detach this window's tmux clients, bounded by
+ * {@link DETACH_ON_CLOSE_DEADLINE_MS}. VS Code awaits the returned promise before disposing
+ * `context.subscriptions`, so the SSH connection is still up while this runs. */
+export function deactivate(): Promise<void> | undefined {
+    return detachOnClose ? detachBeforeExit(detachOnClose) : undefined;
 }
