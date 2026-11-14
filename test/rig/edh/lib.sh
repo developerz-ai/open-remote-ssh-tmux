@@ -120,6 +120,16 @@ codium_open() {
     --folder-uri "vscode-remote://ssh-remote+${EDH_HOST}${EDH_WS}"
 }
 
+# Start VSCodium on client $1 with the driver's flags and any extra arguments (a local folder,
+# or nothing for an empty window); returns at once.
+codium_launch() {
+  local c=$1
+  shift
+  timeout 30 docker exec -d -u pc -e DISPLAY="${EDH_DISPLAY}" "${c}" \
+    codium --user-data-dir "${EDH_UDD}" --extensions-dir "${EDH_EXT}" \
+    --no-sandbox --disable-gpu --password-store=basic --log trace "$@"
+}
+
 # The visible VSCodium window id (the newest when several map).
 window_id() { cx "$1" xdotool search --onlyvisible --name 'VSCodium' 2>/dev/null | tail -1; }
 
@@ -140,12 +150,23 @@ type_line() {
   cx "${c}" xdotool key Return
 }
 
+# Visible VSCodium windows on client $1: how many, and their titles (one per line).
+window_count() { cx "$1" xdotool search --onlyvisible --name 'VSCodium' 2>/dev/null | grep -c . || true; }
+window_titles() {
+  local wid
+  for wid in $(cx "$1" xdotool search --onlyvisible --name 'VSCodium' 2>/dev/null); do
+    cx "$1" xdotool getwindowname "${wid}"
+  done
+}
+
 # The driver's keybindings (client/keybindings.json).
 new_terminal() { key "$1" ctrl+alt+shift+F1; }
 reload_window() { key "$1" ctrl+alt+shift+F2; }
 close_window() { key "$1" ctrl+alt+shift+F3; }
 kill_terminal() { key "$1" ctrl+alt+shift+F4; }
 focus_terminal() { key "$1" ctrl+alt+shift+F5; }
+connect_to_host() { key "$1" ctrl+alt+shift+F6; }
+show_remote_explorer() { key "$1" ctrl+alt+shift+F7; }
 
 # Flip remote.SSH.tmux.enabled in client $1's user settings (application scope) while the
 # window is running — VS Code picks the file change up live, like a Settings UI edit.

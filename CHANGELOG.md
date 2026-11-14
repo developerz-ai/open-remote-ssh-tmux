@@ -1,3 +1,18 @@
+## 1.4.0
+
+**Connecting**
+
+- feat: **Connect to Host...** opens in the current window when that window is empty and local (no folder or workspace open), instead of always leaving a blank window behind. New setting `remote.SSH.openInWindow`: `auto` (default), `current`, `new`. **Connect Current Window to Host...** and the "…in Current Window" / "…in New Window" actions keep their meaning
+- feat: **Connect to Host...** is a list instead of a blank input box: recently connected hosts first, then the rest of the SSH config, each with the `user@hostname:port` it resolves to, then **Add New SSH Host...** and **Configure SSH Hosts...**. Typing an unlisted `[user@]hostname[:port]` still connects to it
+- fix: "Open on SSH Host in Current Window" for a recent folder now asks VS Code to reuse the window explicitly (`forceReuseWindow`)
+
+**SSH Targets view**
+
+- feat: clicking a host connects to it and clicking a recent folder opens it (window per `remote.SSH.openInWindow`); a host's recent folders expand from its arrow
+- feat: inline buttons for both "current window" and "new window" on hosts and folders
+- feat: the host and folder this window is connected to are marked "connected"; hosts show `user@hostname:port` on hover, folders their full path
+- feat: with no hosts, the view offers **Add New SSH Host** and **Open SSH Config File**
+
 ## 1.3.0
 
 Hardening sweep (plan `101-bulletproof-hardening-sweep`): every change below was proven against real tmux 2.6, 3.0a, 3.4, 3.5a and 3.8 over real SSH in the new docker rig, not only in unit tests.

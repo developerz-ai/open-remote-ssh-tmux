@@ -2,7 +2,7 @@
 	"name": "open-remote-ssh-tmux",
 	"displayName": "Open Remote - SSH (tmux)",
 	"description": "Use any remote machine with a SSH server as your development environment.",
-	"version": "1.3.0",
+	"version": "1.4.0",
 	"publisher": "developerz-ai",
 	"license": "MIT",
 	"repository": {
@@ -114,6 +114,22 @@
 					"default": 60,
 					"scope": "application",
 					"minimum": 1
+				},
+				"remote.SSH.openInWindow": {
+					"type": "string",
+					"markdownDescription": "Where **Connect to Host...** and a click on a host or recent folder in **SSH Targets** open the remote. `auto` (default): in this window when it is an empty local window (no folder or workspace open), otherwise in a new window. `current`: always replace this window. `new`: always open a new window. The explicit \"…in Current Window\" / \"…in New Window\" actions are not affected.",
+					"scope": "application",
+					"default": "auto",
+					"enum": [
+						"auto",
+						"current",
+						"new"
+					],
+					"enumDescriptions": [
+						"Reuse an empty local window; otherwise open a new window.",
+						"Always open in the current window.",
+						"Always open in a new window."
+					]
 				},
 				"remote.SSH.defaultExtensions": {
 					"type": "array",
@@ -267,6 +283,12 @@
 				}
 			]
 		},
+		"viewsWelcome": [
+			{
+				"view": "sshHosts",
+				"contents": "No SSH hosts yet.\n[Add New SSH Host](command:openremotessh.explorer.add)\n[Open SSH Config File](command:openremotessh.openConfigFile)"
+			}
+		],
 		"commands": [
 			{
 				"command": "openremotessh.openEmptyWindow",
@@ -300,16 +322,18 @@
 			},
 			{
 				"command": "openremotessh.explorer.emptyWindowInCurrentWindow",
-				"title": "Connect to Host in Current Window"
+				"title": "Connect to Host in Current Window",
+				"icon": "$(arrow-right)"
 			},
 			{
 				"command": "openremotessh.explorer.reopenFolderInCurrentWindow",
-				"title": "Open on SSH Host in Current Window"
+				"title": "Open on SSH Host in Current Window",
+				"icon": "$(arrow-right)"
 			},
 			{
 				"command": "openremotessh.explorer.reopenFolderInNewWindow",
 				"title": "Open on SSH Host in New Window",
-				"icon": "$(folder-opened)"
+				"icon": "$(empty-window)"
 			},
 			{
 				"command": "openremotessh.explorer.deleteFolderHistoryItem",
@@ -468,9 +492,14 @@
 			],
 			"view/item/context": [
 				{
-					"command": "openremotessh.explorer.emptyWindowInNewWindow",
+					"command": "openremotessh.explorer.emptyWindowInCurrentWindow",
 					"when": "viewItem =~ /^openremotessh.explorer.host$/",
 					"group": "inline@1"
+				},
+				{
+					"command": "openremotessh.explorer.emptyWindowInNewWindow",
+					"when": "viewItem =~ /^openremotessh.explorer.host$/",
+					"group": "inline@2"
 				},
 				{
 					"command": "openremotessh.explorer.emptyWindowInNewWindow",
@@ -483,9 +512,14 @@
 					"group": "navigation@1"
 				},
 				{
-					"command": "openremotessh.explorer.reopenFolderInNewWindow",
+					"command": "openremotessh.explorer.reopenFolderInCurrentWindow",
 					"when": "viewItem == openremotessh.explorer.folder",
 					"group": "inline@1"
+				},
+				{
+					"command": "openremotessh.explorer.reopenFolderInNewWindow",
+					"when": "viewItem == openremotessh.explorer.folder",
+					"group": "inline@2"
 				},
 				{
 					"command": "openremotessh.explorer.reopenFolderInNewWindow",
@@ -505,7 +539,7 @@
 				{
 					"command": "openremotessh.explorer.deleteFolderHistoryItem",
 					"when": "viewItem =~ /^openremotessh.explorer.folder/",
-					"group": "inline@2"
+					"group": "inline@3"
 				}
 			]
 		},

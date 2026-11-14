@@ -5,11 +5,14 @@ import { getSSHConfigPath } from './ssh/sshConfig';
 import { exists as fileExists } from './common/files';
 import SSHDestination from './ssh/sshDestination';
 
-export async function promptOpenRemoteSSHWindow(reuseWindow: boolean) {
-    const host = await vscode.window.showInputBox({
-        title: 'Enter [user@]hostname[:port]',
-        validateInput: validateSSHDestinationInput
-    });
+/**
+ * "Connect to Host...": ask for a destination, then connect to it. `askDestination` is the
+ * "Connect to Host" quick pick (`connectQuickPick.ts`, injected by `extension.ts`); it
+ * replaced the bare input box this used to show, and still returns whatever the user typed
+ * when that is not a listed host — so it is validated here, at the boundary.
+ */
+export async function promptOpenRemoteSSHWindow(reuseWindow: boolean, askDestination: () => Promise<string | undefined>) {
+    const host = await askDestination();
 
     if (!host) {
         return;
@@ -21,9 +24,9 @@ export async function promptOpenRemoteSSHWindow(reuseWindow: boolean) {
     // into `hostname` unparsed.
     const sshDest = SSHDestination.parse(host);
     if (!sshDest.hostname) {
-        // `validateInput` should already have blocked this via the UI, but the
-        // input box only enforces it interactively — guard again so a malformed
-        // destination can never open a window with an empty authority.
+        // The pick offers a typed destination only once it parses, but Enter with nothing
+        // selected still hands back the raw text — so a malformed destination can never
+        // open a window with an empty authority.
         // Not awaited: notifications resolve only when dismissed, and never reject.
         void vscode.window.showErrorMessage(`Remote-SSH: "${host}" is not a valid [user@]hostname[:port] destination.`);
         return;
@@ -32,24 +35,15 @@ export async function promptOpenRemoteSSHWindow(reuseWindow: boolean) {
     openRemoteSSHWindow(sshDest.toEncodedString(), reuseWindow);
 }
 
-/** `validateInput` for the "Enter [user@]hostname[:port]" box — parses the current
- * value the same way the command itself will and rejects anything that doesn't
- * resolve to a usable hostname, so the user gets inline feedback instead of a
- * window opened against an empty authority. */
-function validateSSHDestinationInput(value: string): string | undefined {
-    if (!value || !SSHDestination.parse(value).hostname) {
-        return 'Enter a valid [user@]hostname[:port] destination.';
-    }
-    return undefined;
-}
-
 export function openRemoteSSHWindow(host: string, reuseWindow: boolean) {
     // Fire-and-forget: the command opens a window; there is nothing to wait for here.
     void vscode.commands.executeCommand('vscode.newWindow', { remoteAuthority: getRemoteAuthority(host), reuseWindow });
 }
 
 export function openRemoteSSHLocationWindow(host: string, path: string, reuseWindow: boolean) {
-    void vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.from({ scheme: 'vscode-remote', authority: getRemoteAuthority(host), path }), { forceNewWindow: !reuseWindow });
+    // Say both explicitly: `forceNewWindow: false` alone only declines to force a new
+    // window and leaves the choice to VS Code; `forceReuseWindow` asks for this one.
+    void vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.from({ scheme: 'vscode-remote', authority: getRemoteAuthority(host), path }), { forceNewWindow: !reuseWindow, forceReuseWindow: reuseWindow });
 }
 
 export async function addNewHost() {

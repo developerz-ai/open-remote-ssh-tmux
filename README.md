@@ -70,6 +70,25 @@ shell instead, see [Troubleshooting](#troubleshooting).
 - Everything in [SSH Host Requirements](#ssh-host-requirements) and
   [Activation](#activation) below.
 
+## Connecting
+
+- **Remote-SSH: Connect to Host...** (also in the remote indicator, bottom left)
+  opens a list: the hosts you connected to most recently first, then the rest of
+  your SSH config, each with the `user@hostname:port` it resolves to. Type any
+  `[user@]hostname[:port]` that is not listed to connect to it directly. **Add New
+  SSH Host...** and **Configure SSH Hosts...** are at the bottom.
+- **Which window.** From an empty local window (no folder or workspace open) the
+  connection opens **in that window**; from any other window it opens a new one.
+  `remote.SSH.openInWindow` changes this (`current` / `new`), and **Connect
+  Current Window to Host...** always reuses the current window.
+- **SSH Targets** (Remote Explorer): clicking a host connects to it and clicking a
+  recent folder opens it, in the window `remote.SSH.openInWindow` picks; the arrow
+  next to the host's name expands its recent folders. The inline buttons force
+  the current window (→) or a new window. The host and folder this window is
+  connected to are marked "connected"; hover a host for its `user@hostname:port`,
+  a folder for its full path. With no hosts yet, the view offers **Add New SSH
+  Host** and **Open SSH Config File**.
+
 ## How it behaves
 
 - **New Terminal** opens a "Persistent Shell" (the default profile, see
@@ -102,6 +121,7 @@ shell instead, see [Troubleshooting](#troubleshooting).
 
 | Setting | Default | Description |
 |---|---|---|
+| `remote.SSH.openInWindow` | `auto` | Where **Connect to Host...** and a click in **SSH Targets** open the remote. `auto`: the current window when it is an empty local window, otherwise a new window. `current`: always the current window. `new`: always a new window. The explicit "…in Current Window" / "…in New Window" actions ignore it. |
 | `remote.SSH.tmux.enabled` | `auto` | `auto`: persistent terminals on Unix-like remotes, plain shells on Windows. `on`: show an error when the remote has no usable tmux (the connection still opens). `off`: plain shells only; turning it off while connected offers to close this workspace's terminals that are still running. |
 | `remote.SSH.tmux.historyLimit` | `50000` | Scrollback lines kept per terminal, `0` to `1000000`. |
 | `remote.SSH.tmux.handOff` | `auto` | What to do when this workspace's terminals are open on another machine. `auto`: move them here without asking if that machine has been idle for 2 minutes, otherwise offer. `ask`: always offer, never move them without a click. `never`: leave them on the other machine. |
