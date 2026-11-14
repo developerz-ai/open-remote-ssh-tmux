@@ -96,7 +96,10 @@ interface Task {
     fileList: { filepath: string; status: string }[];
 }
 
-describe('staged tooling', () => {
+// The pre-commit harness (husky + lint-staged) is POSIX contributor tooling: these tests swap
+// PATH and acquire tools (eslint shims, pipx) the way a Linux dev box does. The Linux CI job
+// covers them; the Windows/macOS jobs exist to exercise the extension's own code.
+describe.runIf(process.platform === 'linux')('staged tooling', () => {
     it('sends root and nested TypeScript, but not unrelated files, to ESLint', () => {
         const tasks: Task[] = JSON.parse(native('console.log(JSON.stringify(tasks));', [
             'root.ts', 'src/tmux/nested.ts', 'src/notes.md', 'README.md', '.github/workflows/check.yml',

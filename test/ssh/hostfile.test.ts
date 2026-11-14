@@ -545,7 +545,8 @@ describe('knownHostsFiles', () => {
 
     it('takes configured files (string or list), expanding ~', () => {
         const f = knownHostsFiles(['~/a', '/b'], '/etc/c');
-        expect(f.user).toEqual([path.join(os.homedir(), 'a'), '/b']);
+        // normalize: untildify joins with '/', which Windows accepts but spells differently.
+        expect(f.user.map(file => path.normalize(file))).toEqual([path.join(os.homedir(), 'a'), path.normalize('/b')]);
         expect(f.global).toEqual(['/etc/c']);
     });
 

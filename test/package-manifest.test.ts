@@ -342,6 +342,7 @@ describe('package.json manifest drift guard', () => {
             const stripComments = (source: string): string => source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
             const callers = fs.readdirSync(srcDir, { recursive: true, encoding: 'utf8' })
                 .filter(file => file.endsWith('.ts'))
+                .map(file => file.split(path.sep).join('/'))
                 .filter(file => /registerTerminalProfileProvider\s*\(/.test(stripComments(fs.readFileSync(path.resolve(srcDir, file), 'utf8'))));
             expect(callers, 'registerTerminalProfileProvider must be called only by tmux/profileRegistration.ts')
                 .toEqual(['tmux/profileRegistration.ts']);
