@@ -1,3 +1,9 @@
+## 1.4.1
+
+- fix(ci): release `.sha256` files are in `sha256sum -c` format, so the README's verify step works (the v1.3.0 and v1.4.0 assets were re-uploaded in this format, same hashes) (#72)
+- docs: the extension's description and keywords say what it does (tmux-backed persistent terminals); README badges and an "AI-maintained" section (#74)
+- test: the containerised real-VSCodium driver now runs the whole acceptance matrix; every row except 13 (Windows remote) and 18 (Claude Code TUI) passes with no manual steps (#73)
+
 ## 1.4.0
 
 **Connecting**
