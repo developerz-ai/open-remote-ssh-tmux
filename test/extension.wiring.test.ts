@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { CLIPBOARD_PASTE_DEADLINE_MS, CLIPBOARD_SWEEP_DEADLINE_MS, clipboardExec, deactivate, decideDefaultProfile, DETACH_ON_CLOSE_DEADLINE_MS, detachBeforeExit, HAND_OFF_NOT_NOW, HAND_OFF_OFFER_MESSAGE, HAND_OFF_TAKE_OVER, offerHandOff, decideTmuxWiring, defaultProfileSettingKey, deriveTmuxSessionContext, idempotentResolveHandler, lazyExec, onceOnly, readTmuxSettings, reconcileDefaultTerminalProfile, TMUX_EXEC_DEADLINE_MS, TMUX_PROFILE_TITLE, tmuxExec } from '../src/extension';
+import { backgroundTerminalsMessage, canonicalTmuxIdentity, CLIPBOARD_PASTE_DEADLINE_MS, CLIPBOARD_SWEEP_DEADLINE_MS, clipboardExec, CLOSE_BACKGROUND_TERMINALS, deactivate, decideDefaultProfile, DETACH_ON_CLOSE_DEADLINE_MS, detachBeforeExit, HAND_OFF_NOT_NOW, HAND_OFF_OFFER_MESSAGE, HAND_OFF_TAKE_OVER, KEEP_BACKGROUND_TERMINALS, LIFETIME_DOCS_URL, LIFETIME_LEARN_MORE, LIFETIME_WARNING_MESSAGE, maybeWarnTerminalLifetime, offerBackgroundCleanup, offerHandOff, decideTmuxWiring, defaultProfileSettingKey, deriveTmuxSessionContext, lazyExec, onceOnly, readTmuxSettings, reconcileDefaultTerminalProfile, resolveSshTarget, TMUX_EXEC_DEADLINE_MS, TMUX_PROFILE_TITLE, TmuxLayerController, tmuxExec, watchTmuxLayerInputs, type TmuxSettings, type TmuxTerminalLayer } from '../src/extension';
+import SSHDestination from '../src/ssh/sshDestination';
+import type { TmuxSessionContext } from '../src/tmux/terminalProvider';
 import { DeadlineError } from '../src/common/deadline';
 import { wrapWithExitCode } from '../src/tmux/remoteExec';
 import type { RemoteSSHResolver } from '../src/authResolver';
@@ -88,34 +90,377 @@ describe('tmuxExec: every tmux-layer remote call is bounded and reports its exit
     });
 });
 
-describe('idempotentResolveHandler: wire once, refresh on reconnect', () => {
-    it('wires on the first resolve, then only refreshes on every later resolve', () => {
-        const refresh = vi.fn();
-        const wire = vi.fn(() => ({ refresh }));
-        const handler = idempotentResolveHandler(wire);
+/** A fake wired layer, recording what the controller and the watchers do to it. */
+function fakeLayer(identity: TmuxSessionContext = { hostKey: 'dev@h:22', workspaceKey: '/w', cwd: '/w' }) {
+    return {
+        identity,
+        refresh: vi.fn(),
+        reconfigure: vi.fn(),
+        dispose: vi.fn(),
+        protectedSessions: vi.fn(async () => []),
+    } satisfies TmuxTerminalLayer;
+}
 
-        handler(); // first connect → wire
-        handler(); // reconnect → refresh only
-        handler(); // reconnect → refresh only
+describe('TmuxLayerController: wire once, refresh on reconnect, rewire/unwire at runtime', () => {
+    it('wires on the first resolve, then only refreshes on every later resolve', async () => {
+        const layer = fakeLayer();
+        const wire = vi.fn(async () => layer);
+        const controller = new TmuxLayerController(wire);
+
+        await controller.resolved(); // first connect → wire
+        await controller.resolved(); // reconnect → refresh only
+        await controller.resolved(); // reconnect → refresh only
 
         expect(wire).toHaveBeenCalledTimes(1);   // never re-registers
-        expect(refresh).toHaveBeenCalledTimes(2);
+        expect(layer.refresh).toHaveBeenCalledTimes(2);
     });
 
-    it('retries wiring on a later resolve when the gates were not yet satisfied', () => {
-        const refresh = vi.fn();
+    it('retries wiring on a later resolve when the gates were not yet satisfied', async () => {
+        const layer = fakeLayer();
         let call = 0;
-        // First resolve: gates fail (e.g. tmux capability not ready) → undefined, no
-        // layer retained. A later resolve wires for real; then reconnects refresh it.
-        const wire = vi.fn(() => (call++ === 0 ? undefined : { refresh }));
-        const handler = idempotentResolveHandler(wire);
+        const wire = vi.fn(async () => (call++ === 0 ? undefined : layer));
+        const controller = new TmuxLayerController(wire);
 
-        handler(); // gate failed → no layer retained
-        handler(); // now wired
-        handler(); // reconnect → refresh
+        await controller.resolved(); // gate failed → no layer retained
+        await controller.resolved(); // now wired
+        await controller.resolved(); // reconnect → refresh
 
         expect(wire).toHaveBeenCalledTimes(2);
-        expect(refresh).toHaveBeenCalledTimes(1);
+        expect(layer.refresh).toHaveBeenCalledTimes(1);
+    });
+
+    it('a resolve arriving while wiring is in flight joins it instead of wiring twice', async () => {
+        const wire = vi.fn(async () => fakeLayer());
+        const controller = new TmuxLayerController(wire);
+
+        await Promise.all([controller.resolved(), controller.resolved()]);
+
+        expect(wire).toHaveBeenCalledTimes(1);
+    });
+
+    it('counts as wired while wiring is in flight', () => {
+        const controller = new TmuxLayerController(() => new Promise(() => { /* identity still resolving */ }));
+        void controller.resolved();
+
+        expect(controller.wired).toBe(true);
+    });
+
+    it('unwire disposes the layer and hands back its identity', async () => {
+        const layer = fakeLayer();
+        const controller = new TmuxLayerController(async () => layer);
+        await controller.resolved();
+
+        expect(controller.unwire()).toBe(layer.identity);
+        expect(layer.dispose).toHaveBeenCalledTimes(1);
+        expect(controller.wired).toBe(false);
+    });
+
+    it('rewire disposes the old layer before building the new one', async () => {
+        const first = fakeLayer();
+        const second = fakeLayer();
+        const layers = [first, second];
+        const controller = new TmuxLayerController(async () => layers.shift());
+        await controller.resolved();
+
+        await controller.rewire();
+
+        expect(first.dispose).toHaveBeenCalledTimes(1);
+        expect(controller.current).toBe(second);
+    });
+
+    it('a wiring superseded by unwire is disposed when it lands, never kept', async () => {
+        const layer = fakeLayer();
+        let land!: (value: TmuxTerminalLayer) => void;
+        const controller = new TmuxLayerController(() => new Promise<TmuxTerminalLayer>(resolve => {
+            land = resolve;
+        }));
+        const wiring = controller.resolved();
+        await Promise.resolve();
+
+        controller.unwire();
+        land(layer);
+
+        expect(await wiring).toBeUndefined();
+        expect(layer.dispose).toHaveBeenCalledTimes(1);
+        expect(controller.current).toBeUndefined();
+    });
+
+    it('a wiring that throws leaves nothing wired and lets the next resolve retry', async () => {
+        let call = 0;
+        const layer = fakeLayer();
+        const controller = new TmuxLayerController(async () => {
+            if (call++ === 0) {
+                throw new Error('boom');
+            }
+            return layer;
+        });
+
+        expect(await controller.resolved()).toBeUndefined();
+        expect(await controller.resolved()).toBe(layer);
+    });
+});
+
+describe('watchTmuxLayerInputs (05 b/h: settings and folder changes without a reload)', () => {
+    const SETTINGS: TmuxSettings = {
+        enabled: 'auto', historyLimit: 50000, reapOnConnect: true, handOff: 'auto', setDefaultProfile: true, orphanMaxAgeDays: 14,
+    };
+
+    function harness(over: { identity?: TmuxSessionContext | undefined; connected?: boolean } = {}) {
+        let configListener: ((e: { affectsConfiguration(section: string): boolean }) => void) | undefined;
+        let foldersListener: (() => void) | undefined;
+        const configSub = { dispose: vi.fn() };
+        const foldersSub = { dispose: vi.fn() };
+        const layer = fakeLayer();
+        const controller = new TmuxLayerController(async () => layer);
+        let settings = SETTINGS;
+        const reactions = {
+            controller,
+            readSettings: () => settings,
+            connected: () => over.connected ?? true,
+            currentIdentity: vi.fn(async () => ('identity' in over ? over.identity : layer.identity)),
+            clearDefaultProfile: vi.fn(),
+            offerCleanup: vi.fn(async () => undefined),
+            log: { trace: vi.fn() },
+        };
+        const watcher = watchTmuxLayerInputs({
+            onDidChangeConfiguration: listener => {
+                configListener = listener;
+                return configSub;
+            },
+            onDidChangeWorkspaceFolders: listener => {
+                foldersListener = listener;
+                return foldersSub;
+            },
+        }, reactions);
+        const change = (next: Partial<TmuxSettings>, section = 'remote.SSH.tmux'): void => {
+            settings = { ...settings, ...next };
+            configListener!({ affectsConfiguration: (s: string) => section.startsWith(s) || s.startsWith(section) });
+        };
+        return { watcher, layer, controller, reactions, change, configSub, foldersSub, folders: () => foldersListener!() };
+    }
+    const settle = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 0));
+
+    it('subscribes to both events and releases both on dispose', () => {
+        const { watcher, configSub, foldersSub } = harness();
+
+        watcher.dispose();
+
+        expect(configSub.dispose).toHaveBeenCalledTimes(1);
+        expect(foldersSub.dispose).toHaveBeenCalledTimes(1);
+    });
+
+    it('ignores configuration changes outside remote.SSH.tmux', async () => {
+        const { controller, change, layer } = harness();
+        await controller.resolved();
+
+        change({ historyLimit: 1 }, 'editor.fontSize');
+
+        expect(layer.reconfigure).not.toHaveBeenCalled();
+    });
+
+    it('turning persistent terminals off unwires, clears our default profile and offers cleanup', async () => {
+        const { controller, change, layer, reactions } = harness();
+        await controller.resolved();
+
+        change({ enabled: 'off' });
+
+        expect(layer.dispose).toHaveBeenCalledTimes(1);
+        expect(reactions.clearDefaultProfile).toHaveBeenCalledTimes(1);
+        expect(reactions.offerCleanup).toHaveBeenCalledWith(layer.identity);
+    });
+
+    it('turning them back on without a reload wires again', async () => {
+        const { controller, change } = harness();
+        await controller.resolved();
+        change({ enabled: 'off' });
+
+        change({ enabled: 'auto' });
+        await settle();
+
+        expect(controller.wired).toBe(true);
+    });
+
+    it('does not wire on a turn-on before the window is connected (the resolve will)', async () => {
+        const { controller, change } = harness({ connected: false });
+        change({ enabled: 'off' });
+
+        change({ enabled: 'auto' });
+
+        expect(controller.wired).toBe(false);
+    });
+
+    it('a live setting is handed to the wired layer', async () => {
+        const { controller, change, layer } = harness();
+        await controller.resolved();
+
+        change({ historyLimit: 1234 });
+
+        expect(layer.reconfigure).toHaveBeenCalledWith(expect.objectContaining({ historyLimit: 1234 }));
+    });
+
+    it('a folder change that keeps the identity changes nothing', async () => {
+        const { controller, layer, folders } = harness();
+        await controller.resolved();
+
+        folders();
+        await settle();
+
+        expect(layer.dispose).not.toHaveBeenCalled();
+    });
+
+    it('a folder change that moves the identity rewires the layer onto it', async () => {
+        const { controller, layer, folders, reactions } = harness({ identity: { hostKey: 'dev@h:22', workspaceKey: '/other', cwd: '/other' } });
+        await controller.resolved();
+
+        folders();
+        await settle();
+
+        expect(reactions.currentIdentity).toHaveBeenCalled();
+        expect(layer.dispose).toHaveBeenCalledTimes(1);
+        expect(controller.wired).toBe(true);
+    });
+
+    it('a folder change that leaves no folder unwires (no stale identity)', async () => {
+        const { controller, layer, folders, reactions } = harness({ identity: undefined });
+        await controller.resolved();
+
+        folders();
+        await settle();
+
+        expect(layer.dispose).toHaveBeenCalledTimes(1);
+        expect(reactions.clearDefaultProfile).toHaveBeenCalledTimes(1);
+        expect(controller.wired).toBe(false);
+    });
+});
+
+describe('offerBackgroundCleanup (05 b: what still runs after turning terminals off)', () => {
+    afterEach(() => {
+        shownMessages.information.length = 0;
+        shownMessages.warning.length = 0;
+        shownMessages.error.length = 0;
+    });
+    const IDENTITY: TmuxSessionContext = { hostKey: 'dev@h:22', workspaceKey: '/w', cwd: '/w', legacy: { hostKey: 'h', workspaceKey: '/w/' } };
+
+    it('words the offer without internals, singular and plural', () => {
+        expect(backgroundTerminalsMessage(1)).toBe('1 background terminal from this workspace is still running.');
+        expect(backgroundTerminalsMessage(3)).toBe('3 background terminals from this workspace are still running.');
+        expect(backgroundTerminalsMessage(3)).not.toMatch(/tmux|session/i);
+    });
+
+    it('asks once, and closes them (canonical + legacy identities) on "Close them"', async () => {
+        const reaper = { countWorkspaceSessions: vi.fn(async () => 2), killWorkspaceSessions: vi.fn(async () => ({ killed: 2, failed: 0 })) };
+        const ask = vi.fn(async () => CLOSE_BACKGROUND_TERMINALS);
+
+        await offerBackgroundCleanup(IDENTITY, { reaper, ask });
+
+        expect(ask).toHaveBeenCalledWith(backgroundTerminalsMessage(2), CLOSE_BACKGROUND_TERMINALS, KEEP_BACKGROUND_TERMINALS);
+        expect(reaper.killWorkspaceSessions).toHaveBeenCalledWith([
+            { hostKey: 'dev@h:22', workspaceKey: '/w' },
+            { hostKey: 'h', workspaceKey: '/w/' },
+        ]);
+    });
+
+    it.each([KEEP_BACKGROUND_TERMINALS, undefined])('keeps them on %j', async (answer) => {
+        const reaper = { countWorkspaceSessions: vi.fn(async () => 2), killWorkspaceSessions: vi.fn() };
+
+        await offerBackgroundCleanup(IDENTITY, { reaper, ask: async () => answer });
+
+        expect(reaper.killWorkspaceSessions).not.toHaveBeenCalled();
+    });
+
+    it.each([0, undefined])('does not ask when there is nothing (or nothing known) running: %j', async (count) => {
+        const ask = vi.fn();
+
+        await offerBackgroundCleanup(IDENTITY, { reaper: { countWorkspaceSessions: async () => count, killWorkspaceSessions: vi.fn() }, ask });
+
+        expect(ask).not.toHaveBeenCalled();
+    });
+});
+
+describe('maybeWarnTerminalLifetime (05 k: a host that ends processes at logout)', () => {
+    function deps(over: { risk?: boolean; dismissed?: string[] } = {}) {
+        const store = new Map<string, unknown>(over.dismissed ? [['tmux.lifetimeWarningDismissed.v1', over.dismissed]] : []);
+        return {
+            probe: vi.fn(async () => ({ lifetimeRisk: over.risk ?? true })),
+            state: {
+                get: <T>(key: string, fallback: T): T => (store.has(key) ? store.get(key) as T : fallback),
+                update: vi.fn(async (key: string, value: unknown) => {
+                    store.set(key, value);
+                }),
+            },
+            show: vi.fn(async (): Promise<string | undefined> => undefined),
+            openDocs: vi.fn(),
+            log: { trace: vi.fn() },
+            store,
+        };
+    }
+
+    it('warns once, in plain words, and remembers the dismissal for this host', async () => {
+        const d = deps();
+
+        await maybeWarnTerminalLifetime('dev@h:22', d);
+
+        expect(d.show).toHaveBeenCalledWith(LIFETIME_WARNING_MESSAGE, LIFETIME_LEARN_MORE);
+        expect(LIFETIME_WARNING_MESSAGE).not.toMatch(/tmux|session|systemd|logind/i);
+        expect(d.store.get('tmux.lifetimeWarningDismissed.v1')).toEqual(['dev@h:22']);
+    });
+
+    it('opens the troubleshooting entry on "Learn more"', async () => {
+        const d = deps();
+        d.show.mockResolvedValue(LIFETIME_LEARN_MORE);
+
+        await maybeWarnTerminalLifetime('dev@h:22', d);
+
+        expect(d.openDocs).toHaveBeenCalledWith(LIFETIME_DOCS_URL);
+        expect(LIFETIME_DOCS_URL).toMatch(/docs\/troubleshooting\.md#terminals-closed-after-disconnect$/);
+    });
+
+    it('never asks again for a host already dismissed (not even probing)', async () => {
+        const d = deps({ dismissed: ['dev@h:22'] });
+
+        await maybeWarnTerminalLifetime('dev@h:22', d);
+
+        expect(d.probe).not.toHaveBeenCalled();
+        expect(d.show).not.toHaveBeenCalled();
+    });
+
+    it('stays silent when there is no risk', async () => {
+        const d = deps({ risk: false });
+
+        await maybeWarnTerminalLifetime('dev@h:22', d);
+
+        expect(d.show).not.toHaveBeenCalled();
+    });
+});
+
+describe('canonical identity (05 c: the same target reached by alias or address is one identity)', () => {
+    it('an alias resolves through HostName/User/Port to what typing the address gives', () => {
+        const viaAlias = resolveSshTarget(new SSHDestination('myvps'), { HostName: '203.0.113.7', User: 'dev' }, 'local');
+        const viaAddress = resolveSshTarget(new SSHDestination('203.0.113.7', 'dev'), {}, 'local');
+
+        expect(viaAlias).toEqual(viaAddress);
+        expect(viaAlias).toEqual({ hostName: '203.0.113.7', user: 'dev', port: 22 });
+    });
+
+    it('expands %h in HostName against the host as typed', () => {
+        expect(resolveSshTarget(new SSHDestination('box'), { HostName: '%h.lan' }, 'local').hostName).toBe('box.lan');
+    });
+
+    it('takes the config Port, then the typed one, then 22; the local user last', () => {
+        expect(resolveSshTarget(new SSHDestination('h', undefined, 2200), { Port: '2222' }, 'me').port).toBe(2222);
+        expect(resolveSshTarget(new SSHDestination('h', undefined, 2200), {}, 'me').port).toBe(2200);
+        expect(resolveSshTarget(new SSHDestination('h'), {}, 'me')).toEqual({ hostName: 'h', user: 'me', port: 22 });
+    });
+
+    it('builds the provider context: canonical keys, raw path as cwd, legacy kept for adoption', () => {
+        const ctx = canonicalTmuxIdentity({ hostKey: 'myvps', workspaceKey: '/home/dev/proj/' }, { hostName: 'H', user: 'dev', port: 22 });
+
+        expect(ctx).toEqual({
+            hostKey: 'dev@h:22',
+            workspaceKey: '/home/dev/proj',
+            cwd: '/home/dev/proj/',
+            legacy: { hostKey: 'myvps', workspaceKey: '/home/dev/proj/' },
+        });
     });
 });
 
@@ -161,6 +506,18 @@ describe('onceOnly: connect-time housekeeping that must not repeat on reconnect'
 // makes `enabled:'on'` ("require tmux") observably different from `'auto'`.
 describe('readTmuxSettings: the four remote.SSH.tmux.* settings are read', () => {
     beforeEach(() => configOverrides.clear());
+
+    it('reads orphanMaxAgeDays (default 14, 0 allowed, garbage → default)', () => {
+        expect(readTmuxSettings().orphanMaxAgeDays).toBe(14);
+        configOverrides.set('remote.SSH.tmux.orphanMaxAgeDays', 0);
+        expect(readTmuxSettings().orphanMaxAgeDays).toBe(0);
+        configOverrides.set('remote.SSH.tmux.orphanMaxAgeDays', 30);
+        expect(readTmuxSettings().orphanMaxAgeDays).toBe(30);
+        for (const bad of [-1, 2.5, '7', null]) {
+            configOverrides.set('remote.SSH.tmux.orphanMaxAgeDays', bad);
+            expect(readTmuxSettings().orphanMaxAgeDays).toBe(14);
+        }
+    });
 
     it('falls back to the package.json defaults when nothing is configured', () => {
         const settings = readTmuxSettings();

@@ -48,6 +48,7 @@ export const WORKERS = {
     handoff: 'w4',
     hardening: 'w5',
     deadlines: 'w6',
+    lifecycle: 'w7',
 } as const;
 
 /** Parse `RIG_TARGETS`; empty when the rig is not up. */

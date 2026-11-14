@@ -33,11 +33,12 @@ const OLD = NOW - 3600;
 const row = (
     name: string,
     attached: boolean,
-    opts: { windows?: number; paneDead?: boolean; created?: number } = {},
+    opts: { windows?: number; paneDead?: boolean; created?: number; activity?: number } = {},
 ): string => {
     const windows = opts.windows ?? 1;
     const created = opts.created ?? OLD;
-    return `${name} ${attached ? 1 : 0} ${windows} ${created} ${opts.paneDead ? 1 : 0}`;
+    const activity = opts.activity ?? created;
+    return `${name} ${attached ? 1 : 0} ${windows} ${created} ${opts.paneDead ? 1 : 0} a:${activity} o:`;
 };
 
 /**
@@ -74,7 +75,7 @@ function fakeExec(opts: {
     });
 }
 
-function makeReaper(over: { exec?: ReturnType<typeof fakeExec>; now?: number; minAgeSeconds?: number; tmuxPath?: string } = {}) {
+function makeReaper(over: { exec?: ReturnType<typeof fakeExec>; now?: number; minAgeSeconds?: number; tmuxPath?: string; orphanMaxAgeDays?: number } = {}) {
     const exec = over.exec ?? fakeExec();
     const log = { info: vi.fn(), trace: vi.fn() };
     const reaper = new SessionReaper({
@@ -83,6 +84,7 @@ function makeReaper(over: { exec?: ReturnType<typeof fakeExec>; now?: number; mi
         log,
         minAgeSeconds: over.minAgeSeconds,
         tmuxPath: over.tmuxPath,
+        orphanMaxAgeDays: over.orphanMaxAgeDays,
     });
     return { reaper, exec, log };
 }
@@ -117,24 +119,24 @@ describe('reap — selection (list -> parse -> shouldReap -> kill)', () => {
         const reaped = await reaper.reap();
 
         expect(killCommands(exec)).toEqual([buildKillSession(ours(0))]);
-        expect(reaped).toBe(1);
+        expect(reaped.killed).toBe(1);
         expect(log.info).toHaveBeenCalledTimes(1);
     });
 
-    it('never kills a live detached session (a detached long-running task)', async () => {
+    it('never kills a live detached session (a detached long-running task) — counts it as kept', async () => {
         const exec = fakeExec({ list: [row(ours(0), false, { windows: 2, paneDead: false })] });
         const { reaper, log } = makeReaper({ exec });
 
-        expect(await reaper.reap()).toBe(0);
+        expect(await reaper.reap()).toEqual({ killed: 0, orphansKept: 1, orphansTotal: 1 });
         expect(killCommands(exec)).toEqual([]);
-        expect(log.info).not.toHaveBeenCalled();
+        expect(log.info).toHaveBeenCalledWith('tmux housekeeping: 0 killed, 1 old sessions kept');
     });
 
     it('reaps every dead detached owned session in one pass, logged as one count line', async () => {
         const exec = fakeExec({ list: [row(ours(0), false, { paneDead: true }), row(ours(3), false, { paneDead: true })] });
         const { reaper, log } = makeReaper({ exec });
 
-        expect(await reaper.reap()).toBe(2);
+        expect((await reaper.reap()).killed).toBe(2);
         expect(killCommands(exec)).toEqual([buildKillSession(ours(0)), buildKillSession(ours(3))]);
         expect(log.info).toHaveBeenCalledTimes(1);
         expect(log.info).toHaveBeenCalledWith(expect.stringContaining('2'));
@@ -144,7 +146,7 @@ describe('reap — selection (list -> parse -> shouldReap -> kill)', () => {
         const exec = fakeExec({ list: ['no server running on /tmp/tmux-1000/default'] });
         const { reaper, log } = makeReaper({ exec });
 
-        expect(await reaper.reap()).toBe(0);
+        expect((await reaper.reap()).killed).toBe(0);
         expect(killCommands(exec)).toEqual([]);
         expect(log.info).not.toHaveBeenCalled();
     });
@@ -154,12 +156,12 @@ describe('reap — startup grace (injected clock)', () => {
     it('spares a young dead session younger than the grace, reaps it once past the grace', async () => {
         const young = fakeExec({ list: [row(ours(0), false, { paneDead: true, created: NOW })] });
         const youngReaper = makeReaper({ exec: young, now: NOW });
-        expect(await youngReaper.reaper.reap()).toBe(0);
+        expect((await youngReaper.reaper.reap()).killed).toBe(0);
         expect(killCommands(young)).toEqual([]);
 
         const aged = fakeExec({ list: [row(ours(0), false, { paneDead: true, created: NOW - DEFAULT_REAP_GRACE_SECONDS })] });
         const agedReaper = makeReaper({ exec: aged, now: NOW });
-        expect(await agedReaper.reaper.reap()).toBe(1);
+        expect((await agedReaper.reaper.reap()).killed).toBe(1);
         expect(killCommands(aged)).toEqual([buildKillSession(ours(0))]);
     });
 });
@@ -169,7 +171,7 @@ describe('reap — failure handling (never breaks the connect)', () => {
         const exec = fakeExec({ throwOnList: true });
         const { reaper, log } = makeReaper({ exec });
 
-        await expect(reaper.reap()).resolves.toBe(0);
+        await expect(reaper.reap()).resolves.toEqual({ killed: 0, orphansKept: 0, orphansTotal: 0 });
         expect(killCommands(exec)).toEqual([]);
         expect(log.trace).toHaveBeenCalled();
         expect(log.info).not.toHaveBeenCalled();
@@ -182,7 +184,7 @@ describe('reap — failure handling (never breaks the connect)', () => {
         });
         const { reaper, log } = makeReaper({ exec });
 
-        await expect(reaper.reap()).resolves.toBe(1); // ours(1) still reaped
+        expect((await reaper.reap()).killed).toBe(1); // ours(1) still reaped
         expect(killCommands(exec)).toEqual([buildKillSession(ours(0)), buildKillSession(ours(1))]);
         expect(log.trace).toHaveBeenCalled();
     });
@@ -196,7 +198,7 @@ describe('reap — a kill counts only when it landed', () => {
         });
         const { reaper, log } = makeReaper({ exec });
 
-        expect(await reaper.reap()).toBe(1);
+        expect((await reaper.reap()).killed).toBe(1);
         expect(log.trace).toHaveBeenCalled();
     });
 
@@ -207,7 +209,7 @@ describe('reap — a kill counts only when it landed', () => {
         });
         const { reaper, log } = makeReaper({ exec });
 
-        expect(await reaper.reap()).toBe(0);
+        expect((await reaper.reap()).killed).toBe(0);
         expect(log.info).not.toHaveBeenCalled();
     });
 
@@ -218,14 +220,14 @@ describe('reap — a kill counts only when it landed', () => {
         });
         const { reaper } = makeReaper({ exec });
 
-        expect(await reaper.reap()).toBe(1);
+        expect((await reaper.reap()).killed).toBe(1);
     });
 
     it('reads a failed list (tmux not runnable) as "could not list", not as zero sessions', async () => {
         const exec = fakeExec({ listResult: { stdout: '', stderr: 'sh: 1: tmux: not found', code: 127 } });
         const { reaper, log } = makeReaper({ exec });
 
-        expect(await reaper.reap()).toBe(0);
+        expect((await reaper.reap()).killed).toBe(0);
         expect(log.trace).toHaveBeenCalled();
     });
 });
@@ -246,7 +248,7 @@ describe('killWorkspaceSessions — force-kill this workspace (manual escape hat
         });
         const { reaper, log } = makeReaper({ exec });
 
-        const outcome = await reaper.killWorkspaceSessions(HOST, WS);
+        const outcome = await reaper.killWorkspaceSessions([{ hostKey: HOST, workspaceKey: WS }]);
 
         expect(killCommands(exec)).toEqual([buildKillSession(ours(0)), buildKillSession(ours(1))]);
         expect(outcome).toEqual({ killed: 2, failed: 0 });
@@ -257,7 +259,7 @@ describe('killWorkspaceSessions — force-kill this workspace (manual escape hat
         const exec = fakeExec({ list: [row(ours(0), false, { created: NOW })] });
         const { reaper } = makeReaper({ exec, now: NOW });
 
-        expect(await reaper.killWorkspaceSessions(HOST, WS)).toEqual({ killed: 1, failed: 0 });
+        expect(await reaper.killWorkspaceSessions([{ hostKey: HOST, workspaceKey: WS }])).toEqual({ killed: 1, failed: 0 });
         expect(killCommands(exec)).toEqual([buildKillSession(ours(0))]);
     });
 
@@ -265,7 +267,7 @@ describe('killWorkspaceSessions — force-kill this workspace (manual escape hat
         const exec = fakeExec({ list: [row(otherWs(0), false), row('main', true)] });
         const { reaper, log } = makeReaper({ exec });
 
-        expect(await reaper.killWorkspaceSessions(HOST, WS)).toEqual({ killed: 0, failed: 0 });
+        expect(await reaper.killWorkspaceSessions([{ hostKey: HOST, workspaceKey: WS }])).toEqual({ killed: 0, failed: 0 });
         expect(killCommands(exec)).toEqual([]);
         expect(log.info).not.toHaveBeenCalled();
     });
@@ -274,7 +276,7 @@ describe('killWorkspaceSessions — force-kill this workspace (manual escape hat
         const exec = fakeExec({ throwOnList: true });
         const { reaper, log } = makeReaper({ exec });
 
-        await expect(reaper.killWorkspaceSessions(HOST, WS)).resolves.toBeUndefined();
+        await expect(reaper.killWorkspaceSessions([{ hostKey: HOST, workspaceKey: WS }])).resolves.toBeUndefined();
         expect(killCommands(exec)).toEqual([]);
         expect(log.trace).toHaveBeenCalled();
     });
@@ -286,7 +288,7 @@ describe('killWorkspaceSessions — force-kill this workspace (manual escape hat
         });
         const { reaper } = makeReaper({ exec });
 
-        await expect(reaper.killWorkspaceSessions(HOST, WS)).resolves.toEqual({ killed: 1, failed: 1 });
+        await expect(reaper.killWorkspaceSessions([{ hostKey: HOST, workspaceKey: WS }])).resolves.toEqual({ killed: 1, failed: 1 });
         expect(killCommands(exec)).toEqual([buildKillSession(ours(0)), buildKillSession(ours(1))]);
     });
 
@@ -297,7 +299,89 @@ describe('killWorkspaceSessions — force-kill this workspace (manual escape hat
         });
         const { reaper, log } = makeReaper({ exec });
 
-        await expect(reaper.killWorkspaceSessions(HOST, WS)).resolves.toEqual({ killed: 1, failed: 1 });
+        await expect(reaper.killWorkspaceSessions([{ hostKey: HOST, workspaceKey: WS }])).resolves.toEqual({ killed: 1, failed: 1 });
         expect(log.info).toHaveBeenCalledWith(expect.stringContaining('1'));
+    });
+});
+
+describe('reap — orphan aging (05: remote.SSH.tmux.orphanMaxAgeDays)', () => {
+    const DAY = 86400;
+
+    it('kills a detached session of ours idle past the limit, keeps a recent one, counts both', async () => {
+        const exec = fakeExec({
+            list: [
+                row(ours(0), false, { activity: NOW - 15 * DAY }),  // aged orphan  -> kill
+                row(ours(1), false, { activity: NOW - 2 * DAY }),   // recent orphan -> keep, counted
+                row(ours(2), true, { activity: NOW - 99 * DAY }),   // attached      -> keep, not an orphan
+                row('main', false, { activity: NOW - 99 * DAY }),   // foreign       -> never touched
+            ],
+        });
+        const { reaper, log } = makeReaper({ exec, orphanMaxAgeDays: 14 });
+
+        expect(await reaper.reap()).toEqual({ killed: 1, orphansKept: 1, orphansTotal: 2 });
+        expect(killCommands(exec)).toEqual([buildKillSession(ours(0))]);
+        expect(log.info).toHaveBeenCalledWith('tmux housekeeping: 1 killed, 1 old sessions kept');
+    });
+
+    it('0 disables aging: nothing is killed, every orphan is kept', async () => {
+        const exec = fakeExec({ list: [row(ours(0), false, { activity: NOW - 400 * DAY })] });
+        const { reaper } = makeReaper({ exec, orphanMaxAgeDays: 0 });
+
+        expect(await reaper.reap()).toEqual({ killed: 0, orphansKept: 1, orphansTotal: 1 });
+        expect(killCommands(exec)).toEqual([]);
+    });
+
+    it('defaults to the documented 14 days when no limit is configured', async () => {
+        const exec = fakeExec({ list: [row(ours(0), false, { activity: NOW - 14 * DAY })] });
+        const { reaper } = makeReaper({ exec });
+
+        expect((await reaper.reap()).killed).toBe(1);
+    });
+
+    it('never kills a session this window is about to restore (protected), however old', async () => {
+        const exec = fakeExec({ list: [row(ours(0), false, { activity: NOW - 99 * DAY })] });
+        const { reaper } = makeReaper({ exec, orphanMaxAgeDays: 14 });
+
+        expect(await reaper.reap({ protect: [ours(0)] })).toEqual({ killed: 0, orphansKept: 0, orphansTotal: 0 });
+        expect(killCommands(exec)).toEqual([]);
+    });
+
+    it('an aged orphan whose kill is not confirmed is reported as kept, not killed', async () => {
+        const exec = fakeExec({
+            list: [row(ours(0), false, { activity: NOW - 30 * DAY })],
+            failKillFor: { name: ours(0), stderr: 'protocol version mismatch', code: 1 },
+        });
+        const { reaper } = makeReaper({ exec, orphanMaxAgeDays: 14 });
+
+        expect(await reaper.reap()).toEqual({ killed: 0, orphansKept: 1, orphansTotal: 1 });
+    });
+});
+
+describe('killWorkspaceSessions / countWorkspaceSessions — several identities (05: legacy + canonical)', () => {
+    const LEGACY = { hostKey: 'myvps', workspaceKey: '/home/user/proj/' };
+    const CANON = { hostKey: 'user@203.0.113.7:22', workspaceKey: '/home/user/proj' };
+    const legacy = (slot: number): string => sessionName(LEGACY.hostKey, LEGACY.workspaceKey, slot);
+    const canon = (slot: number): string => sessionName(CANON.hostKey, CANON.workspaceKey, slot);
+
+    it('kills the sessions of every identity given, nothing else', async () => {
+        const exec = fakeExec({ list: [row(canon(0), false), row(legacy(0), true), row(ours(0), false), row('main', false)] });
+        const { reaper } = makeReaper({ exec });
+
+        expect(await reaper.killWorkspaceSessions([CANON, LEGACY])).toEqual({ killed: 2, failed: 0 });
+        expect(killCommands(exec)).toEqual([buildKillSession(canon(0)), buildKillSession(legacy(0))]);
+    });
+
+    it('counts this workspace\'s sessions without killing any', async () => {
+        const exec = fakeExec({ list: [row(canon(0), true), row(canon(3), false), row(legacy(1), false), row(ours(0), false)] });
+        const { reaper } = makeReaper({ exec });
+
+        expect(await reaper.countWorkspaceSessions([CANON, LEGACY])).toBe(3);
+        expect(killCommands(exec)).toEqual([]);
+    });
+
+    it('count resolves undefined when the sessions could not be listed', async () => {
+        const { reaper } = makeReaper({ exec: fakeExec({ throwOnList: true }) });
+
+        expect(await reaper.countWorkspaceSessions([CANON])).toBeUndefined();
     });
 });

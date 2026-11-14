@@ -240,6 +240,13 @@
 					"scope": "application",
 					"default": true
 				},
+				"remote.SSH.tmux.orphanMaxAgeDays": {
+					"type": "integer",
+					"markdownDescription": "Close a persistent terminal that no window has been attached to and that has had no activity for this many days — for example one left behind by a folder that was renamed or never reopened. Checked when connecting. `0` keeps such terminals forever.",
+					"scope": "application",
+					"default": 14,
+					"minimum": 0
+				},
 				"remote.SSH.tmux.setDefaultProfile": {
 					"type": "boolean",
 					"markdownDescription": "Make the tmux-backed \"Persistent Shell\" the default terminal profile, so a plain **New Terminal** is persistent without picking a profile. This writes `terminal.integrated.defaultProfile.<platform>` at **Workspace** scope — i.e. into `.vscode/settings.json` inside the remote folder, which is a tracked file in your repository. Set to `false` to leave your settings untouched and select \"Persistent Shell\" from the terminal dropdown manually.",

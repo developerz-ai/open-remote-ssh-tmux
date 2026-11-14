@@ -100,28 +100,35 @@ export const KILL_SESSIONS_CONFIRM_LABEL = 'Kill Sessions';
  */
 export const KILL_WORKSPACE_SESSIONS_COMMAND_ID = 'openremotessh.tmux.killWorkspaceSessions';
 
+/** One (host, workspace) identity the workspace's sessions are named by. A workspace can
+ * have two — its canonical identity and a legacy one older versions used — and the kill must
+ * cover both, or a session not yet adopted would survive "kill all". */
+export interface WorkspaceSessionIdentity {
+    readonly hostKey: string;
+    readonly workspaceKey: string;
+}
+
 /**
  * The reaper capability the kill command needs, declared here as a narrow local
  * interface (ISP) so this module depends on a behaviour, not on the tmux layer's
- * types: force-kill every persistent session of one (host, workspace), returning the
+ * types: force-kill every persistent session of the workspace's identities, returning the
  * count. `SessionReaper` satisfies it structurally.
  */
 export interface WorkspaceSessionKiller {
     /** Resolves how many sessions were killed and how many could not be, or `undefined`
      * when the sessions could not be listed at all. */
-    killWorkspaceSessions(hostKey: string, workspaceKey: string): Promise<{ killed: number; failed: number } | undefined>;
+    killWorkspaceSessions(identities: readonly WorkspaceSessionIdentity[]): Promise<{ killed: number; failed: number } | undefined>;
 }
 
 /**
- * What the kill command operates on: the workspace-scoped killer and the
- * (host, workspace) identity to target. The wiring (`extension.ts`) resolves this
- * lazily from the live SSH connection + open workspace, and yields `undefined` when
- * there is no remote connection — so the command is a safe no-op off a remote.
+ * What the kill command operates on: the workspace-scoped killer and the identities to
+ * target. The wiring (`extension.ts`) resolves this lazily from the live SSH connection +
+ * open workspace, and yields `undefined` when there is no remote connection — so the
+ * command is a safe no-op off a remote.
  */
 export interface WorkspaceKillTarget {
     readonly reaper: WorkspaceSessionKiller;
-    readonly hostKey: string;
-    readonly workspaceKey: string;
+    readonly identities: readonly WorkspaceSessionIdentity[];
 }
 
 /**
@@ -131,10 +138,12 @@ export interface WorkspaceKillTarget {
  * force-kill to the reaper. Deliberately thin: it owns no tmux/session logic and
  * builds no command lines (the reaper does, via module 02). `resolveTarget` is
  * injected so the SSH-connection/workspace plumbing stays in `extension.ts` and this
- * handler is unit-testable.
+ * handler is unit-testable; it may resolve asynchronously (the identity reads the SSH config).
  */
-export async function killWorkspaceSessions(resolveTarget: () => WorkspaceKillTarget | undefined): Promise<void> {
-    const target = resolveTarget();
+export async function killWorkspaceSessions(
+    resolveTarget: () => WorkspaceKillTarget | undefined | Promise<WorkspaceKillTarget | undefined>,
+): Promise<void> {
+    const target = await resolveTarget();
     if (!target) {
         // Off a remote (or before resolve completes) there is nothing to kill.
         vscode.window.showInformationMessage('Remote-SSH: Not connected to a remote — no persistent terminal sessions to kill.');
@@ -149,7 +158,15 @@ export async function killWorkspaceSessions(resolveTarget: () => WorkspaceKillTa
     if (choice !== KILL_SESSIONS_CONFIRM_LABEL) {
         return; // cancelled — leave every session untouched
     }
+    await closeWorkspaceSessions(target);
+}
 
+/**
+ * Kill the workspace's sessions and tell the user what actually happened — the part of the
+ * kill command after its confirm, shared with the "terminals are still running" offer that
+ * follows turning persistent terminals off (whose own buttons are the confirmation).
+ */
+export async function closeWorkspaceSessions(target: WorkspaceKillTarget): Promise<void> {
     // `WorkspaceSessionKiller` is a structural interface (ISP) — the concrete
     // `SessionReaper` never rejects, but nothing here guarantees every current or
     // future implementation upholds that. Guard the call so a rejection surfaces
@@ -158,7 +175,7 @@ export async function killWorkspaceSessions(resolveTarget: () => WorkspaceKillTa
     // reaper confirmed it, and an unreachable remote is an error — never a cheerful "Killed 0".
     let outcome: { killed: number; failed: number } | undefined;
     try {
-        outcome = await target.reaper.killWorkspaceSessions(target.hostKey, target.workspaceKey);
+        outcome = await target.reaper.killWorkspaceSessions(target.identities);
     } catch {
         outcome = undefined;
     }

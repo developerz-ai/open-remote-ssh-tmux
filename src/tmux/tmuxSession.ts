@@ -142,6 +142,10 @@ export interface TmuxSession {
     readonly paneDead: boolean;
     /** `#{session_created}` — unix epoch seconds. */
     readonly createdEpoch: number;
+    /** `#{session_activity}` — unix epoch seconds of the session's last activity (client
+     * input, attach), the age evidence of the orphan rule in {@link reapVerdict}.
+     * `undefined` for a row that did not carry it — and then the session is never aged out. */
+    readonly activityEpoch?: number;
     /** `#{@orst_owner}` — the client id of the window that last attached, or `undefined` for
      * a session that carries no tag (created before tags existed, or never attached by us). */
     readonly owner?: string;
@@ -169,6 +173,9 @@ export interface AttachOrCreateOptions {
     /** This window's client id, written into the session as {@link OWNER_OPTION}. Must have
      * {@link isClientId}'s shape — it is a tmux argv element, so anything else is refused. */
     readonly owner?: string;
+    /** Create detached and fail if the name exists (`new-session -d`, no `-A`): the claim
+     * form ({@link buildClaimSessionCommand}). Default false (attach-or-create). */
+    readonly detached?: boolean;
 }
 
 /** Inputs to the reap decision beyond the session itself. */
@@ -177,7 +184,16 @@ export interface ReapOptions {
      * create/list race (a pane that dies the instant it spawns) from being killed
      * before it stabilises. Default 0. */
     readonly minAgeSeconds?: number;
+    /** `remote.SSH.tmux.orphanMaxAgeDays`: a detached session of ours with no activity for
+     * this many days is an abandoned orphan and is reaped. `0`, absent, or anything that is
+     * not a positive integer disables aging. */
+    readonly orphanMaxAgeDays?: number;
 }
+
+/** The `remote.SSH.tmux.orphanMaxAgeDays` default (package.json). */
+export const DEFAULT_ORPHAN_MAX_AGE_DAYS = 14;
+
+const SECONDS_PER_DAY = 86400;
 
 /**
  * Deterministic session name for a (host, workspace, terminal-slot) triple:
@@ -235,6 +251,37 @@ export function isOurSession(name: string): boolean {
     return OWNED_SESSION_RE.test(name);
 }
 
+/** The resolved SSH target a window connects to — what the session identity is keyed on. */
+export interface SshTarget {
+    /** `HostName` from the user's SSH config (tokens expanded), else the host as typed. */
+    readonly hostName: string;
+    readonly user: string;
+    readonly port: number;
+}
+
+/**
+ * The host half of the session identity: the target the connection actually reaches, not
+ * the alias the user typed. Keyed on the alias, `myvps`, `203.0.113.7` and `myvps.lan` were
+ * three identities for one machine, so a hand-off between a PC that uses the alias and a
+ * laptop that uses the address silently never matched. The user and port are part of it:
+ * a different account is a different tmux server, and a different port can be another
+ * machine behind the same address. Host names are case-insensitive (DNS), so lower-cased.
+ */
+export function canonicalHostKey(target: SshTarget): string {
+    return `${target.user}@${target.hostName.toLowerCase()}:${target.port}`;
+}
+
+/**
+ * The workspace half of the session identity: the folder path with repeated slashes
+ * collapsed and the trailing one stripped, so `/srv/proj`, `/srv/proj/` and `//srv/proj`
+ * are one workspace. The root stays `/`. Symlinks are NOT resolved — that needs the remote
+ * (`realpath`) and would move the identity of every session when a link is retargeted.
+ */
+export function canonicalWorkspaceKey(path: string): string {
+    const collapsed = path.replace(/\/{2,}/g, '/');
+    return collapsed.length > 1 ? collapsed.replace(/\/$/, '') : collapsed;
+}
+
 /**
  * `cwd` as tmux must receive it to land in exactly that directory. Two parts of tmux read
  * an argv element even though no shell does (both verified on 2.6 … 3.8 by the rig):
@@ -285,9 +332,8 @@ export function buildAttachOrCreateArgv(
     const tmux = jobTmux(opts.tmuxPath ?? TMUX_BIN);
     // `-D` must sit with the other `new-session` flags, before `-s`: it is a flag of the
     // attach behaviour `-A` selects, not a standalone command.
-    const create = opts.takeOver
-        ? ['new-session', '-A', '-D', '-s', name, '-c', tmuxLiteralPath(cwd)]
-        : ['new-session', '-A', '-s', name, '-c', tmuxLiteralPath(cwd)];
+    const mode = opts.detached ? ['-d'] : opts.takeOver ? ['-A', '-D'] : ['-A'];
+    const create = ['new-session', ...mode, '-s', name, '-c', tmuxLiteralPath(cwd)];
     if (shell !== undefined) {
         create.push(shell);
     }
@@ -379,6 +425,36 @@ export function buildAttachOrCreateArgv(
 }
 
 /**
+ * Claim a brand-new slot ON THE REMOTE before handing it to a terminal: the attach chain of
+ * {@link buildAttachOrCreateArgv} with a detached create (`new-session -d`, no `-A`), run
+ * through a shell. tmux runs one client's command list without interleaving another's, so
+ * of two machines claiming the same name at once exactly one creates it and the other gets
+ * `duplicate session` (see {@link isDuplicateSession}) and moves on to the next slot. The
+ * terminal's own argv then attaches the session that now exists. Without it, both machines
+ * read "slot 0 is free", both returned `new-session -A -s <slot 0>`, and the second spawn
+ * attached to the first's brand-new session: one shell, two machines, mirrored (reproduced on
+ * the rig).
+ *
+ * Below 3.7 the chain borrows the GLOBAL `history-limit` around the create; a refused create
+ * aborts the chain before its restore, so the restore is repeated here on failure (the saved
+ * value is the one this chain just stored).
+ */
+export function buildClaimSessionCommand(name: string, cwd: string, opts: Omit<AttachOrCreateOptions, 'takeOver' | 'detached'> = {}): string {
+    const tmux = escapeShellArg(opts.tmuxPath ?? TMUX_BIN);
+    const argv = buildAttachOrCreateArgv(name, cwd, undefined, { ...opts, detached: true });
+    const chain = `${tmux} ${argv.map(escapeShellArg).join(' ')}`;
+    if (tmuxFeatures(opts.tmuxVersion).liveHistoryLimit) {
+        return chain;
+    }
+    return `${chain} || { rc=$?; ${tmux} set-option -gF history-limit ${escapeShellArg(`#{${SAVED_HISTORY_OPTION}}`)}; (exit $rc); }`;
+}
+
+/** tmux's refusal to create a session whose name already exists. */
+export function isDuplicateSession(stderr: string): boolean {
+    return /duplicate session/.test(stderr);
+}
+
+/**
  * `tmux list-sessions` with a stable `-F` format — the reap/restore paths must
  * parse machine output, never the localised human table. `#{pane_dead}` reports the
  * session's active pane's dead state (tmux resolves a session format against its
@@ -389,8 +465,13 @@ export function buildAttachOrCreateArgv(
  */
 export function buildListSessions(tmuxPath = TMUX_BIN): string {
     return `${escapeShellArg(tmuxPath)} list-sessions -F `
-        + escapeShellArg(`#{session_name} #{session_attached} #{session_windows} #{session_created} #{pane_dead} ${OWNER_FIELD}#{${OWNER_OPTION}}`);
+        + escapeShellArg(`#{session_name} #{session_attached} #{session_windows} #{session_created} #{pane_dead} `
+            + `${ACTIVITY_FIELD}#{session_activity} ${OWNER_FIELD}#{${OWNER_OPTION}}`);
 }
+
+/** Prefix of the activity field in a {@link buildListSessions} row — tagged like the owner
+ * field, so a row from before it existed (or a fixture) still parses unambiguously. */
+const ACTIVITY_FIELD = 'a:';
 
 /** Prefix of the owner field in a {@link buildListSessions} row. An untagged session prints
  * just the prefix, so the field is always exactly one token and the numeric fields stay
@@ -488,6 +569,16 @@ export function buildHasSession(name: string, tmuxPath = TMUX_BIN): string {
 /** `tmux kill-session -t =<name>`. */
 export function buildKillSession(name: string, tmuxPath = TMUX_BIN): string {
     return `${escapeShellArg(tmuxPath)} kill-session -t =${escapeShellArg(name)}`;
+}
+
+/** `tmux rename-session -t =<from> <to>` — moves a session of the legacy (alias-keyed)
+ * identity to its canonical name. The process inside and any attached client are untouched.
+ * `to` must be a name this extension mints; anything else is a programming error. */
+export function buildRenameSession(from: string, to: string, tmuxPath = TMUX_BIN): string {
+    if (!isOurSession(to)) {
+        throw new Error(`refusing to rename to a foreign session name: ${JSON.stringify(to)}`);
+    }
+    return `${escapeShellArg(tmuxPath)} rename-session -t =${escapeShellArg(from)} ${escapeShellArg(to)}`;
 }
 
 /** Tag on each answer line of {@link buildHasSessionsCommand}. */
@@ -588,6 +679,7 @@ export function parseListSessions(stdout: string): TmuxSession[] {
         // The owner field is optional on read: rows from before it existed (and test fixtures)
         // carry five fields.
         const ownerToken = tokens[tokens.length - 1].startsWith(OWNER_FIELD) ? tokens.pop()! : undefined;
+        const activityToken = tokens[tokens.length - 1].startsWith(ACTIVITY_FIELD) ? tokens.pop()! : undefined;
         if (tokens.length < 5) {
             continue;
         }
@@ -605,6 +697,7 @@ export function parseListSessions(stdout: string): TmuxSession[] {
             windows,
             paneDead: paneDeadFlag > 0,
             createdEpoch,
+            activityEpoch: activityToken === undefined ? undefined : toNonNegativeInt(activityToken.slice(ACTIVITY_FIELD.length)),
             owner: ownerToken === undefined || ownerToken === OWNER_FIELD ? undefined : ownerToken.slice(OWNER_FIELD.length),
         });
     }
@@ -629,34 +722,47 @@ export function readListSessionsResult(result: {
 }
 
 /**
- * Conservative reap decision — pure, with the clock injected (`now`, epoch
- * seconds; no `Date.now()` inside). Reap iff the session is one of OURS, is not
- * attached, is a genuine corpse (its active pane is dead — the process exited but
- * the session lingers under `remain-on-exit`), and has cleared the startup grace
- * window. When in doubt, keep: a foreign session, an attached session, or any
- * session with a live pane (a detached long-running task) is never touched.
+ * What the reaper may do with one session — pure, clock injected (`now`, epoch seconds).
+ *  - `reap-corpse` — ours, detached, its pane is dead (the process exited but the session
+ *    lingers under `remain-on-exit`), and past the startup grace;
+ *  - `reap-orphan` — ours, detached, live, and with no activity for `orphanMaxAgeDays`:
+ *    abandoned. Nothing else ever cleans these up — a folder that was renamed or never
+ *    reopened leaves its sessions running with no window that will list, restore or adopt
+ *    them (the zombie this fork exists to prevent);
+ *  - `orphan` — ours, detached and live, but not (or not yet) aged out: kept, and counted;
+ *  - `keep` — everything else: a foreign name, an attached session, a young corpse.
  *
- * The gate is `paneDead`, NOT `windows`: gating on `windows === 0` was a no-op,
- * because tmux destroys a session when its last window closes (we set
- * `remain-on-exit off`), so an owned session never appears with 0 windows — a
- * corpse surfaces as a live-window/dead-pane session instead. That unreachable
- * predicate is what left the reaper doing nothing; `paneDead` is what makes it fire.
+ * The owner tag is deliberately not consulted: a session another machine last attached is
+ * still an orphan once nobody is attached and it has been idle that long.
+ *
+ * The corpse gate is `paneDead`, NOT `windows`: tmux destroys a session when its last
+ * window closes (we set `remain-on-exit off`), so an owned session never appears with 0
+ * windows — a corpse surfaces as a live-window/dead-pane session instead.
  */
+export type ReapVerdict = 'reap-corpse' | 'reap-orphan' | 'orphan' | 'keep';
+
+export function reapVerdict(session: TmuxSession, now: number, opts: ReapOptions = {}): ReapVerdict {
+    if (!isOurSession(session.name) || session.attached) {
+        return 'keep';
+    }
+    if (session.paneDead) {
+        const minAgeSeconds = opts.minAgeSeconds ?? 0;
+        return now - session.createdEpoch < minAgeSeconds ? 'keep' : 'reap-corpse';
+    }
+    const days = opts.orphanMaxAgeDays;
+    const agingOn = days !== undefined && Number.isInteger(days) && days > 0;
+    if (agingOn && session.activityEpoch !== undefined && now - session.activityEpoch >= days * SECONDS_PER_DAY) {
+        return 'reap-orphan';
+    }
+    return 'orphan';
+}
+
+/** Conservative reap decision: true iff {@link reapVerdict} licenses a kill. When in doubt,
+ * keep — a foreign session, an attached session, or a detached live one still in use within
+ * the aging window is never touched. */
 export function shouldReap(session: TmuxSession, now: number, opts: ReapOptions = {}): boolean {
-    if (!isOurSession(session.name)) {
-        return false;
-    }
-    if (session.attached) {
-        return false;
-    }
-    if (!session.paneDead) {
-        return false;
-    }
-    const minAgeSeconds = opts.minAgeSeconds ?? 0;
-    if (now - session.createdEpoch < minAgeSeconds) {
-        return false;
-    }
-    return true;
+    const verdict = reapVerdict(session, now, opts);
+    return verdict === 'reap-corpse' || verdict === 'reap-orphan';
 }
 
 /** Parse a token as a non-negative integer, or `undefined` if it is not one. */

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { SLOT_MAPPING_STATE_KEY, TmuxTerminalProvider } from '../../src/tmux/terminalProvider';
+import { REVIVE_DEADLINE_MS, REVIVE_GRACE_MS, REVIVE_QUIET_MS, SLOT_MAPPING_STATE_KEY, TmuxTerminalProvider } from '../../src/tmux/terminalProvider';
 import { createRemoteExec } from '../../src/tmux/remoteExec';
-import { buildAttachOrCreateArgv, buildDetachClientsCommand, buildKillSession, sessionName } from '../../src/tmux/tmuxSession';
+import { buildAttachOrCreateArgv, buildDetachClientsCommand, buildKillSession, buildRenameSession, sessionName } from '../../src/tmux/tmuxSession';
 
 // The terminal provider is the user-facing heart of the fork: it decides which
 // tmux session (slot) each VS Code terminal maps to. Both hard invariants live
@@ -132,13 +132,14 @@ function makeProvider(over: {
     handOff?: import('../../src/tmux/slotState').HandOffPolicy;
     offerTakeOver?: () => Promise<boolean>;
     staleClientSeconds?: number;
+    ctx?: import('../../src/tmux/terminalProvider').TmuxSessionContext;
 } = {}) {
     const opened = over.opened ?? [];
     const exec = over.exec ?? fakeExec();
     const state = over.state ?? fakeState();
     const log = { info: vi.fn(), trace: vi.fn() };
     const provider = new TmuxTerminalProvider({
-        ctx: { hostKey: HOST, workspaceKey: WS, cwd: CWD },
+        ctx: over.ctx ?? { hostKey: HOST, workspaceKey: WS, cwd: CWD },
         // `code` defaults to 0 so a fake that omits it reads as tmux succeeding.
         exec: over.rawExec ?? (async (command: string) => ({ code: 0, ...await exec(command) })),
         state,
@@ -200,46 +201,79 @@ describe('slot allocation', () => {
     });
 });
 
-describe('no-steal TOCTOU (re-probe immediately before returning)', () => {
-    // The no-steal guard reads a `list-sessions` snapshot, but VS Code spawns the
-    // tmux process only *after* provideTerminalProfile returns — a window this code
-    // cannot observe. A single snapshot is therefore TOCTOU: another client can
-    // attach the chosen slot in between. The provider re-probes as the last remote
-    // read before committing to *shrink* (never close) that window, re-picking a
-    // slot taken since the first snapshot instead of stealing it.
+describe('atomic slot claim (05 l: two machines opening a terminal at the same moment)', () => {
+    // The no-steal guard reads a `list-sessions` snapshot, but VS Code spawns the tmux
+    // process only *after* provideTerminalProfile returns. Two machines pressing "New
+    // Terminal" together both read "slot 0 is free" and both returned `new-session -A` on
+    // it: the second spawn attached to the first one's brand-new session (reproduced on the
+    // rig). The chosen slot is now created on the remote (`new-session -d`, refused when the
+    // name exists) before it is handed out; a refused claim moves on to the next slot.
 
-    it('skips a slot taken (attached elsewhere) between the first snapshot and returning', async () => {
-        // First `list-sessions`: empty → slot 0 looks free. Every later one: slot 0
-        // is now attached by another client. Without the re-probe the provider hands
-        // out slot 0 (a steal); with it, the fresher snapshot pushes it to slot 1.
-        let listCalls = 0;
-        const exec = vi.fn(async (command: string) => {
-            if (command.includes('list-sessions')) {
-                listCalls++;
-                return { stdout: listCalls === 1 ? '' : row(name(0), true), stderr: '' };
+    /** A remote that refuses the claim of `taken` names as duplicates. */
+    function claimExec(taken: string[] = [], opts: { throwOnClaim?: boolean } = {}) {
+        return vi.fn(async (command: string): Promise<ExecResult> => {
+            if (command.includes('\'new-session\' \'-d\'')) {
+                if (opts.throwOnClaim) {
+                    throw new Error('connection reset');
+                }
+                const claimed = taken.find(n => command.includes(`'${n}'`));
+                return claimed ? { stdout: '', stderr: `duplicate session: ${claimed}`, code: 1 } : { stdout: '', stderr: '', code: 0 };
             }
-            return { stdout: '', stderr: '' };
+            return { stdout: '', stderr: '', code: 0 };
         });
+    }
+    const claims = (exec: ReturnType<typeof claimExec>): string[] =>
+        exec.mock.calls.map(call => call[0]).filter(command => command.includes('\'new-session\' \'-d\''));
+
+    it('creates the chosen slot on the remote, then hands out an attach of it', async () => {
+        const exec = claimExec();
         const { provider } = makeProvider({ exec });
 
-        expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(1));
-        expect(listCalls).toBeGreaterThanOrEqual(2); // re-probed before returning
+        const options = optionsOf(await provider.provideTerminalProfile());
+
+        expect(targetSession(options)).toBe(name(0));
+        expect(claims(exec)).toHaveLength(1);
+        expect(claims(exec)[0]).toContain(`'${name(0)}'`);
+        expect(options.shellArgs).toContain('-A'); // the terminal attaches what the claim created
     });
 
-    it('keeps its chosen slot when the re-probe shows only an unrelated slot taken', async () => {
-        // A re-probe revealing another client on some *other* slot must not bump a
-        // new terminal off a slot that is still free.
-        let listCalls = 0;
-        const exec = vi.fn(async (command: string) => {
-            if (command.includes('list-sessions')) {
-                listCalls++;
-                return { stdout: listCalls === 1 ? '' : row(name(5), true), stderr: '' };
-            }
-            return { stdout: '', stderr: '' };
-        });
+    it('moves on to the next slot when another machine claimed this one first', async () => {
+        const exec = claimExec([name(0), name(1)]);
+        const { provider } = makeProvider({ exec });
+
+        expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(2));
+        expect(claims(exec)).toHaveLength(3);
+    });
+
+    it('keeps the slot when the claim cannot be delivered (the snapshot already said free)', async () => {
+        const exec = claimExec([], { throwOnClaim: true });
         const { provider } = makeProvider({ exec });
 
         expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(0));
+    });
+
+    it('gives up on a remote that refuses every slot with a plain shell, never a guessed slot', async () => {
+        const exec = vi.fn(async (command: string): Promise<ExecResult> => command.includes('\'new-session\' \'-d\'')
+            ? { stdout: '', stderr: 'duplicate session: x', code: 1 }
+            : { stdout: '', stderr: '', code: 0 });
+        const { provider } = makeProvider({ exec });
+
+        expect(optionsOf(await provider.provideTerminalProfile())).toEqual({});
+        // ...and holds no slot for it.
+        exec.mockImplementation(async () => ({ stdout: '', stderr: '', code: 0 }));
+        expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(0));
+    });
+
+    it('a restored session is not claimed (it exists already)', async () => {
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const exec = fakeExec({ list: [row(name(0), false)], existing: [name(0)] });
+        const { provider } = makeProvider({ state, exec, reviveGraceMs: 30, reviveDeadlineMs: 300 });
+
+        const init = provider.initialize();
+        await provider.provideTerminalProfile();
+        await init;
+
+        expect(exec.mock.calls.some(call => call[0].includes('\'new-session\' \'-d\''))).toBe(false);
     });
 });
 
@@ -280,16 +314,14 @@ describe('no-steal guard under a probe failure', () => {
         expect(optionsOf(await provider.provideTerminalProfile())).toEqual({});
     });
 
-    it('keeps the slot chosen from a good snapshot when only the re-probe fails', async () => {
-        // The re-probe only narrows the TOCTOU window; losing it is no reason to drop to a
+    it('keeps the slot chosen from a good snapshot when only the claim fails', async () => {
+        // The claim only closes the two-machine race; losing it is no reason to drop to a
         // plain shell when a fresh snapshot already said the slot is free.
-        let listCalls = 0;
         const exec = vi.fn(async (command: string): Promise<ExecResult> => {
             if (command.includes('list-sessions')) {
-                listCalls++;
-                if (listCalls === 1) {
-                    return { stdout: row(name(0), true), stderr: '' };
-                }
+                return { stdout: row(name(0), true), stderr: '' };
+            }
+            if (command.includes('\'new-session\' \'-d\'')) {
                 throw new Error('connection reset');
             }
             return { stdout: '', stderr: '' };
@@ -598,7 +630,8 @@ describe('explicit close kills the session (no invisible leftovers)', () => {
         [2, 'shell process exit'],
         [0, 'unknown'],
     ])('never kills when the terminal closed for reason %i (%s)', async (reason) => {
-        const { exec, provider } = await openThenClose(reason);
+        // The session is still there afterwards (only the user's close may end it).
+        const { exec, provider } = await openThenClose(reason, { exec: fakeExec({ list: [row(name(0), false)] }) });
 
         expect(kills(exec)).toEqual([]);
         expect(provider.mappedSlots()).toEqual([0]); // still restorable on the next connect
@@ -609,7 +642,7 @@ describe('explicit close kills the session (no invisible leftovers)', () => {
     // symmetric: wrongly keeping a session costs one stale terminal that the next reload
     // re-attaches, wrongly killing one destroys work that cannot be recovered. Keep it.
     it('never kills when the host reports no exit status at all (VS Code < 1.71)', async () => {
-        const { exec, provider } = await openThenClose(undefined);
+        const { exec, provider } = await openThenClose(undefined, { exec: fakeExec({ list: [row(name(0), false)] }) });
 
         expect(kills(exec)).toEqual([]);
         expect(provider.mappedSlots()).toEqual([0]);
@@ -1958,17 +1991,19 @@ describe('hand-off ownership (03: owner tag, staleness, offer)', () => {
             expect(lines).toHaveLength(1);
         });
 
-        it('keeps the mapping when the shell simply exited (session gone)', async () => {
+        // 05 (g): the session is gone, so the mapping goes too — keeping it only cost the
+        // next reconcile a has-session round-trip to find that out.
+        it('forgets the slot quietly when the shell simply exited (session gone)', async () => {
             const { provider, log } = await evict(2, '');
 
-            expect(provider.mappedSlots()).toEqual([0]);
+            expect(provider.mappedSlots()).toEqual([]);
             expect(log.info).not.toHaveBeenCalled();
         });
 
         it('does not probe on a window shutdown', async () => {
             const { exec, provider } = await evict(1, owned(name(0), true, OTHER));
 
-            expect(exec.mock.calls.filter(([command]) => command.includes('list-sessions'))).toHaveLength(2); // the two at open
+            expect(exec.mock.calls.filter(([command]) => command.includes('list-sessions'))).toHaveLength(1); // the snapshot at open
             expect(provider.mappedSlots()).toEqual([0]);
         });
     });
@@ -2024,5 +2059,389 @@ describe('hand-off ownership (03: owner tag, staleness, offer)', () => {
 
             await expect(provider.detachAll()).resolves.toBeUndefined();
         });
+    });
+});
+
+/** A promise and the function that settles it — for holding a remote call open. */
+function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>(res => {
+        resolve = res;
+    });
+    return { promise, resolve };
+}
+
+describe('overlapping reconciles (05 d: a reconnect inside the revive window)', () => {
+    // A reconnect re-plans while the first pass is still holding its restore queue open for
+    // VS Code's revive (up to ~12 s). Running the two passes concurrently let the second
+    // plan() clear the first's queue — so a revive arriving next found nothing and minted a
+    // NEW session (the 1.0.8/1.0.9 duplicate) — and let the first pass's cleanup wipe the
+    // reservations the second had just made. Passes now run one after the other.
+
+    it('keeps the restore queue intact and mints no slot twice', async () => {
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0), '1': name(1) } });
+        const exec = fakeExec({ list: [row(name(0), false), row(name(1), false)], existing: [name(0), name(1)] });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ state, exec, opened, reviveGraceMs: 30, reviveDeadlineMs: 300, reviveQuietMs: 30 });
+
+        const first = provider.initialize();
+        await provider.initialized;
+        const second = provider.initialize({ awaitRevive: false }); // the reconnect
+        const revivedProfile = await provider.provideTerminalProfile(); // VS Code's revive, late
+        await Promise.all([first, second]);
+
+        expect(targetSession(optionsOf(revivedProfile))).toBe(name(0));
+        // Slot 1 opened once, by whichever pass drained it — never twice, never a new slot.
+        expect(opened.map(targetSession)).toEqual([name(1)]);
+        expect(provider.mappedSlots()).toEqual([0, 1]);
+    });
+
+    it('does not let a reconnect\'s pass run while the first is still planning (deferred exec)', async () => {
+        const gate = deferred<void>();
+        const lists: number[] = [];
+        let calls = 0;
+        const rawExec = async (command: string) => {
+            if (command.includes('list-sessions')) {
+                lists.push(++calls);
+                if (calls === 1) {
+                    await gate.promise; // the first plan is stuck on the remote
+                }
+                return { stdout: row(name(0), false), stderr: '', code: 0 };
+            }
+            if (command.includes('has-session')) {
+                return { ...hasReply(command, () => ({ code: 0 })), code: 0 };
+            }
+            return { stdout: '', stderr: '', code: 0 };
+        };
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ state, rawExec, opened });
+
+        const first = provider.initialize({ awaitRevive: false });
+        const second = provider.initialize({ awaitRevive: false });
+        await new Promise(resolve => setTimeout(resolve, 10));
+        expect(lists).toEqual([1]); // the second pass waits its turn
+        gate.resolve();
+        await Promise.all([first, second]);
+
+        expect(opened.map(targetSession)).toEqual([name(0)]);
+    });
+
+    it('coalesces a storm of reconnects into one follow-up pass', async () => {
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const exec = fakeExec({ list: [row(name(0), false)], existing: [name(0)] });
+        const { provider } = makeProvider({ state, exec, reviveGraceMs: 20 });
+
+        const passes = [provider.initialize(), provider.initialize({ awaitRevive: false }), provider.initialize({ awaitRevive: false }), provider.initialize({ awaitRevive: false })];
+        await Promise.all(passes);
+
+        const lists = exec.mock.calls.filter(call => call[0].includes('list-sessions')).length;
+        expect(lists).toBe(2);
+    });
+
+    it('a pass that fails does not wedge the next one', async () => {
+        let fail = true;
+        const rawExec = async (command: string) => {
+            if (command.includes('list-sessions') && fail) {
+                fail = false;
+                throw new Error('channel closed');
+            }
+            return { stdout: '', stderr: '', code: 0 };
+        };
+        const { provider } = makeProvider({ rawExec });
+
+        await provider.initialize({ awaitRevive: false });
+        await expect(provider.initialize({ awaitRevive: false })).resolves.toBeUndefined();
+    });
+});
+
+describe('revive waits are named, and a reconnect during revive is safe (05 f)', () => {
+    it('exposes the three waits as named constants', () => {
+        expect([REVIVE_GRACE_MS, REVIVE_DEADLINE_MS, REVIVE_QUIET_MS]).toEqual([2500, 10000, 2000]);
+    });
+
+    it('a reconnect during the revive window neither cuts the window short nor opens a duplicate', async () => {
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const exec = fakeExec({ list: [row(name(0), false)], existing: [name(0)] });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ state, exec, opened, reviveGraceMs: 20, reviveDeadlineMs: 400 });
+
+        const init = provider.initialize();
+        await provider.initialized;
+        const refresh = provider.initialize({ awaitRevive: false });
+        await new Promise(resolve => setTimeout(resolve, 60)); // past the grace
+        const revivedProfile = await provider.provideTerminalProfile(); // the revive is still served
+        await Promise.all([init, refresh]);
+
+        expect(targetSession(optionsOf(revivedProfile))).toBe(name(0));
+        expect(opened).toEqual([]);
+    });
+});
+
+describe('slot claim survives a failed persist (05 e)', () => {
+    /** workspaceState whose writes reject (storage failure). */
+    function brokenState(initial: Record<string, unknown> = {}) {
+        const state = fakeState(initial);
+        return { ...state, update: async (): Promise<void> => { throw new Error('storage failure'); } };
+    }
+
+    it('still resolves a usable terminal when the mapping cannot be saved', async () => {
+        const { provider, log } = makeProvider({ state: brokenState() });
+
+        const profile = await provider.provideTerminalProfile();
+
+        expect(targetSession(optionsOf(profile))).toBe(name(0));
+        expect(log.trace).toHaveBeenCalledWith(expect.stringContaining('storage failure'));
+        // The slot is held by that terminal, so the next one gets its own.
+        expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(1));
+    });
+
+    it('serves a queued restore even when the mapping cannot be saved', async () => {
+        const state = brokenState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const exec = fakeExec({ list: [row(name(0), false)], existing: [name(0)] });
+        const { provider } = makeProvider({ state, exec, reviveGraceMs: 30, reviveDeadlineMs: 300 });
+
+        const init = provider.initialize().catch(() => undefined);
+        const profile = await provider.provideTerminalProfile();
+        await init;
+
+        expect(targetSession(optionsOf(profile))).toBe(name(0));
+    });
+
+    it('frees the slot and answers with a plain shell when building the terminal fails', async () => {
+        const { provider } = makeProvider({ tmuxVersion: '3.4' });
+        // A programming error past the claim (here: an owner id tmux would refuse).
+        (provider as unknown as { clientId: string }).clientId = 'not an id; kill-server';
+
+        const profile = await provider.provideTerminalProfile();
+
+        expect(optionsOf(profile)).toEqual({});
+        (provider as unknown as { clientId: string }).clientId = ME;
+        expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(0));
+    });
+});
+
+describe('close without a user reason (05 g)', () => {
+    const flush = (): Promise<void> => new Promise<void>(res => setTimeout(res, 0));
+
+    async function openThenClose(reason: number | undefined, list: string[]) {
+        const exec = fakeExec();
+        const made = makeProvider({ exec });
+        const profile = await made.provider.provideTerminalProfile(); // slot 0, list empty
+        exec.mockImplementation(async (command: string) => command.includes('list-sessions')
+            ? { stdout: list.join('\n'), stderr: '', code: 0 }
+            : { stdout: '', stderr: '', code: 0 });
+        const term = {
+            creationOptions: optionsOf(profile),
+            exitStatus: reason === undefined ? undefined : { code: 0, reason },
+        } as unknown as import('vscode').Terminal;
+        made.provider.handleTerminalOpened(term);
+        made.provider.handleTerminalClosed(term);
+        await flush();
+        await flush();
+        return { ...made, exec };
+    }
+
+    it('an absent reason (VS Code < 1.71) never kills, and is logged as unknown', async () => {
+        const { exec, log } = await openThenClose(undefined, [row(name(0), false)]);
+
+        expect(exec.mock.calls.some(call => call[0].includes('kill-session'))).toBe(false);
+        expect(log.trace).toHaveBeenCalledWith(expect.stringContaining('slot 0 closed (unknown)'));
+    });
+
+    it('says the session was kept only when it is still there', async () => {
+        const { log, provider } = await openThenClose(2, [row(name(0), false)]);
+
+        expect(log.trace).toHaveBeenCalledWith(expect.stringContaining('session kept'));
+        expect(provider.mappedSlots()).toEqual([0]);
+    });
+
+    it('says the session ended — and forgets it — when the shell exit took it down', async () => {
+        const { log, provider } = await openThenClose(2, []);
+
+        expect(log.trace).toHaveBeenCalledWith(expect.stringContaining('session ended'));
+        expect(log.trace).not.toHaveBeenCalledWith(expect.stringContaining('session kept'));
+        expect(provider.mappedSlots()).toEqual([]);
+    });
+});
+
+describe('dispose (05 b: the layer is switched off at runtime)', () => {
+    it('opens nothing after dispose, even with a restore still queued', async () => {
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const exec = fakeExec({ list: [row(name(0), false)], existing: [name(0)] });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ state, exec, opened, reviveGraceMs: 30, reviveDeadlineMs: 60 });
+
+        const init = provider.initialize();
+        await provider.initialized;
+        provider.dispose();
+        await init;
+
+        expect(opened).toEqual([]);
+    });
+
+    it('a profile requested after dispose is a plain shell', async () => {
+        const { provider } = makeProvider();
+        provider.dispose();
+
+        expect(optionsOf(await provider.provideTerminalProfile())).toEqual({});
+    });
+});
+
+describe('configure (05 b: settings changed without a reload)', () => {
+    it('new terminals use the new scrollback limit', async () => {
+        const { provider } = makeProvider({ historyLimit: 1000, tmuxVersion: '3.8' });
+        provider.configure({ historyLimit: 2000, handOff: 'auto' });
+
+        const args = optionsOf(await provider.provideTerminalProfile()).shellArgs ?? [];
+
+        expect(args.join(' ')).toContain('history-limit 2000');
+    });
+
+    it('the next reconcile applies the new hand-off policy', async () => {
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const exec = fakeExec({ list: [owned(name(0), true, OTHER)], existing: [name(0)] });
+        const offer = vi.fn(async () => false);
+        const { provider } = makeProvider({ state, exec, offerTakeOver: offer, handOff: 'never' });
+        provider.configure({ historyLimit: 50000, handOff: 'ask' });
+
+        await provider.initialize({ awaitRevive: false });
+
+        expect(offer).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('mappedSessionNames (05 a: what housekeeping must never age out)', () => {
+    it('lists the sessions this window maps', async () => {
+        const { provider } = makeProvider();
+        await provider.provideTerminalProfile();
+        await provider.provideTerminalProfile();
+
+        expect(provider.mappedSessionNames()).toEqual([name(0), name(1)]);
+    });
+});
+
+describe('legacy identity adoption (05 c: alias-keyed sessions move to the canonical name)', () => {
+    // Before 05 the session hash was keyed on the alias as typed and the raw folder path.
+    // The canonical identity hashes differently, so without adoption an upgrade would leave
+    // every running session under a name nothing looks up any more.
+    const LEGACY = { hostKey: 'myvps', workspaceKey: '/home/user/proj/' };
+    const legacy = (slot: number): string => sessionName(LEGACY.hostKey, LEGACY.workspaceKey, slot);
+    const ctx = { hostKey: HOST, workspaceKey: WS, cwd: CWD, legacy: LEGACY };
+
+    /** A fake remote whose sessions really get renamed, so a second pass sees the result. */
+    function renamingExec(initial: string[]) {
+        const rows = new Map(initial.map(line => [line.split(' ')[0], line]));
+        return vi.fn(async (command: string): Promise<ExecResult> => {
+            if (command.includes('list-sessions')) {
+                return { stdout: [...rows.values()].join('\n'), stderr: '', code: 0 };
+            }
+            const rename = /rename-session -t ='([^']*)' '([^']*)'/.exec(command);
+            if (rename) {
+                const line = rows.get(rename[1]);
+                if (!line) {
+                    return { stdout: '', stderr: `can't find session: ${rename[1]}`, code: 1 };
+                }
+                rows.delete(rename[1]);
+                rows.set(rename[2], line.replace(rename[1], rename[2]));
+                return { stdout: '', stderr: '', code: 0 };
+            }
+            if (command.includes('has-session')) {
+                return hasReply(command, target => rows.has(target) ? { code: 0 } : { code: 1, message: `can't find session: ${target}` });
+            }
+            return { stdout: '', stderr: '', code: 0 };
+        });
+    }
+    const renames = (exec: ReturnType<typeof renamingExec>): string[] =>
+        exec.mock.calls.map(call => call[0]).filter(command => command.includes('rename-session'));
+
+    it('renames a detached legacy session to the same canonical slot and restores it', async () => {
+        const exec = renamingExec([row(legacy(0), false)]);
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': legacy(0) } });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ ctx, exec, state, opened });
+
+        await provider.initialize({ awaitRevive: false });
+
+        expect(renames(exec)).toEqual([buildRenameSession(legacy(0), name(0))]);
+        expect(opened.map(targetSession)).toEqual([name(0)]);
+        expect(state.get(SLOT_MAPPING_STATE_KEY)).toEqual({ '0': name(0) });
+    });
+
+    it('adopts once: a later pass renames nothing', async () => {
+        const exec = renamingExec([row(legacy(0), false)]);
+        const { provider } = makeProvider({ ctx, exec });
+
+        await provider.initialize({ awaitRevive: false });
+        await provider.initialize({ awaitRevive: false });
+
+        expect(renames(exec)).toHaveLength(1);
+    });
+
+    it('moves to the next free canonical slot when the same slot is already taken', async () => {
+        const exec = renamingExec([row(name(0), false), row(legacy(0), false)]);
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ ctx, exec, opened });
+
+        await provider.initialize({ awaitRevive: false });
+
+        expect(renames(exec)).toEqual([buildRenameSession(legacy(0), name(1))]);
+        expect(opened.map(targetSession).sort()).toEqual([name(0), name(1)]);
+    });
+
+    it('never touches a legacy session another machine\'s client is on — and retries later', async () => {
+        const exec = renamingExec([owned(legacy(0), true, OTHER)]);
+        const { provider } = makeProvider({ ctx, exec });
+
+        await provider.initialize({ awaitRevive: false });
+        expect(renames(exec)).toEqual([]);
+
+        // The other machine let go; the next pass adopts it.
+        exec.mockClear();
+        const free = renamingExec([owned(legacy(0), false, OTHER)]);
+        exec.mockImplementation(free);
+        await provider.initialize({ awaitRevive: false });
+        expect(renames(exec)).toEqual([buildRenameSession(legacy(0), name(0))]);
+    });
+
+    it('adopts our own still-attached legacy session (the reload reconnected its pty) without a second tab', async () => {
+        const exec = renamingExec([owned(legacy(0), true, ME)]);
+        const opened: LaunchOptions[] = [];
+        // The reconnected pty still carries the legacy name in its argv.
+        const legacyTerminal = { creationOptions: { shellArgs: ['new-session', '-A', '-s', legacy(0)] }, dispose: vi.fn() } as unknown as import('vscode').Terminal;
+        const { provider } = makeProvider({ ctx, exec, opened, listTerminals: () => [legacyTerminal] });
+
+        await provider.initialize({ awaitRevive: false });
+
+        expect(renames(exec)).toEqual([buildRenameSession(legacy(0), name(0))]);
+        expect(opened).toEqual([]); // that tab IS slot 0 now
+        expect(provider.mappedSlots()).toEqual([0]);
+        // And it is recognised when VS Code reports it opening.
+        provider.handleTerminalOpened(legacyTerminal);
+        expect(legacyTerminal.dispose).not.toHaveBeenCalled();
+    });
+
+    it('a legacy session that vanished before the rename is not recreated', async () => {
+        const exec = renamingExec([row(legacy(0), false)]);
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': legacy(0) } });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ ctx, exec, state, opened });
+        exec.mockImplementation(async (command: string) => {
+            if (command.includes('list-sessions')) {
+                return { stdout: command.includes('rename') ? '' : row(legacy(0), false), stderr: '', code: 0 };
+            }
+            if (command.includes('rename-session')) {
+                return { stdout: '', stderr: `can't find session: ${legacy(0)}`, code: 1 };
+            }
+            if (command.includes('has-session')) {
+                return hasReply(command, target => ({ code: 1, message: `can't find session: ${target}` }));
+            }
+            return { stdout: '', stderr: '', code: 0 };
+        });
+
+        await provider.initialize({ awaitRevive: false });
+
+        expect(opened).toEqual([]);
+        expect(provider.mappedSlots()).toEqual([]);
     });
 });

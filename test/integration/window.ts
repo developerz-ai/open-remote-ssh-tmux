@@ -1,7 +1,7 @@
 import type * as vscode from 'vscode';
 import { resolveClientId } from '../../src/tmux/clientIdentity';
 import type { HandOffPolicy } from '../../src/tmux/slotState';
-import { TmuxTerminalProvider, type OfferTakeOver } from '../../src/tmux/terminalProvider';
+import { TmuxTerminalProvider, type OfferTakeOver, type TmuxSessionContext } from '../../src/tmux/terminalProvider';
 import { RIG_TMUX, RigSession } from './rig';
 
 // A VS Code window, as far as the terminal layer can tell: the production
@@ -57,7 +57,7 @@ export class RigWindow {
     constructor(
         private readonly rig: RigSession,
         private readonly state: MachineState,
-        ctx: { hostKey: string; workspaceKey: string; cwd: string },
+        ctx: TmuxSessionContext,
         options: RigWindowOptions = {},
     ) {
         this.provider = new TmuxTerminalProvider({

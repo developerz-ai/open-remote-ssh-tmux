@@ -1,20 +1,26 @@
 import { describe, expect, it } from 'vitest';
 import {
     buildAttachOrCreateArgv,
+    buildClaimSessionCommand,
     buildDetachClientsCommand,
     buildHasSession,
     buildHasSessionsCommand,
     buildKillSession,
     buildListClientsCommand,
     buildListSessions,
+    buildRenameSession,
+    canonicalHostKey,
+    canonicalWorkspaceKey,
     clampHistoryLimit,
     classifyTmuxFailure,
     escapeShellArg,
+    isDuplicateSession,
     isOurSession,
     parseHasSessions,
     parseListClients,
     parseListSessions,
     readListSessionsResult,
+    reapVerdict,
     sessionName,
     sessionSlot,
     shouldReap,
@@ -105,7 +111,7 @@ describe('buildListSessions', () => {
         // `#{session_windows}` alone can never be 0 for a live session, so it is not it.
         expect(buildListSessions()).toBe(
             `'tmux' list-sessions -F `
-            + `'#{session_name} #{session_attached} #{session_windows} #{session_created} #{pane_dead} o:#{@orst_owner}'`,
+            + `'#{session_name} #{session_attached} #{session_windows} #{session_created} #{pane_dead} a:#{session_activity} o:#{@orst_owner}'`,
         );
     });
 
@@ -715,5 +721,171 @@ describe('buildDetachClientsCommand (explicit detach on window close)', () => {
 
     it('refuses a malformed owner', () => {
         expect(() => buildDetachClientsCommand([A], 'x;y')).toThrow();
+    });
+});
+
+describe('parseListSessions with the activity field (05: orphan aging)', () => {
+    it('reads #{session_activity} as activityEpoch', () => {
+        expect(parseListSessions('code-x-0 0 1 1700000000 0 a:1700000500 o:')[0]).toMatchObject({
+            name: 'code-x-0', createdEpoch: 1700000000, activityEpoch: 1700000500, owner: undefined,
+        });
+    });
+
+    it('reads activity alongside an owner tag, and a name with spaces', () => {
+        expect(parseListSessions('my s 0 1 1700000000 0 a:1700000001 o:1a2b3c4d-0011aabb')[0]).toMatchObject({
+            name: 'my s', activityEpoch: 1700000001, owner: '1a2b3c4d-0011aabb',
+        });
+    });
+
+    it('leaves activityEpoch undefined for rows without it, or with a non-numeric value', () => {
+        expect(parseListSessions('code-x-0 0 1 1700000000 0 o:')[0].activityEpoch).toBeUndefined();
+        expect(parseListSessions('code-x-0 0 1 1700000000 0 a: o:')[0].activityEpoch).toBeUndefined();
+    });
+});
+
+describe('shouldReap / reapVerdict: orphan aging (05)', () => {
+    const DAY = 86400;
+    const NOW = 1_800_000_000;
+    // Ours by name, detached, live pane, last touched `idleDays` ago.
+    const orphan = (idleDays: number, over: Partial<Parameters<typeof shouldReap>[0]> = {}) => ({
+        name: `code-${HASH_PROJ}-0`,
+        attached: false,
+        windows: 1,
+        paneDead: false,
+        createdEpoch: NOW - 100 * DAY,
+        activityEpoch: NOW - idleDays * DAY,
+        ...over,
+    });
+
+    it('reaps a detached session of ours idle past the limit', () => {
+        expect(shouldReap(orphan(15), NOW, { orphanMaxAgeDays: 14 })).toBe(true);
+        expect(reapVerdict(orphan(15), NOW, { orphanMaxAgeDays: 14 })).toBe('reap-orphan');
+    });
+
+    it('keeps one active within the limit, counted as an orphan', () => {
+        expect(shouldReap(orphan(13), NOW, { orphanMaxAgeDays: 14 })).toBe(false);
+        expect(reapVerdict(orphan(13), NOW, { orphanMaxAgeDays: 14 })).toBe('orphan');
+    });
+
+    it('never reaps an attached session, however old', () => {
+        expect(shouldReap(orphan(400, { attached: true }), NOW, { orphanMaxAgeDays: 14 })).toBe(false);
+        expect(reapVerdict(orphan(400, { attached: true }), NOW, { orphanMaxAgeDays: 14 })).toBe('keep');
+    });
+
+    it('never reaps a foreign name, however old', () => {
+        for (const name of ['main', 'code', 'code-notes', `code-${HASH_PROJ}-007`]) {
+            expect(shouldReap(orphan(400, { name }), NOW, { orphanMaxAgeDays: 14 })).toBe(false);
+            expect(reapVerdict(orphan(400, { name }), NOW, { orphanMaxAgeDays: 14 })).toBe('keep');
+        }
+    });
+
+    it('0 (or no setting) disables aging — the session is only counted', () => {
+        expect(shouldReap(orphan(400), NOW, { orphanMaxAgeDays: 0 })).toBe(false);
+        expect(shouldReap(orphan(400), NOW)).toBe(false);
+        expect(reapVerdict(orphan(400), NOW, { orphanMaxAgeDays: 0 })).toBe('orphan');
+    });
+
+    it('rejects a nonsensical limit (negative, fractional, NaN) as disabled', () => {
+        for (const days of [-1, 1.5, Number.NaN]) {
+            expect(shouldReap(orphan(400), NOW, { orphanMaxAgeDays: days })).toBe(false);
+        }
+    });
+
+    it('keeps a session whose activity could not be read (no evidence of age)', () => {
+        expect(shouldReap(orphan(400, { activityEpoch: undefined }), NOW, { orphanMaxAgeDays: 14 })).toBe(false);
+    });
+
+    it('an owner tag naming another machine does not protect a detached, aged session', () => {
+        expect(shouldReap(orphan(15, { owner: '1a2b3c4d-0011aabb' }), NOW, { orphanMaxAgeDays: 14 })).toBe(true);
+    });
+
+    it('a corpse is still a corpse (dead pane wins, no aging needed)', () => {
+        expect(reapVerdict(orphan(0, { paneDead: true }), NOW)).toBe('reap-corpse');
+    });
+});
+
+describe('canonicalHostKey / canonicalWorkspaceKey (05: one identity per real target)', () => {
+    it('an alias and the address it resolves to give the same key', () => {
+        // `myvps` with HostName 203.0.113.7 in ~/.ssh/config, versus typing the address.
+        expect(canonicalHostKey({ hostName: '203.0.113.7', user: 'dev', port: 22 }))
+            .toBe(canonicalHostKey({ hostName: '203.0.113.7', user: 'dev', port: 22 }));
+    });
+
+    it('is case-insensitive in the host name (DNS is)', () => {
+        expect(canonicalHostKey({ hostName: 'MyVPS.Example.com', user: 'dev', port: 22 }))
+            .toBe(canonicalHostKey({ hostName: 'myvps.example.com', user: 'dev', port: 22 }));
+    });
+
+    it('a different user or port is a different target', () => {
+        const base = canonicalHostKey({ hostName: 'h', user: 'dev', port: 22 });
+        expect(canonicalHostKey({ hostName: 'h', user: 'root', port: 22 })).not.toBe(base);
+        expect(canonicalHostKey({ hostName: 'h', user: 'dev', port: 2222 })).not.toBe(base);
+    });
+
+    it('spells the key as user@host:port', () => {
+        expect(canonicalHostKey({ hostName: 'h.example', user: 'dev', port: 2222 })).toBe('dev@h.example:2222');
+    });
+
+    it('strips trailing slashes and collapses repeated ones', () => {
+        expect(canonicalWorkspaceKey('/home/dev/proj/')).toBe('/home/dev/proj');
+        expect(canonicalWorkspaceKey('/home//dev///proj//')).toBe('/home/dev/proj');
+        expect(canonicalWorkspaceKey('/home/dev/proj')).toBe('/home/dev/proj');
+    });
+
+    it('keeps the root as /', () => {
+        expect(canonicalWorkspaceKey('/')).toBe('/');
+        expect(canonicalWorkspaceKey('//')).toBe('/');
+    });
+});
+
+describe('buildRenameSession (05: legacy identity adoption)', () => {
+    it('renames an exact target, both names quoted', () => {
+        expect(buildRenameSession(`code-${HASH_PROJ}-0`, `code-${HASH_OTHER_WS}-1`)).toBe(
+            `'tmux' rename-session -t ='code-${HASH_PROJ}-0' 'code-${HASH_OTHER_WS}-1'`,
+        );
+    });
+
+    it('runs the given tmux binary', () => {
+        expect(buildRenameSession('a', `code-${HASH_PROJ}-1`, '/opt/t mux')).toMatch(/^'\/opt\/t mux' rename-session /);
+    });
+
+    it('refuses to rename to a name we could not have minted', () => {
+        expect(() => buildRenameSession(`code-${HASH_PROJ}-0`, 'main; kill-server')).toThrow();
+    });
+});
+
+describe('buildClaimSessionCommand (05 l: a new slot is claimed on the remote before it is handed out)', () => {
+    const NAME = `code-${HASH_PROJ}-0`;
+    const OWNER = '1a2b3c4d-0011aabb';
+
+    it('is the attach chain with a detached create (-d, no -A), every word shell-quoted', () => {
+        const argv = buildAttachOrCreateArgv(NAME, '/srv/p', undefined, { tmuxVersion: '3.8', owner: OWNER, detached: true });
+        expect(argv.slice(0, 6)).toEqual(['new-session', '-d', '-s', NAME, '-c', '/srv/p']);
+        expect(argv).not.toContain('-A');
+        expect(buildClaimSessionCommand(NAME, '/srv/p', { tmuxVersion: '3.8', owner: OWNER }))
+            .toBe(`'tmux' ${argv.map(escapeShellArg).join(' ')}`);
+    });
+
+    it('below 3.7 puts the borrowed global history-limit back when the create fails (a duplicate)', () => {
+        const command = buildClaimSessionCommand(NAME, '/srv/p', { tmuxVersion: '3.4', owner: OWNER, tmuxPath: '/opt/tmux' });
+        expect(command).toContain(`'new-session' '-d' '-s' '${NAME}'`);
+        expect(command).toMatch(/ \|\| \{ rc=\$\?; '\/opt\/tmux' set-option -gF history-limit '#\{@orst_saved_hl\}'; \(exit \$rc\); \}$/);
+    });
+
+    it('has no restore fallback where nothing global is borrowed', () => {
+        expect(buildClaimSessionCommand(NAME, '/srv/p', { tmuxVersion: '3.8' })).not.toContain('||');
+    });
+
+    it('keeps a hostile path inert (single argv word, format chars escaped)', () => {
+        const command = buildClaimSessionCommand(NAME, '/srv/x\'; rm -rf ~; \'#(id)', { tmuxVersion: '3.8' });
+        expect(command).toContain(escapeShellArg('/srv/x\'; rm -rf ~; \'##(id)'));
+    });
+});
+
+describe('isDuplicateSession', () => {
+    it('recognises tmux\'s duplicate-session refusal and nothing else', () => {
+        expect(isDuplicateSession('duplicate session: code-abc-0')).toBe(true);
+        expect(isDuplicateSession('can\'t find session: x')).toBe(false);
+        expect(isDuplicateSession('')).toBe(false);
     });
 });

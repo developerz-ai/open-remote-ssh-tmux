@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { KILL_SESSIONS_CONFIRM_LABEL, killWorkspaceSessions, type WorkspaceKillTarget } from '../src/commands';
+import { closeWorkspaceSessions, KILL_SESSIONS_CONFIRM_LABEL, killWorkspaceSessions, type WorkspaceKillTarget } from '../src/commands';
 import { messageResponses, shownMessages } from './mocks/vscode';
 
 /** Terminology check: the confirm/result messages must stay operator-facing
@@ -14,6 +14,8 @@ const TMUX_JARGON = /tmux/i;
 
 const HOST = 'example.com';
 const WS = '/home/user/proj';
+/** The workspace's identities: canonical plus a legacy (alias-keyed) one still to adopt. */
+const IDENTITIES = [{ hostKey: HOST, workspaceKey: WS }, { hostKey: 'alias', workspaceKey: `${WS}/` }];
 
 /** What the reaper reports back: kill counts, or `undefined` when it could not list. */
 type Outcome = { killed: number; failed: number } | undefined;
@@ -21,7 +23,7 @@ type Outcome = { killed: number; failed: number } | undefined;
 /** A target whose reaper records how it was invoked. */
 function fakeTarget(outcome: Outcome = { killed: 3, failed: 0 }) {
     const kill = vi.fn(async (): Promise<Outcome> => outcome);
-    const target: WorkspaceKillTarget = { reaper: { killWorkspaceSessions: kill }, hostKey: HOST, workspaceKey: WS };
+    const target: WorkspaceKillTarget = { reaper: { killWorkspaceSessions: kill }, identities: IDENTITIES };
     return { target, kill };
 }
 
@@ -40,7 +42,7 @@ describe('killWorkspaceSessions command handler', () => {
         await killWorkspaceSessions(() => target);
 
         expect(shownMessages.warning).toHaveLength(1); // a confirm dialog was shown
-        expect(kill).toHaveBeenCalledWith(HOST, WS);
+        expect(kill).toHaveBeenCalledWith(IDENTITIES);
     });
 
     it('does nothing when the user dismisses/cancels the confirm', async () => {
@@ -64,7 +66,7 @@ describe('killWorkspaceSessions command handler', () => {
         const kill = vi.fn(async () => {
             throw new Error('ssh channel closed');
         });
-        const target: WorkspaceKillTarget = { reaper: { killWorkspaceSessions: kill }, hostKey: HOST, workspaceKey: WS };
+        const target: WorkspaceKillTarget = { reaper: { killWorkspaceSessions: kill }, identities: IDENTITIES };
         messageResponses.warning = KILL_SESSIONS_CONFIRM_LABEL;
 
         await expect(killWorkspaceSessions(() => target)).resolves.toBeUndefined();
@@ -102,8 +104,7 @@ describe('killWorkspaceSessions command handler', () => {
         const unreachable: Outcome = undefined;
         const target: WorkspaceKillTarget = {
             reaper: { killWorkspaceSessions: vi.fn(async () => unreachable) },
-            hostKey: HOST,
-            workspaceKey: WS,
+            identities: IDENTITIES,
         };
         messageResponses.warning = KILL_SESSIONS_CONFIRM_LABEL;
 
@@ -112,5 +113,36 @@ describe('killWorkspaceSessions command handler', () => {
         expect(shownMessages.information).toHaveLength(0);
         expect(shownMessages.error).toHaveLength(1);
         expect(String(shownMessages.error[0][0])).not.toMatch(TMUX_JARGON);
+    });
+});
+
+describe('killWorkspaceSessions: target resolved asynchronously', () => {
+    it('awaits a target that takes a moment to resolve (identity needs the SSH config)', async () => {
+        const { target, kill } = fakeTarget();
+        messageResponses.warning = KILL_SESSIONS_CONFIRM_LABEL;
+
+        await killWorkspaceSessions(async () => target);
+
+        expect(kill).toHaveBeenCalledWith(IDENTITIES);
+    });
+});
+
+describe('closeWorkspaceSessions: the kill without its modal (the settings-off offer already asked)', () => {
+    it('kills without a confirm and reports the outcome in plain language', async () => {
+        const { target, kill } = fakeTarget({ killed: 2, failed: 0 });
+
+        await closeWorkspaceSessions(target);
+
+        expect(kill).toHaveBeenCalledWith(IDENTITIES);
+        expect(shownMessages.warning).toHaveLength(0);
+        expect(String(shownMessages.information[0][0])).toContain('Killed 2 ');
+        expect(String(shownMessages.information[0][0])).not.toMatch(TMUX_JARGON);
+    });
+
+    it('reports an error when the sessions could not be listed', async () => {
+        const unreachable: Outcome = undefined;
+        await closeWorkspaceSessions({ reaper: { killWorkspaceSessions: vi.fn(async () => unreachable) }, identities: IDENTITIES });
+
+        expect(shownMessages.error).toHaveLength(1);
     });
 });

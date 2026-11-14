@@ -8,6 +8,8 @@
 // than an `SSHConnection`/`ssh2` handle, so the whole decision is pure and unit-
 // testable. It is also side-effect-free by design — no logging here; the caller
 // (the resolver wiring) logs one line from `reason`, keeping this module a leaf.
+// The second, advisory probe here (`probeLifetimeRisk`) asks whether the host ends a
+// user's processes at logout, which would take every terminal down on disconnect.
 // See docs/plans/2026/07/24/101-v1-tmux-release/03-remote-bootstrap.md.
 
 import { withDeadline } from '../common/deadline';
@@ -143,4 +145,57 @@ function versionMeetsFloor(versionToken: string): boolean | undefined {
         return major > FLOOR_MAJOR;
     }
     return minor >= FLOOR_MINOR;
+}
+
+/** What the remote's service manager says about the tmux server outliving the SSH login. */
+export interface LifetimeFacts {
+    /** logind's `KillUserProcesses`; `undefined` when it could not be read. */
+    readonly killUserProcesses?: boolean;
+    /** This user's `Linger`; `undefined` when it could not be read. Informational only. */
+    readonly linger?: boolean;
+    /** The terminals will probably not survive a disconnect on this host. */
+    readonly lifetimeRisk: boolean;
+}
+
+/**
+ * Ask systemd-logind whether it ends a user's processes at logout. The tmux server is
+ * started from the SSH login, so it lives in that login's session scope; with logind's
+ * `KillUserProcesses=yes` the scope — server and every terminal in it — is terminated when
+ * the connection closes. `Linger` is read too, for the log: it keeps the user's service
+ * manager running but does NOT exempt the session scope, so it does not change the verdict.
+ * `loginctl show-session` with no id prints the manager's properties. Each call is bounded
+ * by `timeout` where it exists (a wedged D-Bus must not hold the channel) and silenced; no
+ * loginctl at all (non-systemd, macOS) answers nothing, which reads as "unknown". One line:
+ * it runs under the remote login shell, and csh rejects a newline inside quotes.
+ */
+export const LIFETIME_PROBE_COMMAND = 'if command -v loginctl >/dev/null 2>&1; then '
+    + 't=; command -v timeout >/dev/null 2>&1 && t="timeout 3"; '
+    + '$t loginctl show-session -p KillUserProcesses 2>/dev/null; '
+    + '$t loginctl show-user "$(id -un)" -p Linger 2>/dev/null; fi; true';
+
+/** Read {@link LIFETIME_PROBE_COMMAND} output. Anything unrecognised is "unknown" — and
+ * unknown is never a risk: the warning is only worth showing on evidence. */
+export function parseLifetimeFacts(stdout: string): LifetimeFacts {
+    const flag = (key: string): boolean | undefined => {
+        const value = new RegExp(`^${key}=(yes|no)\\s*$`, 'm').exec(stdout)?.[1];
+        return value === undefined ? undefined : value === 'yes';
+    };
+    const killUserProcesses = flag('KillUserProcesses');
+    const linger = flag('Linger');
+    return {
+        ...(killUserProcesses === undefined ? {} : { killUserProcesses }),
+        ...(linger === undefined ? {} : { linger }),
+        lifetimeRisk: killUserProcesses === true,
+    };
+}
+
+/** Run the lifetime probe over a deadline-bounded runner. Never throws: a failed probe is
+ * "unknown". Kept apart from {@link probeTmux}, which the resolver awaits on every connect —
+ * this is advisory, so it must never be able to delay or fail the connect. */
+export async function probeLifetimeRisk(exec: TmuxExec): Promise<LifetimeFacts> {
+    try {
+        return parseLifetimeFacts((await exec(LIFETIME_PROBE_COMMAND)).stdout);
+    } catch {
+        return { lifetimeRisk: false };
+    }
 }
