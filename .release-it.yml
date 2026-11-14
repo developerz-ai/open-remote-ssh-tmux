@@ -2,7 +2,11 @@ git:
   commitMessage: v${version}
   tagName: v${version}
   tagAnnotation: Release version ${version}
-  requireCleanWorkingDir: false
+  requireCleanWorkingDir: true
+hooks:
+  # Compile, lint and unit tests before anything is bumped or tagged. Not the docker
+  # tmux rig: CI runs that on every pull request and push to main.
+  before:init: bin/check
 npm:
   publish: false
 disable-metrics: true

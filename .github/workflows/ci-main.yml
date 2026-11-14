@@ -19,10 +19,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Install zizmor
-        run: |
-          pipx install zizmor
-
       - name: Setup Node.js environment
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -41,9 +37,18 @@ jobs:
         run: |
           npm test
 
+      # Not the full local gate: the dependency-advisory and workflow audits judge the
+      # outside world (new advisories, new rules) and so could red a change that touched
+      # nothing; they run on a schedule in audit.yml. fixpack rewrites package.json in
+      # place, so a diff after it means the committed manifest was not normalised.
+      - name: Lint package manifest
+        run: |
+          npm run lint:package
+          git diff --exit-code -- package.json
+
       - name: Lint code
         run: |
-          npm run lint:all
+          npm run lint
 
       - name: Lint commit
         # `github.event.before` cannot be handed to commitlint as-is. It is all-zeros when
@@ -80,6 +85,40 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.before }}
           HEAD_SHA: ${{ github.event.head_commit.id }}
+
+  package:
+    # Release packaging runs vsce on Node 22 (its locked toolchain needs >= 22.13, see
+    # check-packaging-node.js), not the repo's Node 20, so packaging breakage used to
+    # surface only at release. Package here on the release runtime, and hold the vsix to
+    # the .vscodeignore whitelist. Packaging builds first (vscode:prepublish).
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js environment
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: |
+          npm ci
+
+      - name: Check packaging Node compatibility
+        run: node .github/scripts/check-packaging-node.js
+
+      - name: Package
+        run: |
+          npm run package
+
+      - name: Check vsix contents
+        run: |
+          node .github/scripts/check-vsix-contents.js *.vsix
 
   tmux-rig:
     # Real tmux over real ssh2, one docker sshd per release (test/rig/). Its own job so

@@ -643,6 +643,11 @@ describe('package.json manifest drift guard', () => {
             expect(pkg.publisher).toBe('developerz-ai');
         });
 
+        it('declares the MIT license LICENSE.txt grants', () => {
+            expect(fs.readFileSync(path.join(repoRoot, 'LICENSE.txt'), 'utf8')).toMatch(/^MIT License/);
+            expect(pkg.license).toBe('MIT');
+        });
+
         it('repository url points at the fork org, not upstream jeanp413/open-remote-ssh', () => {
             const repository = pkg.repository as JsonObject;
             expect(repository.url).toContain('developerz-ai/open-remote-ssh-tmux');

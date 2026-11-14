@@ -21,21 +21,27 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          fetch-depth: 0
           persist-credentials: false
 
-      - name: Get Version
+      # Release exactly the tag that triggered this run, and only when it is the version
+      # package.json declares: the newest tag in the repository is not necessarily this one
+      # (a preview prerelease, an upstream tag), and a tag pushed without bumping
+      # package.json would otherwise publish a vsix that reports another version.
+      - name: Check tag matches package.json
         run: |
-          # Get the latest tag
-          LATEST_TAG=$(git tag --sort=-v:refname | head -n1)
-
-          if [ -z "$LATEST_TAG" ]; then
-            echo "No tags found in the repository"
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            echo "::error::Publish runs on a version tag, not on ${GITHUB_REF_TYPE} ${GITHUB_REF_NAME}"
             exit 1
           fi
 
-          echo "VERSION=$LATEST_TAG" >> $GITHUB_ENV
-          echo "Using version: $LATEST_TAG"
+          EXPECTED="v$(jq -r .version package.json)"
+          if [[ "${GITHUB_REF_NAME}" != "${EXPECTED}" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match package.json version ${EXPECTED}"
+            exit 1
+          fi
+
+          echo "VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          echo "Using version: ${GITHUB_REF_NAME}"
 
       - name: Check Existing Release
         run: |
@@ -75,21 +81,37 @@ jobs:
       # unmet engine floor, so the guard below turns that warning into a hard
       # failure before anything is packaged. Keep this pin in sync with preview.yml.
       - name: Setup Node.js
-        if: env.RELEASE_EXISTS == 'no'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
           package-manager-cache: false
 
-      - name: Check packaging Node compatibility
-        if: env.RELEASE_EXISTS == 'no'
-        run: node .github/scripts/check-packaging-node.js
-
-      - name: Build
-        if: env.RELEASE_EXISTS == 'no'
+      - name: Install dependencies
         run: |
           npm ci
 
+      # After `npm ci`: the guard reads the lockfile with `semver`, which it requires
+      # from node_modules.
+      - name: Check packaging Node compatibility
+        run: node .github/scripts/check-packaging-node.js
+
+      # The same gates a pull request passes, on the tagged commit itself: nothing is
+      # published that did not build, test and lint.
+      - name: Build
+        run: |
+          npm run build
+
+      - name: Test
+        run: |
+          npm test
+
+      - name: Lint code
+        run: |
+          npm run lint
+
+      - name: Package
+        if: env.RELEASE_EXISTS == 'no'
+        run: |
           npm run package
 
           VSIX_NAME=$(ls *.vsix)
@@ -113,7 +135,7 @@ jobs:
 
       - name: Release
         if: env.RELEASE_EXISTS == 'no'
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2 # zizmor: ignore[superfluous-actions]
         with:
           files: |
             ${{ env.VSIX_NAME }}

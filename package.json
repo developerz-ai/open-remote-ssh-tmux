@@ -4,6 +4,7 @@
 	"description": "Use any remote machine with a SSH server as your development environment.",
 	"version": "1.2.0",
 	"publisher": "developerz-ai",
+	"license": "MIT",
 	"repository": {
 		"type": "git",
 		"url": "https://github.com/developerz-ai/open-remote-ssh-tmux.git"
@@ -28,7 +29,7 @@
 		"lint": "eslint",
 		"lint:all": "npm run lint:package && npm audit && npm run ci:lint && npm run lint",
 		"lint:fix": "eslint --fix",
-		"lint:package": "fixpack || true",
+		"lint:package": "fixpack",
 		"package": "rimraf *.vsix && vsce package",
 		"postinstall": "node scripts/patch-ssh2.js && npm run update:dts",
 		"prepare": "husky; npm run lint:package",

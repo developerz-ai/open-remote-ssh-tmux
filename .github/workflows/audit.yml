@@ -1,0 +1,89 @@
+name: Scheduled audit
+
+# `npm audit` and zizmor judge the outside world (new advisories, new audit rules), so
+# on pull requests they would red a change that touched nothing. They run here instead
+# and report to one tracking issue: opened or commented on when something is found,
+# closed once a run comes back clean. `npm run lint:all` still runs both locally.
+
+on:
+  schedule:
+    - cron: 0 6 * * *
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+    env:
+      # Pinned so a new zizmor release (new rules) is a deliberate bump, not a surprise.
+      ZIZMOR_VERSION: '1.31.1'
+      ISSUE_TITLE: 'Scheduled audit: npm audit / zizmor findings'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js environment
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+
+      # Both tools run to completion so one finding does not hide the other. npm audit
+      # reads package-lock.json, so no install (and no install scripts) is needed.
+      - name: Run audits
+        id: audit
+        run: |
+          set +e
+          npm audit > npm-audit.txt 2>&1
+          echo "npm_audit=$?" >> "$GITHUB_OUTPUT"
+          pipx run --spec "zizmor==${ZIZMOR_VERSION}" zizmor . > zizmor.txt 2>&1
+          echo "zizmor=$?" >> "$GITHUB_OUTPUT"
+          cat npm-audit.txt zizmor.txt
+
+      - name: Report to the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NPM_AUDIT_STATUS: ${{ steps.audit.outputs.npm_audit }}
+          ZIZMOR_STATUS: ${{ steps.audit.outputs.zizmor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          ISSUE="$(gh issue list --state open --search "in:title \"${ISSUE_TITLE}\"" --json number,title \
+            --jq '.[] | select(.title == env.ISSUE_TITLE) | .number' | head -n1)"
+
+          if [[ "${NPM_AUDIT_STATUS}" == "0" && "${ZIZMOR_STATUS}" == "0" ]]; then
+            if [[ -n "${ISSUE}" ]]; then
+              gh issue close "${ISSUE}" --comment "Clean again as of ${RUN_URL}."
+            fi
+            exit 0
+          fi
+
+          {
+            echo "Scheduled audit found problems: ${RUN_URL}"
+            echo
+            echo "- \`npm audit\`: exit ${NPM_AUDIT_STATUS}"
+            echo "- zizmor ${ZIZMOR_VERSION}: exit ${ZIZMOR_STATUS}"
+            for report in npm-audit.txt zizmor.txt; do
+              echo
+              echo "<details><summary>${report}</summary>"
+              echo
+              echo '```'
+              tail -c 25000 "${report}"
+              echo '```'
+              echo "</details>"
+            done
+          } > issue-body.md
+
+          if [[ -n "${ISSUE}" ]]; then
+            gh issue comment "${ISSUE}" --body-file issue-body.md
+          else
+            gh issue create --title "${ISSUE_TITLE}" --body-file issue-body.md
+          fi
+          exit 1

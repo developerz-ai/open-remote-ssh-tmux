@@ -356,6 +356,20 @@ describe('publish runtime engine contract', () => {
             ).toBeLessThan(buildIndex);
         });
 
+        // The guard `require`s semver from node_modules, so on a fresh checkout it
+        // can only run once `npm ci` has installed it — before that it dies with
+        // MODULE_NOT_FOUND and the release never gets to package.
+        it.each(workflowFiles)('runs the guard after `npm ci` in %s', (file) => {
+            const contents = fs.readFileSync(file, 'utf8');
+
+            const installIndex = contents.indexOf('npm ci');
+            expect(installIndex, `${file} never runs npm ci`).toBeGreaterThan(-1);
+            expect(
+                installIndex,
+                `${file} runs the guard before npm ci — it cannot load semver yet`
+            ).toBeLessThan(contents.indexOf('node .github/scripts/check-packaging-node.js'));
+        });
+
         it('pins the same Node version in both workflows', () => {
             const versions = workflowFiles.map(file => {
                 const contents = fs.readFileSync(file, 'utf8');
