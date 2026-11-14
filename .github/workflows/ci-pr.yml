@@ -71,3 +71,35 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+  tmux-rig:
+    # Real tmux over real ssh2, one docker sshd per release (test/rig/). Its own job so
+    # `npm test` stays fast; a matrix so each release builds and fails on its own.
+    name: tmux rig (${{ matrix.tmux }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        tmux: ["2.6", "3.0a", "3.4", "3.5a", "3.8"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js environment
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: |
+          npm ci
+
+      - name: Real-tmux integration tests
+        run: |
+          npm run test:tmux -- "${TMUX_VERSION}"
+        env:
+          TMUX_VERSION: ${{ matrix.tmux }}
