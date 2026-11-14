@@ -77,6 +77,10 @@ remote install scripts) and is organised by responsibility. Preserve that; each 
 | `src/commands.ts` | Command handlers invoked from the palette / menus, including the kill-workspace-sessions command. Thin — delegate. |
 | `src/hostTreeView.ts` | The "SSH Targets" tree view (presentation only). |
 | `src/remoteLocationHistory.ts` | Persist & recall recently opened remote folders. |
+| `src/windowTarget.ts` *(new)* | Pure current-vs-new-window decision for the default connect/open actions (`remote.SSH.openInWindow`: `auto` reuses an empty local window) + the thin reader of the live window state. |
+| `src/hostPresentation.ts` *(new)* | Pure "what we show about a host": the connected host/folder (from `env.remoteAuthority` / the open folder), `user@hostname:port` from the SSH config, the tree rows' icon + description. |
+| `src/recentHosts.ts` *(new)* | MRU of connected destinations in `globalState` (the folder history only sees windows with a folder open). |
+| `src/connectQuickPick.ts` *(new)* | The "Connect to Host..." quick pick: recent hosts, other hosts, add/configure entries, a typed `[user@]host[:port]`. |
 | `src/ssh/sshConnection.ts` | The `ssh2` connection + tunnel primitives. |
 | `src/ssh/sshConfig.ts` | Parse & query the user's SSH config file. |
 | `src/ssh/sshDestination.ts` | Parse/format a `user@host:port` destination. |

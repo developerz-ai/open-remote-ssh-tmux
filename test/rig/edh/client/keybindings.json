@@ -3,5 +3,7 @@
 	{ "key": "ctrl+alt+shift+f2", "command": "workbench.action.reloadWindow" },
 	{ "key": "ctrl+alt+shift+f3", "command": "workbench.action.closeWindow" },
 	{ "key": "ctrl+alt+shift+f4", "command": "workbench.action.terminal.kill" },
-	{ "key": "ctrl+alt+shift+f5", "command": "workbench.action.terminal.focus" }
+	{ "key": "ctrl+alt+shift+f5", "command": "workbench.action.terminal.focus" },
+	{ "key": "ctrl+alt+shift+f6", "command": "openremotessh.openEmptyWindow" },
+	{ "key": "ctrl+alt+shift+f7", "command": "workbench.view.remote" }
 ]

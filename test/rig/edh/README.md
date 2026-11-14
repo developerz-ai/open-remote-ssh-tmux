@@ -29,7 +29,7 @@ minutes, then cached). Output: `EDH_OUT` (default a fresh `mktemp -d`) holds `re
 | `client.Dockerfile` | Debian + pinned VSCodium (`run.sh`: version + sha256) + Xvfb + xdotool + ImageMagick + `ss`; user `pc` |
 | `client/entrypoint.sh` | key + `~/.ssh/config` + pinned host key (`ssh-keyscan`), `argv.json` `enable-proposed-api` (as README "Activation"), Xvfb `:99 -nolisten tcp`, installs the mounted `.vsix` |
 | `client/settings.json` | quiet start-up, no confirmations, `remote.SSH.remotePlatform`, driver commands in `commandsToSkipShell`, and `-workbench.action.toggleSidebarVisibility` so Ctrl+B reaches the terminal (stock VS Code eats it — upstream behaviour, not this extension) |
-| `client/keybindings.json` | Ctrl+Alt+Shift+F1 new terminal, F2 reload window, F3 close window, F4 kill terminal, F5 focus terminal |
+| `client/keybindings.json` | Ctrl+Alt+Shift+F1 new terminal, F2 reload window, F3 close window, F4 kill terminal, F5 focus terminal, F6 Remote-SSH: Connect to Host..., F7 Remote Explorer |
 | `lib.sh` | remote probes, client control, `wait_until`/`wait_stable`/`expect` |
 | `rows/*.sh` | one per row; `# edh: machines=2` in the header starts the second client ("laptop") |
 
@@ -62,6 +62,7 @@ files removed. Rows that kill a machine (`23`) get a fresh one from the next row
 | `30-reconnect-storm` | 30 | remote `sshd: wedh` killed 3× in ~10 s → same 2 sessions, one client each, 2 tmux / 0 plain ptys |
 | `32-listener-audit` | 32 | `ss -ltnp`/`-lunp` in the client: every VSCodium-owned listener is loopback |
 | `35-keys-esc` | 35 | Ctrl-B → `0x02`, Esc → `0x1b`, each exactly once; worst Esc latency ≤ worst baseline + 100 ms (truecolor: screenshot) |
+| `40-open-in-window` | 40 | not the remote — the client's windows (`xdotool`, title set to carry `${remoteName}`): Connect to Host from an empty local window connects that window (1 window, remote); from a local-folder window it opens a second, remote one and keeps the local one; in SSH Targets the twistie only expands and a host-label click connects (new window from a remote one). Screenshots: the quick pick, the view (connected mark, tooltip, inline buttons) |
 
 "Tabs" are counted as the children of the remote VS Code pty host: one process per terminal
 VS Code keeps, `tmux: client` for ours and the login shell for a plain one. Both machines

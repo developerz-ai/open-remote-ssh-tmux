@@ -4,9 +4,13 @@ import Log from './common/logger';
 import { expandTokens, RemoteSSHResolver, REMOTE_SSH_AUTHORITY } from './authResolver';
 import SSHDestination from './ssh/sshDestination';
 import SSHConfiguration from './ssh/sshConfig';
-import { closeWorkspaceSessions, KILL_WORKSPACE_SESSIONS_COMMAND_ID, killWorkspaceSessions, openSSHConfigFile, promptOpenRemoteSSHWindow, type WorkspaceKillTarget, type WorkspaceSessionIdentity, type WorkspaceSessionKiller } from './commands';
+import { addNewHost, closeWorkspaceSessions, KILL_WORKSPACE_SESSIONS_COMMAND_ID, killWorkspaceSessions, openSSHConfigFile, promptOpenRemoteSSHWindow, type WorkspaceKillTarget, type WorkspaceSessionIdentity, type WorkspaceSessionKiller } from './commands';
 import { HostTreeDataProvider } from './hostTreeView';
 import { getRemoteWorkspaceLocationData, RemoteLocationHistory } from './remoteLocationHistory';
+import { RecentHosts } from './recentHosts';
+import { connectedDestination } from './hostPresentation';
+import { loadConnectPickSources, pickConnectDestination } from './connectQuickPick';
+import { reuseCurrentWindow } from './windowTarget';
 import { TmuxTerminalProvider, type OpenTerminal, type TmuxSessionContext } from './tmux/terminalProvider';
 import { createCloseWatch, createRemoteExec, type RawExec, type RemoteExec } from './tmux/remoteExec';
 import { probeLifetimeRisk, type LifetimeFacts, type TmuxCapability } from './tmux/tmuxBootstrap';
@@ -115,12 +119,27 @@ export async function activate(context: vscode.ExtensionContext) {
             .then(undefined, (err: unknown) => logger.trace(`Could not remember this remote folder: ${errorMessage(err)}`));
     }
 
+    // Remember the host this window connects to, folder or not, so "Connect to Host..." lists
+    // it first. Same rule as above: a failed write must not take activation down.
+    const recentHosts = new RecentHosts(context.globalState);
+    const connectedHost = connectedDestination(vscode.env.remoteAuthority);
+    if (connectedHost) {
+        await recentHosts.add(connectedHost.toString())
+            .then(undefined, (err: unknown) => logger.trace(`Could not remember this host: ${errorMessage(err)}`));
+    }
+
     const hostTreeDataProvider = new HostTreeDataProvider(locationHistory);
     context.subscriptions.push(vscode.window.createTreeView('sshHosts', { treeDataProvider: hostTreeDataProvider }));
     context.subscriptions.push(hostTreeDataProvider);
 
-    context.subscriptions.push(vscode.commands.registerCommand('openremotessh.openEmptyWindow', () => promptOpenRemoteSSHWindow(false)));
-    context.subscriptions.push(vscode.commands.registerCommand('openremotessh.openEmptyWindowInCurrentWindow', () => promptOpenRemoteSSHWindow(true)));
+    // "Connect to Host..." lands per `remote.SSH.openInWindow` (reuses an empty local window by
+    // default); "Connect Current Window to Host..." always reuses this one.
+    const askDestination = (): Promise<string | undefined> => pickConnectDestination(
+        () => loadConnectPickSources(recentHosts, locationHistory),
+        { add: addNewHost, configure: openSSHConfigFile },
+    );
+    context.subscriptions.push(vscode.commands.registerCommand('openremotessh.openEmptyWindow', () => promptOpenRemoteSSHWindow(reuseCurrentWindow(), askDestination)));
+    context.subscriptions.push(vscode.commands.registerCommand('openremotessh.openEmptyWindowInCurrentWindow', () => promptOpenRemoteSSHWindow(true, askDestination)));
     context.subscriptions.push(vscode.commands.registerCommand('openremotessh.openConfigFile', () => openSSHConfigFile()));
     context.subscriptions.push(vscode.commands.registerCommand('openremotessh.showLog', () => logger.show()));
     context.subscriptions.push(vscode.commands.registerCommand(KILL_WORKSPACE_SESSIONS_COMMAND_ID, () => killWorkspaceSessions(() => resolveKillTarget(remoteSSHResolver, logger, layers))));
