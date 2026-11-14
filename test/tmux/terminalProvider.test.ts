@@ -25,6 +25,7 @@ interface LaunchOptions {
     readonly shellArgs?: string[];
     readonly cwd?: string;
     readonly isTransient?: boolean;
+    readonly env?: { readonly [key: string]: string | null | undefined };
 }
 
 /** The `-s <name>` target a launched/returned option-set attaches to. */
@@ -111,6 +112,7 @@ function makeProvider(over: {
     opened?: LaunchOptions[];
     historyLimit?: number;
     tmuxPath?: string;
+    tmuxVersion?: string;
     listTerminals?: () => readonly import('vscode').Terminal[];
     reviveGraceMs?: number;
     reviveDeadlineMs?: number;
@@ -138,6 +140,7 @@ function makeProvider(over: {
         log,
         historyLimit: over.historyLimit,
         tmuxPath: over.tmuxPath,
+        tmuxVersion: over.tmuxVersion,
     });
     return { provider, opened, exec, state, log };
 }
@@ -700,6 +703,40 @@ describe('profile options (invisible + argv, no injection surface)', () => {
         await provider.initialize();
 
         expect(opened[0]?.shellPath).toBe(tmuxPath);
+    });
+
+    it('hands the probed path and version to the argv builder', async () => {
+        const tmuxPath = '/opt/tmux/bin/tmux';
+        const { provider } = makeProvider({ tmuxPath, tmuxVersion: '3.4', historyLimit: 777 });
+        const options = optionsOf(await provider.provideTerminalProfile());
+        expect(options.shellArgs).toEqual(
+            buildAttachOrCreateArgv(name(0), CWD, undefined, { historyLimit: 777, tmuxPath, tmuxVersion: '3.4' }),
+        );
+    });
+
+    // A pty that inherits `TMUX` from the server environment makes tmux refuse to start
+    // ("sessions should be nested with care") when it points at the same server; null
+    // deletes the variable from the terminal's environment.
+    it('unsets TMUX / TMUX_PANE in the launched terminal environment', async () => {
+        const { provider } = makeProvider();
+        expect(optionsOf(await provider.provideTerminalProfile()).env).toEqual({ TMUX: null, TMUX_PANE: null });
+    });
+
+    // The pty runs the probed binary; the exec-side list/has/kill must address the same one.
+    it('runs list/has/kill through the probed tmux path', async () => {
+        const tmuxPath = '/opt/tmux/bin/tmux';
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const exec = fakeExec({ list: [row(name(0), false)], existing: [name(0)] });
+        const { provider } = makeProvider({ state, exec, tmuxPath });
+
+        await provider.initialize();
+
+        const commands = exec.mock.calls.map(call => call[0] as string);
+        expect(commands.length).toBeGreaterThan(0);
+        for (const command of commands) {
+            expect(command).not.toMatch(/(^|[$(]|; )'?tmux'? /);
+            expect(command).toContain(`'${tmuxPath}'`);
+        }
     });
 
     it('defaults the history limit through to the 02 builder when unset', async () => {

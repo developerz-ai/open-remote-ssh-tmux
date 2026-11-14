@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { DEFAULT_REAP_GRACE_SECONDS, SessionReaper } from '../../src/tmux/sessionReaper';
-import { buildKillSession, sessionName } from '../../src/tmux/tmuxSession';
+import { buildKillSession, buildListSessions, sessionName } from '../../src/tmux/tmuxSession';
 
 // The reaper is the anti-zombie backstop that complements the terminal provider:
 // on a successful connect (and on manual refresh) it lists the remote's tmux
@@ -74,7 +74,7 @@ function fakeExec(opts: {
     });
 }
 
-function makeReaper(over: { exec?: ReturnType<typeof fakeExec>; now?: number; minAgeSeconds?: number } = {}) {
+function makeReaper(over: { exec?: ReturnType<typeof fakeExec>; now?: number; minAgeSeconds?: number; tmuxPath?: string } = {}) {
     const exec = over.exec ?? fakeExec();
     const log = { info: vi.fn(), trace: vi.fn() };
     const reaper = new SessionReaper({
@@ -82,6 +82,7 @@ function makeReaper(over: { exec?: ReturnType<typeof fakeExec>; now?: number; mi
         now: () => over.now ?? NOW,
         log,
         minAgeSeconds: over.minAgeSeconds,
+        tmuxPath: over.tmuxPath,
     });
     return { reaper, exec, log };
 }
@@ -91,6 +92,18 @@ const killCommands = (exec: ReturnType<typeof fakeExec>): string[] =>
     exec.mock.calls.map(call => call[0]).filter(command => command.includes('kill-session'));
 
 describe('reap — selection (list -> parse -> shouldReap -> kill)', () => {
+    it('lists and kills through the probed tmux path when given one', async () => {
+        const exec = fakeExec({ list: [row(ours(0), false, { paneDead: true })] });
+        const { reaper } = makeReaper({ exec, tmuxPath: '/opt/tmux' });
+
+        await reaper.reap();
+
+        expect(exec.mock.calls.map(call => call[0])).toEqual([
+            buildListSessions('/opt/tmux'),
+            buildKillSession(ours(0), '/opt/tmux'),
+        ]);
+    });
+
     it('kills exactly the dead, detached session we own; leaves attached + foreign', async () => {
         const exec = fakeExec({
             list: [

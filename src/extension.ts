@@ -13,6 +13,7 @@ import { FallbackTerminalProvider } from './tmux/fallbackTerminalProvider';
 import { TerminalProfileRegistration } from './tmux/profileRegistration';
 import { pasteClipboardImage, sweepOldImages } from './clipboard/pasteImage';
 import { SessionReaper } from './tmux/sessionReaper';
+import { clampHistoryLimit } from './tmux/tmuxSession';
 import { prepareEnvCollection } from './common/envCollection';
 import { disposeAll } from './common/disposable';
 
@@ -233,6 +234,8 @@ function wireTmuxTerminalLayer(
             // so nix / `~/.local/bin` installs off the non-login PATH still work —
             // undefined falls back to a bare `tmux` on PATH.
             tmuxPath: capability.path,
+            // Picks the attach chain variant for this tmux (see tmuxFeatures).
+            tmuxVersion: capability.version,
             // Scrollback lines for new sessions (remote.SSH.tmux.historyLimit); the
             // provider caps its `new-session` history buffer to this.
             historyLimit: settings.historyLimit,
@@ -293,6 +296,7 @@ function wireTmuxTerminalLayer(
             exec,
             now: () => Math.floor(Date.now() / 1000),
             log: logger,
+            tmuxPath: capability.path,
         });
 
         // Run the reaper only when remote.SSH.tmux.reapOnConnect is set (default true) —
@@ -485,7 +489,9 @@ export function readTmuxSettings(): TmuxSettings {
     const config = vscode.workspace.getConfiguration('remote.SSH');
     return {
         enabled: config.get<string>('tmux.enabled', 'auto'),
-        historyLimit: config.get<number>('tmux.historyLimit', 50000),
+        // Read as `unknown`: a hand-edited settings.json can hold anything, and a value tmux
+        // rejects would stop every terminal from opening (see clampHistoryLimit).
+        historyLimit: clampHistoryLimit(config.get<unknown>('tmux.historyLimit', 50000)),
         reapOnConnect: config.get<boolean>('tmux.reapOnConnect', true),
         setDefaultProfile: config.get<boolean>('tmux.setDefaultProfile', true),
     };
@@ -712,6 +718,7 @@ function resolveKillTarget(resolver: RemoteSSHResolver, logger: Log): WorkspaceK
         exec: tmuxExec(resolver),
         now: () => Math.floor(Date.now() / 1000),
         log: logger,
+        tmuxPath: resolver.getTmuxCapability()?.path,
     });
     return { reaper, hostKey: context.hostKey, workspaceKey: context.workspaceKey };
 }

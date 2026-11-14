@@ -103,6 +103,29 @@ describe('probeTmux — resolved path', () => {
         const result = await probeTmux(execWith('tmux 3.2a'));
         expect(result.path).toBeUndefined();
     });
+
+    // A login shell's rc file can print before the probe runs (`echo Welcome` in
+    // ~/.bashrc, a motd). Reading only line 1 dropped the path and launched a bare `tmux`,
+    // which breaks nix / ~/.local/bin installs — reproduced on the real-tmux rig.
+    it('finds the path after login-shell banner lines', async () => {
+        const exec = execWith('Welcome to the rig\nLast login: today\n/usr/local/bin/tmux\ntmux 3.4\n');
+        expect(await probeTmux(exec)).toEqual({ available: true, version: '3.4', path: '/usr/local/bin/tmux' });
+    });
+
+    it('takes the LAST absolute-path line when a banner line also starts with /', async () => {
+        const exec = execWith('/etc/motd says hi\n/home/u/.nix-profile/bin/tmux\ntmux 3.4\n');
+        expect((await probeTmux(exec)).path).toBe('/home/u/.nix-profile/bin/tmux');
+    });
+
+    it('keeps a path containing spaces whole', async () => {
+        const exec = execWith('/home/a b/.local/bin/tmux\r\ntmux 3.4\r\n');
+        expect((await probeTmux(exec)).path).toBe('/home/a b/.local/bin/tmux');
+    });
+
+    it('ignores absolute-path lines printed after the version line', async () => {
+        const exec = execWith('/usr/bin/tmux\ntmux 3.4\n/etc/logout-noise\n');
+        expect((await probeTmux(exec)).path).toBe('/usr/bin/tmux');
+    });
 });
 
 describe('probeTmux — version token edges', () => {

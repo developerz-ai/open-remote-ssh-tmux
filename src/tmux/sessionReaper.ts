@@ -6,6 +6,7 @@ import {
     readListSessionsResult,
     sessionSlot,
     shouldReap,
+    TMUX_BIN,
     TmuxSession,
 } from './tmuxSession';
 
@@ -55,6 +56,9 @@ export interface SessionReaperDeps {
      * to `DEFAULT_REAP_GRACE_SECONDS`; an un-reaped young corpse is simply cleared on
      * the next connect/refresh (deterministic naming means it is never duplicated). */
     readonly minAgeSeconds?: number;
+    /** The probed tmux binary (`TmuxCapability.path`), so list/kill address the same tmux
+     * the terminals launch. Undefined → a bare `tmux` on PATH. */
+    readonly tmuxPath?: string;
 }
 
 /** Default startup grace: a dead owned session must be at least this old before
@@ -81,12 +85,14 @@ export class SessionReaper {
     private readonly now: Clock;
     private readonly log: TmuxLog;
     private readonly minAgeSeconds: number;
+    private readonly tmuxPath: string;
 
     constructor(deps: SessionReaperDeps) {
         this.exec = deps.exec;
         this.now = deps.now;
         this.log = deps.log;
         this.minAgeSeconds = deps.minAgeSeconds ?? DEFAULT_REAP_GRACE_SECONDS;
+        this.tmuxPath = deps.tmuxPath ?? TMUX_BIN;
     }
 
     /**
@@ -159,7 +165,7 @@ export class SessionReaper {
      * (distinct from "zero sessions", which is a normal empty array). */
     private async listSessions(): Promise<TmuxSession[] | undefined> {
         try {
-            const result = await this.exec(buildListSessions());
+            const result = await this.exec(buildListSessions(this.tmuxPath));
             const sessions = readListSessionsResult(result);
             if (sessions === undefined) {
                 this.log.trace(`tmux reaper: list-sessions failed (rc ${result.code ?? 'unknown'}): ${result.stderr.trim()}`);
@@ -178,7 +184,7 @@ export class SessionReaper {
      * remaining kills still run. */
     private async kill(name: string): Promise<boolean> {
         try {
-            const { stderr, code } = await this.exec(buildKillSession(name));
+            const { stderr, code } = await this.exec(buildKillSession(name, this.tmuxPath));
             const verdict = code === 0 ? 'killed' : classifyTmuxFailure(stderr, code);
             if (verdict === 'killed' || verdict === 'absent') {
                 return true;

@@ -11,7 +11,7 @@ export { escapeShellArg };
 // owns the session/list/has/kill/new-session command-line builders (and the pure
 // reading of their answers, `classifyTmuxFailure`); the only
 // other tmux command sites are `tmuxBootstrap.ts`'s PROBE_COMMAND and the
-// `TMUX_BIN` shellPath in `terminalProvider.ts`. No `vscode`/`ssh2`/`ssh` imports
+// `shellPath` (probed path, or {@link TMUX_BIN}) in `terminalProvider.ts`. No `vscode`/`ssh2`/`ssh` imports
 // so it is fully unit-testable. Every user-influenced string routed into a
 // command goes through `escapeShellArg` (these command lines run on the remote
 // via a shell; unescaped a hostile workspace path would be arbitrary code
@@ -24,10 +24,70 @@ export const SESSION_PREFIX = 'code-';
 /** Length of the workspace hash embedded in a session name (sha1 hex chars). */
 const HASH_LENGTH = 12;
 
-/** Default scrollback (lines) applied per session. Wired to a user setting by
- * the terminal provider; `historyLimit` applies to windows created after it is
- * set — see the create-options note below. */
+/** Default scrollback (lines) applied per session (`remote.SSH.tmux.historyLimit`). */
 const DEFAULT_HISTORY_LIMIT = 50000;
+
+/** Largest scrollback we pass to tmux. tmux itself accepts up to INT_MAX, but every line
+ * of every pane is kept in server memory, so a typo like `1e10` must not become a
+ * multi-gigabyte buffer; a million lines is far past any real use. */
+const MAX_HISTORY_LIMIT = 1_000_000;
+
+/** The tmux binary a command line runs when the probe resolved no absolute path — a bare
+ * `tmux` on PATH. Shared with `terminalProvider.ts`'s `shellPath` fallback. */
+export const TMUX_BIN = 'tmux';
+
+/** Server user option holding the user's own global `history-limit` while the legacy chain
+ * borrows the global for our new pane (see {@link buildAttachOrCreateArgv}). It is left set
+ * afterwards on purpose: `set-option -gu @…` on a user option CRASHES the tmux 2.6 server
+ * (verified on the rig — every session on it is lost). */
+const SAVED_HISTORY_OPTION = '@orst_saved_hl';
+
+/** `escape-time` tmux shipped as its default before 3.5 (500 ms — Esc felt laggy in every
+ * TUI) and the value 3.5 made the new default. Ours only replaces the old default. */
+const LEGACY_ESCAPE_TIME = '500';
+const ESCAPE_TIME = '10';
+
+/**
+ * Coerce `remote.SSH.tmux.historyLimit` into a value tmux accepts. tmux rejects a
+ * fractional, negative or out-of-range `history-limit`, and that error aborted the whole
+ * `;` chain before `new-session` — no terminal could open at all (reproduced on tmux 2.6 …
+ * 3.8 with 1.5, -1 and 1e10). Integers are capped at {@link MAX_HISTORY_LIMIT}; anything
+ * else that is not a non-negative integer (NaN, Infinity, a string from a hand-edited
+ * settings.json) falls back to the default.
+ */
+export function clampHistoryLimit(value: unknown): number {
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+        return DEFAULT_HISTORY_LIMIT;
+    }
+    return Math.min(value, MAX_HISTORY_LIMIT);
+}
+
+/** The behaviour differences between tmux releases that the attach chain has to know
+ * about. Everything else it uses was verified to behave the same on 2.6 (the floor),
+ * 3.0a, 3.4, 3.5a and 3.8 by the real-tmux rig (`test/rig`). */
+export interface TmuxFeatures {
+    /** tmux ≥ 3.7 applies a changed `history-limit` to existing panes ("When
+     * history-limit is changed, apply to existing panes", CHANGES 3.7; verified 3.5a no,
+     * 3.8 yes). There a session-scoped value reaches our pane — and, conversely, touching
+     * the GLOBAL would resize every pane on the user's server. */
+    readonly liveHistoryLimit: boolean;
+}
+
+/**
+ * Feature table for a probed tmux version token (`3.4`, `3.0a`, `next-3.7`). An
+ * unparseable or missing version (an exotic `tmux master` build) is treated as modern:
+ * the modern chain never touches the user's global, so on an old tmux the worst case is
+ * our scrollback setting not applying — never a changed server.
+ */
+export function tmuxFeatures(version: string | undefined): TmuxFeatures {
+    const match = version === undefined ? null : /(\d+)\.(\d+)/.exec(version);
+    if (!match) {
+        return { liveHistoryLimit: true };
+    }
+    const major = parseInt(match[1], 10);
+    const minor = parseInt(match[2], 10);
+    return { liveHistoryLimit: major > 3 || (major === 3 && minor >= 7) };
+}
 
 /** Session name shape this extension produces and is allowed to reap:
  * `code-<sha1_12>-<slot>`. Hex + digits only — no `.`/`:` (both forbidden by
@@ -88,8 +148,15 @@ export interface AttachOrCreateOptions {
      * 3.4 server: the stale client is dropped and the pane's process is untouched.
      * Default false. */
     readonly takeOver?: boolean;
-    /** Scrollback lines for windows created after the session starts. Default 50000. */
+    /** Scrollback lines for the session's pane. Clamped by {@link clampHistoryLimit};
+     * default 50000. */
     readonly historyLimit?: number;
+    /** The tmux binary the pty launches (the probe's absolute path). The chain's own shell
+     * jobs run it too, so they talk to the same build. Default {@link TMUX_BIN}. */
+    readonly tmuxPath?: string;
+    /** The probed tmux version; selects the chain variant via {@link tmuxFeatures}.
+     * Unknown → the modern chain. */
+    readonly tmuxVersion?: string;
 }
 
 /** Inputs to the reap decision beyond the session itself. */
@@ -157,13 +224,44 @@ export function isOurSession(name: string): boolean {
 }
 
 /**
+ * `cwd` as tmux must receive it to land in exactly that directory. Two parts of tmux read
+ * an argv element even though no shell does (both verified on 2.6 … 3.8 by the rig):
+ *  - `new-session -c` is FORMAT-EXPANDED: a directory named `x#(touch $HOME/pwned)` ran
+ *    that command, and `x#S` became the session name. `##` is tmux's literal `#`.
+ *  - an element ending in `;` is a command separator: `x;` was split off and the shell
+ *    started in $HOME. `\;` is the literal; tmux drops just that one backslash, so a path
+ *    already ending in `\;` becomes `\\;` and survives too.
+ */
+function tmuxLiteralPath(path: string): string {
+    const escaped = path.replace(/#/g, '##');
+    return escaped.endsWith(';') ? `${escaped.slice(0, -1)}\\;` : escaped;
+}
+
+/** The tmux binary as a word inside a tmux shell job (`run-shell` / `if-shell`): shell-quoted,
+ * and with `#` doubled because tmux format-expands the job's command before the shell sees it. */
+function jobTmux(tmuxPath: string): string {
+    return escapeShellArg(tmuxPath).replace(/#/g, '##');
+}
+
+/** `if-shell` test that succeeds when the user's server already has `key` bound in the root
+ * table — by them, or by an earlier attach of ours. `list-keys -T root <key>` does not exist
+ * at 2.6, hence the grep; the line shape `… -T root <key> …` is the same on 2.6 … 3.8. */
+function rootKeyBound(tmux: string, key: string): string {
+    return `${tmux} list-keys -T root | grep -Eq -- '-T root +${key} '`;
+}
+
+/**
  * The argv form for attach-or-create — the array a VS Code terminal profile
- * carries as `shellArgs` (with `shellPath: 'tmux'`). The pty host hands argv to
- * `execve` **directly, with no intervening shell**, so — unlike the shell-string
- * builder — elements are NOT escaped and there is no injection surface: a hostile
- * workspace path is simply one inert argv element. The tmux command separator is a
- * bare `;` element (the shell form writes `\;` only to stop the shell from eating
- * the `;`). Same per-session hardening/cosmetics as the shell form, kept in lockstep.
+ * carries as `shellArgs` (with `shellPath` the probed tmux). The pty host hands argv to
+ * `execve` **directly, with no intervening shell**, so elements are not shell-escaped and
+ * the tmux command separator is a bare `;` element. tmux itself still interprets parts of
+ * it (formats in `-c` and in shell jobs, a trailing `;`), which {@link tmuxLiteralPath}
+ * and {@link jobTmux} neutralise.
+ *
+ * Every write here is either scoped to OUR session (`-t =<name>:`) or applied only while
+ * the user's server still holds tmux's default, so a setting the user configured is never
+ * overwritten. The one global we borrow, `history-limit` on tmux < 3.7, is put back to
+ * the user's exact value before anything that can fail.
  */
 export function buildAttachOrCreateArgv(
     name: string,
@@ -171,91 +269,96 @@ export function buildAttachOrCreateArgv(
     shell?: string,
     opts: AttachOrCreateOptions = {},
 ): string[] {
-    const historyLimit = opts.historyLimit ?? DEFAULT_HISTORY_LIMIT;
+    const historyLimit = String(clampHistoryLimit(opts.historyLimit ?? DEFAULT_HISTORY_LIMIT));
+    const tmux = jobTmux(opts.tmuxPath ?? TMUX_BIN);
     // `-D` must sit with the other `new-session` flags, before `-s`: it is a flag of the
     // attach behaviour `-A` selects, not a standalone command.
     const create = opts.takeOver
-        ? ['new-session', '-A', '-D', '-s', name, '-c', cwd]
-        : ['new-session', '-A', '-s', name, '-c', cwd];
+        ? ['new-session', '-A', '-D', '-s', name, '-c', tmuxLiteralPath(cwd)]
+        : ['new-session', '-A', '-s', name, '-c', tmuxLiteralPath(cwd)];
     if (shell !== undefined) {
         create.push(shell);
     }
+    // Before 3.7, `history-limit` is read only when a PANE is created, and `new-session`
+    // creates the session's one pane before any chained command runs, so a session-scoped
+    // value set afterwards never reached it (pane stayed at 2000 while `show-options` said
+    // 50000). The global is the only lever there: save the user's value, set ours, create,
+    // put theirs back. The save is a shell job reading `show-options -gv`, because a
+    // `#{history-limit}` format resolves through the most recent session and would pick up a
+    // session-local value as if it were the global (verified on the rig). The old restore,
+    // `set-option -gu`, reset the global to tmux's built-in 2000 instead of the user's value.
+    // `run-shell` blocks the chain until the job is done, and nothing between the save and
+    // the restore yields, so a concurrent attach cannot observe our value.
+    const borrowGlobal = !tmuxFeatures(opts.tmuxVersion).liveHistoryLimit;
+    const head = borrowGlobal
+        ? [
+            'run-shell', `${tmux} set-option -g ${SAVED_HISTORY_OPTION} "$(${tmux} show-options -gv history-limit)"`,
+            ';', 'set-option', '-g', 'history-limit', historyLimit,
+            ';', ...create,
+            ';', 'set-option', '-gF', 'history-limit', `#{${SAVED_HISTORY_OPTION}}`,
+        ]
+        : create;
     // `set-option`'s `-t` is target-WINDOW syntax (unlike `set-window-option`'s,
     // which accepts a bare `=<name>` exact-match session target fine): confirmed
     // against a real tmux 3.4 server that a bare `=<name>` there is NOT resolved
     // as "exact-match session, default window" and fails with "no such session"
-    // — `status`/`history-limit` silently never applied (status bar stayed
-    // visible: a hard Invisible-UX violation this repo's unit tests, which fake
-    // tmux entirely, could not catch). `=<name>:` (trailing colon = exact session,
-    // empty/default window) is the form `set-option` actually accepts.
+    // — `status`/`history-limit` silently never applied. `=<name>:` (trailing colon =
+    // exact session, empty/default window) is the form `set-option` actually accepts.
+    const session = `=${name}:`;
     return [
-        // `history-limit` is consumed when a PANE is created, not when the option is set —
-        // and `new-session` creates the session's one and only pane before any chained
-        // `set-option` can run. Setting it at session scope afterwards (as this builder used
-        // to) therefore did nothing at all: `show-options` reported 50000 while
-        // `#{history_limit}` on the actual pane stayed at tmux's 2000-line default, making
-        // the advertised `remote.SSH.tmux.historyLimit` setting a silent no-op. Confirmed on
-        // six live sessions before the fix. The global option is the only one read at pane
-        // creation, so set it here and restore it the moment the session exists.
-        'set-option', '-g', 'history-limit', String(historyLimit),
-        ';', ...create,
-        // Restore the user's global immediately — it belongs to their whole tmux server, not
-        // to us. This sits before every option below on purpose: tmux aborts a `;` chain at
-        // the first failing command, so anything that can fail must come after the restore,
-        // otherwise one bad target would leave our value burned into their server.
-        ';', 'set-option', '-gu', 'history-limit',
+        ...head,
         ';', 'set-window-option', '-t', `=${name}`, 'remain-on-exit', 'off',
-        ';', 'set-option', '-t', `=${name}:`, 'status', 'off',
-        ';', 'set-option', '-t', `=${name}:`, 'history-limit', String(historyLimit),
+        ';', 'set-option', '-t', session, 'status', 'off',
+        // On ≥ 3.7 this is what sizes the pane; before that it only covers windows created
+        // later, and is harmless.
+        ';', 'set-option', '-t', session, 'history-limit', historyLimit,
         // Invisible UX, not a nicety: tmux defaults `mouse` to off, which leaves mouse
         // reporting disabled, so the scroll wheel emits arrow keys straight into the
-        // shell — the wheel "scrolls commands" (bash history) instead of the screen, and
-        // the history-limit set directly above is reachable only via tmux's own
-        // `prefix + [` copy-mode binding. Requiring a tmux keybinding to scroll is
-        // exactly the leaked-tmux-UI this fork forbids, so this is unconditional.
+        // shell — the wheel "scrolls commands" (bash history) instead of the screen.
         // Trade-off (accepted deliberately): with mouse reporting on, drag-selection
         // belongs to tmux rather than VS Code — hence `set-clipboard` below. Alt+drag
         // remains the escape hatch to VS Code's own selection.
-        ';', 'set-option', '-t', `=${name}:`, 'mouse', 'on',
+        ';', 'set-option', '-t', session, 'mouse', 'on',
+        // No tmux prefix in our sessions: C-b was swallowed as tmux's prefix on every
+        // version (Claude Code uses it), and a prefix is tmux UI the user never asked for.
+        // Session-scoped, so the user's own sessions keep theirs. `None` verified at 2.6.
+        ';', 'set-option', '-t', session, 'prefix', 'None',
+        ';', 'set-option', '-t', session, 'prefix2', 'None',
+        // A lone Esc is held for `escape-time` to tell it from an Alt- sequence: 500 ms by
+        // default before 3.5, which makes Esc lag in every TUI. It is a SERVER option, so
+        // lower it only while it still holds that old default — a value the user chose
+        // stays. (3.5+ defaults to 10 already, so this is a no-op there.)
+        ';', 'if-shell', '-F', `#{==:#{escape-time},${LEGACY_ESCAPE_TIME}}`, `set-option -s escape-time ${ESCAPE_TIME}`,
         // Makes tmux emit OSC52 on copy, so a drag-select inside the remote tmux reaches
         // the LOCAL clipboard over the SSH link; tmux's default `external` forwards OSC52
         // only for apps running *inside* tmux, never for tmux's own copy-mode. Without
         // this, `mouse on` above would trade a broken wheel for broken copy/paste.
-        //
-        // `-s` (server scope) is deliberate: `set-clipboard` IS a server option, so a
-        // session-targeted `-t =<name>:` write is silently promoted to server scope
-        // anyway (verified against a real tmux 3.4 server — the same class of silent
-        // mis-scoping that made `status`/`history-limit` no-ops above). Writing `-s`
-        // states the true blast radius at the call site instead of hiding a global write
-        // behind session syntax. It is the one option here that outlives our sessions:
-        // it applies to the user's whole tmux server until that server exits, and is
-        // never written to their ~/.tmux.conf.
-        ';', 'set-option', '-s', 'set-clipboard', 'on',
+        // `set-clipboard` is a SERVER option (a session-targeted write is silently promoted
+        // — verified on 3.4), so it is changed only from tmux's default: a user who set
+        // `off` keeps it. (An explicit `external` is indistinguishable from the default.)
+        ';', 'if-shell', '-F', '#{==:#{set-clipboard},external}', 'set-option -s set-clipboard on',
         // The keyboard half of the same Invisible-UX problem `mouse on` fixes for the
         // wheel. tmux binds nothing to PageUp in the root table, so the key reaches the
         // shell as bytes — and readline's stock `/etc/inputrc` (plus most zsh setups)
         // maps it to history-search-backward, so PageUp "scrolls" to the COMMAND above
-        // instead of the screen, with the 50000-line scrollback again reachable only
-        // through tmux's own `prefix + [`. `copy-mode -u` enters copy mode already paged
-        // up one screen; `-e` makes it exit by itself once PageDown reaches the bottom,
-        // so copy mode is never something the user has to notice, let alone leave.
+        // instead of the screen. `copy-mode -u` enters copy mode already paged up one
+        // screen; `-e` makes it exit by itself once PageDown reaches the bottom.
         //
-        // `if-shell -F` is a format test (no shell per keypress) against
-        // `PASS_KEYS_THROUGH` above: the binding takes the key ONLY at a bare shell
-        // prompt, so vim/less/htop and normal-screen TUIs like Claude Code keep their own
-        // PageUp/PageDown. PageDown deliberately has no else-branch: outside copy mode
-        // there is nothing below the live screen, and the only thing left for the key to
-        // do is the history-search-forward being fixed.
+        // The inner `if-shell -F` is a format test (no shell per keypress) against
+        // `PASS_KEYS_THROUGH`: the binding takes the key ONLY at a bare shell prompt, so
+        // vim/less/htop and normal-screen TUIs like Claude Code keep their own keys.
+        // PageDown deliberately has no else-branch: outside copy mode there is nothing
+        // below the live screen.
         //
-        // Scope, stated plainly: key tables are SERVER-global — tmux has no per-session
-        // bindings — so unlike `mouse`/`status` these two outlive our sessions and apply
-        // to the user's own sessions on the same server until it exits (never written to
-        // their ~/.tmux.conf). Same accepted blast radius as `set-clipboard` above, and
-        // the same reason they sit after the `-gu` restore: anything fallible last.
-        ';', 'bind-key', '-n', 'PPage', 'if-shell', '-F', PASS_KEYS_THROUGH,
-        'send-keys PPage', 'copy-mode -eu',
-        ';', 'bind-key', '-n', 'NPage', 'if-shell', '-F', PASS_KEYS_THROUGH,
-        'send-keys NPage',
+        // Key tables are SERVER-global (tmux has no per-session bindings), so each key is
+        // bound only when the root table has nothing on it yet: a user's own PageUp binding
+        // wins, and so does ours from an earlier attach. That test needs a shell job (no
+        // format can see bindings): one short `list-keys | grep` per key, per attach. The
+        // then-branch is empty — "already bound, leave it".
+        ';', 'if-shell', rootKeyBound(tmux, 'PPage'), '',
+        `bind-key -n PPage if-shell -F '${PASS_KEYS_THROUGH}' 'send-keys PPage' 'copy-mode -eu'`,
+        ';', 'if-shell', rootKeyBound(tmux, 'NPage'), '',
+        `bind-key -n NPage if-shell -F '${PASS_KEYS_THROUGH}' 'send-keys NPage'`,
     ];
 }
 
@@ -268,8 +371,8 @@ export function buildAttachOrCreateArgv(
  * session (tmux destroys it with its last window). It expands to `0`/`1`, so it is
  * always a token and safe as the right-anchored final field.
  */
-export function buildListSessions(): string {
-    return 'tmux list-sessions -F '
+export function buildListSessions(tmuxPath = TMUX_BIN): string {
+    return `${escapeShellArg(tmuxPath)} list-sessions -F `
         + escapeShellArg('#{session_name} #{session_attached} #{session_windows} #{session_created} #{pane_dead}');
 }
 
@@ -282,13 +385,13 @@ export function buildListSessions(): string {
 // session, exact by construction).
 
 /** `tmux has-session -t =<name>`. */
-export function buildHasSession(name: string): string {
-    return `tmux has-session -t =${escapeShellArg(name)}`;
+export function buildHasSession(name: string, tmuxPath = TMUX_BIN): string {
+    return `${escapeShellArg(tmuxPath)} has-session -t =${escapeShellArg(name)}`;
 }
 
 /** `tmux kill-session -t =<name>`. */
-export function buildKillSession(name: string): string {
-    return `tmux kill-session -t =${escapeShellArg(name)}`;
+export function buildKillSession(name: string, tmuxPath = TMUX_BIN): string {
+    return `${escapeShellArg(tmuxPath)} kill-session -t =${escapeShellArg(name)}`;
 }
 
 /** Tag on each answer line of {@link buildHasSessionsCommand}. */
@@ -303,9 +406,9 @@ const HAS_TAG = '__has';
  * line travels inside a single-quoted `sh -c` argument, and a csh login shell rejects a
  * newline inside quotes. Parse with {@link parseHasSessions}.
  */
-export function buildHasSessionsCommand(names: readonly string[]): string {
+export function buildHasSessionsCommand(names: readonly string[], tmuxPath = TMUX_BIN): string {
     return names
-        .map((name, index) => `r=$(${buildHasSession(name)} 2>&1); printf '${HAS_TAG} %s %s %s\\n' ${index} "$?" "$r"`)
+        .map((name, index) => `r=$(${buildHasSession(name, tmuxPath)} 2>&1); printf '${HAS_TAG} %s %s %s\\n' ${index} "$?" "$r"`)
         .join('; ');
 }
 

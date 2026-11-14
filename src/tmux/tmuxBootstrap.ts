@@ -116,17 +116,18 @@ function parseVersionToken(stdout: string): string | undefined {
     return /^tmux (\S+)/m.exec(stdout)?.[1];
 }
 
-/** Extract the resolved binary path that `command -v tmux` prints on the first
- * stdout line. POSIX `command -v` prints an absolute path for an external command,
- * so we require a leading `/` — that also cleanly rejects the `tmux <version>` line
- * (present when the probe skipped straight to `tmux -V`) so it is never mistaken for
- * a path. Returns `undefined` when no such line was printed. */
+/** Extract the resolved binary path that `command -v tmux` prints. POSIX `command -v`
+ * prints an absolute path for an external command, so we require a leading `/` — that
+ * also rejects the `tmux <version>` line, so it is never mistaken for a path. Only lines
+ * BEFORE the version line count (the path is printed right before it), and the last
+ * absolute one wins: a login shell's rc file may print a banner first (verified on the
+ * real-tmux rig — reading line 1 only dropped the path and fell back to a bare `tmux`).
+ * Returns `undefined` when no such line was printed. */
 function parsePath(stdout: string): string | undefined {
-    const firstLine = stdout.split('\n', 1)[0]?.trim();
-    if (firstLine === undefined || !firstLine.startsWith('/')) {
-        return undefined;
-    }
-    return firstLine;
+    const lines = stdout.split('\n').map(line => line.trim());
+    const versionLine = lines.findIndex(line => /^tmux \S/.test(line));
+    const candidates = versionLine === -1 ? lines : lines.slice(0, versionLine);
+    return candidates.filter(line => line.startsWith('/')).pop();
 }
 
 /** Whether a version token clears the floor. `undefined` when the token has no

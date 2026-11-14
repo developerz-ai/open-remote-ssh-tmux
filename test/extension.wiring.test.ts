@@ -182,6 +182,18 @@ describe('readTmuxSettings: the four remote.SSH.tmux.* settings are read', () =>
         expect(settings.reapOnConnect).toBe(false);
         expect(settings.setDefaultProfile).toBe(setDefaultProfile);
     });
+
+    // A value tmux rejects used to abort the attach chain before `new-session`, so no
+    // terminal could open. The read seam clamps, so no setting can stop a terminal.
+    it.each([
+        [1.5, 50000],
+        [-1, 50000],
+        [1e10, 1_000_000],
+        ['5000', 50000],
+    ] as const)('clamps historyLimit %j to %j', (configured, expected) => {
+        configOverrides.set('remote.SSH.tmux.historyLimit', configured);
+        expect(readTmuxSettings().historyLimit).toBe(expected);
+    });
 });
 
 describe('decideTmuxWiring: enabled setting × tmux availability', () => {
