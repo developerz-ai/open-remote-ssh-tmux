@@ -1,8 +1,12 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { decideDefaultProfile, decideTmuxWiring, defaultProfileSettingKey, deriveTmuxSessionContext, idempotentResolveHandler, lazyExec, onceOnly, readTmuxSettings, reconcileDefaultTerminalProfile, TMUX_PROFILE_TITLE } from '../src/extension';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { backgroundTerminalsMessage, canonicalTmuxIdentity, CLIPBOARD_PASTE_DEADLINE_MS, CLIPBOARD_SWEEP_DEADLINE_MS, clipboardExec, CLOSE_BACKGROUND_TERMINALS, deactivate, decideDefaultProfile, DEFAULT_PROFILE_WRITE_DEADLINE_MS, HAND_OFF_NOT_NOW, HAND_OFF_OFFER_MESSAGE, HAND_OFF_TAKE_OVER, KEEP_BACKGROUND_TERMINALS, LIFETIME_DOCS_URL, LIFETIME_LEARN_MORE, LIFETIME_WARNING_MESSAGE, maybeWarnTerminalLifetime, offerBackgroundCleanup, offerHandOff, decideTmuxWiring, defaultProfileSettingKey, deriveTmuxSessionContext, lazyExec, onceOnly, readTmuxSettings, reconcileDefaultTerminalProfile, resolveSshTarget, TMUX_EXEC_DEADLINE_MS, TMUX_PROFILE_TITLE, TmuxLayerController, tmuxExec, watchTmuxLayerInputs, type TmuxSettings, type TmuxTerminalLayer } from '../src/extension';
+import SSHDestination from '../src/ssh/sshDestination';
+import type { TmuxSessionContext } from '../src/tmux/terminalProvider';
+import { DeadlineError } from '../src/common/deadline';
+import { wrapWithExitCode } from '../src/tmux/remoteExec';
 import type { RemoteSSHResolver } from '../src/authResolver';
 import type Log from '../src/common/logger';
-import { ConfigurationTarget, configOverrides, inspectOverrides, TerminalProfile, updateCalls } from './mocks/vscode';
+import { ConfigurationTarget, configOverrides, inspectOverrides, messageResponses, shownMessages, TerminalProfile, updateCalls, updateControl } from './mocks/vscode';
 import { FallbackTerminalProvider } from '../src/tmux/fallbackTerminalProvider';
 
 /** A no-op Log — the default-profile reconcile only calls `trace` on the (untaken) error path. */
@@ -60,34 +64,403 @@ describe('lazyExec: post-reconnect exec targets the live connection', () => {
     });
 });
 
-describe('idempotentResolveHandler: wire once, refresh on reconnect', () => {
-    it('wires on the first resolve, then only refreshes on every later resolve', () => {
-        const refresh = vi.fn();
-        const wire = vi.fn(() => ({ refresh }));
-        const handler = idempotentResolveHandler(wire);
-
-        handler(); // first connect → wire
-        handler(); // reconnect → refresh only
-        handler(); // reconnect → refresh only
-
-        expect(wire).toHaveBeenCalledTimes(1);   // never re-registers
-        expect(refresh).toHaveBeenCalledTimes(2);
+describe('tmuxExec: every tmux-layer remote call is bounded and reports its exit code', () => {
+    afterEach(() => {
+        vi.useRealTimers();
     });
 
-    it('retries wiring on a later resolve when the gates were not yet satisfied', () => {
-        const refresh = vi.fn();
-        let call = 0;
-        // First resolve: gates fail (e.g. tmux capability not ready) → undefined, no
-        // layer retained. A later resolve wires for real; then reconnects refresh it.
-        const wire = vi.fn(() => (call++ === 0 ? undefined : { refresh }));
-        const handler = idempotentResolveHandler(wire);
+    it('runs through the live connection with the exit-code marker, and parses it back', async () => {
+        const connection = { exec: vi.fn(async () => ({ stdout: 'row\n\n__rc=0\n', stderr: '' })) };
+        const { resolver } = fakeResolver(connection);
 
-        handler(); // gate failed → no layer retained
-        handler(); // now wired
-        handler(); // reconnect → refresh
+        expect(await tmuxExec(resolver)('tmux ls')).toEqual({ stdout: 'row\n', stderr: '', code: 0 });
+        expect(connection.exec).toHaveBeenCalledWith(wrapWithExitCode('tmux ls'));
+    });
+
+    it('rejects with a DeadlineError after 8 s when the connection never answers', async () => {
+        vi.useFakeTimers();
+        const connection = { exec: vi.fn(() => new Promise(() => { /* half-dead link */ })) };
+        const { resolver } = fakeResolver(connection);
+
+        const pending = tmuxExec(resolver)('tmux ls');
+        const assertion = expect(pending).rejects.toBeInstanceOf(DeadlineError);
+        await vi.advanceTimersByTimeAsync(TMUX_EXEC_DEADLINE_MS);
+        await assertion;
+        expect(TMUX_EXEC_DEADLINE_MS).toBe(8000);
+    });
+});
+
+/** A fake wired layer, recording what the controller and the watchers do to it. */
+function fakeLayer(identity: TmuxSessionContext = { hostKey: 'dev@h:22', workspaceKey: '/w', cwd: '/w' }) {
+    return {
+        identity,
+        refresh: vi.fn(),
+        reconfigure: vi.fn(),
+        dispose: vi.fn(),
+        protectedSessions: vi.fn(async () => []),
+    } satisfies TmuxTerminalLayer;
+}
+
+describe('TmuxLayerController: wire once, refresh on reconnect, rewire/unwire at runtime', () => {
+    it('wires on the first resolve, then only refreshes on every later resolve', async () => {
+        const layer = fakeLayer();
+        const wire = vi.fn(async () => layer);
+        const controller = new TmuxLayerController(wire);
+
+        await controller.resolved(); // first connect → wire
+        await controller.resolved(); // reconnect → refresh only
+        await controller.resolved(); // reconnect → refresh only
+
+        expect(wire).toHaveBeenCalledTimes(1);   // never re-registers
+        expect(layer.refresh).toHaveBeenCalledTimes(2);
+    });
+
+    it('retries wiring on a later resolve when the gates were not yet satisfied', async () => {
+        const layer = fakeLayer();
+        let call = 0;
+        const wire = vi.fn(async () => (call++ === 0 ? undefined : layer));
+        const controller = new TmuxLayerController(wire);
+
+        await controller.resolved(); // gate failed → no layer retained
+        await controller.resolved(); // now wired
+        await controller.resolved(); // reconnect → refresh
 
         expect(wire).toHaveBeenCalledTimes(2);
-        expect(refresh).toHaveBeenCalledTimes(1);
+        expect(layer.refresh).toHaveBeenCalledTimes(1);
+    });
+
+    it('a resolve arriving while wiring is in flight joins it instead of wiring twice', async () => {
+        const wire = vi.fn(async () => fakeLayer());
+        const controller = new TmuxLayerController(wire);
+
+        await Promise.all([controller.resolved(), controller.resolved()]);
+
+        expect(wire).toHaveBeenCalledTimes(1);
+    });
+
+    it('counts as wired while wiring is in flight', () => {
+        const controller = new TmuxLayerController(() => new Promise(() => { /* identity still resolving */ }));
+        void controller.resolved();
+
+        expect(controller.wired).toBe(true);
+    });
+
+    it('unwire disposes the layer and hands back its identity', async () => {
+        const layer = fakeLayer();
+        const controller = new TmuxLayerController(async () => layer);
+        await controller.resolved();
+
+        expect(controller.unwire()).toBe(layer.identity);
+        expect(layer.dispose).toHaveBeenCalledTimes(1);
+        expect(controller.wired).toBe(false);
+    });
+
+    it('rewire disposes the old layer before building the new one', async () => {
+        const first = fakeLayer();
+        const second = fakeLayer();
+        const layers = [first, second];
+        const controller = new TmuxLayerController(async () => layers.shift());
+        await controller.resolved();
+
+        await controller.rewire();
+
+        expect(first.dispose).toHaveBeenCalledTimes(1);
+        expect(controller.current).toBe(second);
+    });
+
+    it('a wiring superseded by unwire is disposed when it lands, never kept', async () => {
+        const layer = fakeLayer();
+        let land!: (value: TmuxTerminalLayer) => void;
+        const controller = new TmuxLayerController(() => new Promise<TmuxTerminalLayer>(resolve => {
+            land = resolve;
+        }));
+        const wiring = controller.resolved();
+        await Promise.resolve();
+
+        controller.unwire();
+        land(layer);
+
+        expect(await wiring).toBeUndefined();
+        expect(layer.dispose).toHaveBeenCalledTimes(1);
+        expect(controller.current).toBeUndefined();
+    });
+
+    it('a wiring that throws leaves nothing wired and lets the next resolve retry', async () => {
+        let call = 0;
+        const layer = fakeLayer();
+        const controller = new TmuxLayerController(async () => {
+            if (call++ === 0) {
+                throw new Error('boom');
+            }
+            return layer;
+        });
+
+        expect(await controller.resolved()).toBeUndefined();
+        expect(await controller.resolved()).toBe(layer);
+    });
+});
+
+describe('watchTmuxLayerInputs (05 b/h: settings and folder changes without a reload)', () => {
+    const SETTINGS: TmuxSettings = {
+        enabled: 'auto', historyLimit: 50000, reapOnConnect: true, handOff: 'auto', setDefaultProfile: true, orphanMaxAgeDays: 14,
+    };
+
+    function harness(over: { identity?: TmuxSessionContext | undefined; connected?: boolean } = {}) {
+        let configListener: ((e: { affectsConfiguration(section: string): boolean }) => void) | undefined;
+        let foldersListener: (() => void) | undefined;
+        const configSub = { dispose: vi.fn() };
+        const foldersSub = { dispose: vi.fn() };
+        const layer = fakeLayer();
+        const controller = new TmuxLayerController(async () => layer);
+        let settings = SETTINGS;
+        const reactions = {
+            controller,
+            readSettings: () => settings,
+            connected: () => over.connected ?? true,
+            currentIdentity: vi.fn(async () => ('identity' in over ? over.identity : layer.identity)),
+            clearDefaultProfile: vi.fn(),
+            offerCleanup: vi.fn(async () => undefined),
+            log: { trace: vi.fn() },
+        };
+        const watcher = watchTmuxLayerInputs({
+            onDidChangeConfiguration: listener => {
+                configListener = listener;
+                return configSub;
+            },
+            onDidChangeWorkspaceFolders: listener => {
+                foldersListener = listener;
+                return foldersSub;
+            },
+        }, reactions);
+        const change = (next: Partial<TmuxSettings>, section = 'remote.SSH.tmux'): void => {
+            settings = { ...settings, ...next };
+            configListener!({ affectsConfiguration: (s: string) => section.startsWith(s) || s.startsWith(section) });
+        };
+        return { watcher, layer, controller, reactions, change, configSub, foldersSub, folders: () => foldersListener!() };
+    }
+    const settle = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 0));
+
+    it('subscribes to both events and releases both on dispose', () => {
+        const { watcher, configSub, foldersSub } = harness();
+
+        watcher.dispose();
+
+        expect(configSub.dispose).toHaveBeenCalledTimes(1);
+        expect(foldersSub.dispose).toHaveBeenCalledTimes(1);
+    });
+
+    it('ignores configuration changes outside remote.SSH.tmux', async () => {
+        const { controller, change, layer } = harness();
+        await controller.resolved();
+
+        change({ historyLimit: 1 }, 'editor.fontSize');
+
+        expect(layer.reconfigure).not.toHaveBeenCalled();
+    });
+
+    it('turning persistent terminals off unwires, clears our default profile and offers cleanup', async () => {
+        const { controller, change, layer, reactions } = harness();
+        await controller.resolved();
+
+        change({ enabled: 'off' });
+
+        expect(layer.dispose).toHaveBeenCalledTimes(1);
+        expect(reactions.clearDefaultProfile).toHaveBeenCalledTimes(1);
+        expect(reactions.offerCleanup).toHaveBeenCalledWith(layer.identity);
+    });
+
+    it('turning them back on without a reload wires again', async () => {
+        const { controller, change } = harness();
+        await controller.resolved();
+        change({ enabled: 'off' });
+
+        change({ enabled: 'auto' });
+        await settle();
+
+        expect(controller.wired).toBe(true);
+    });
+
+    it('does not wire on a turn-on before the window is connected (the resolve will)', async () => {
+        const { controller, change } = harness({ connected: false });
+        change({ enabled: 'off' });
+
+        change({ enabled: 'auto' });
+
+        expect(controller.wired).toBe(false);
+    });
+
+    it('a live setting is handed to the wired layer', async () => {
+        const { controller, change, layer } = harness();
+        await controller.resolved();
+
+        change({ historyLimit: 1234 });
+
+        expect(layer.reconfigure).toHaveBeenCalledWith(expect.objectContaining({ historyLimit: 1234 }));
+    });
+
+    it('a folder change that keeps the identity changes nothing', async () => {
+        const { controller, layer, folders } = harness();
+        await controller.resolved();
+
+        folders();
+        await settle();
+
+        expect(layer.dispose).not.toHaveBeenCalled();
+    });
+
+    it('a folder change that moves the identity rewires the layer onto it', async () => {
+        const { controller, layer, folders, reactions } = harness({ identity: { hostKey: 'dev@h:22', workspaceKey: '/other', cwd: '/other' } });
+        await controller.resolved();
+
+        folders();
+        await settle();
+
+        expect(reactions.currentIdentity).toHaveBeenCalled();
+        expect(layer.dispose).toHaveBeenCalledTimes(1);
+        expect(controller.wired).toBe(true);
+    });
+
+    it('a folder change that leaves no folder unwires (no stale identity)', async () => {
+        const { controller, layer, folders, reactions } = harness({ identity: undefined });
+        await controller.resolved();
+
+        folders();
+        await settle();
+
+        expect(layer.dispose).toHaveBeenCalledTimes(1);
+        expect(reactions.clearDefaultProfile).toHaveBeenCalledTimes(1);
+        expect(controller.wired).toBe(false);
+    });
+});
+
+describe('offerBackgroundCleanup (05 b: what still runs after turning terminals off)', () => {
+    afterEach(() => {
+        shownMessages.information.length = 0;
+        shownMessages.warning.length = 0;
+        shownMessages.error.length = 0;
+    });
+    const IDENTITY: TmuxSessionContext = { hostKey: 'dev@h:22', workspaceKey: '/w', cwd: '/w', legacy: { hostKey: 'h', workspaceKey: '/w/' } };
+
+    it('words the offer without internals, singular and plural', () => {
+        expect(backgroundTerminalsMessage(1)).toBe('1 background terminal from this workspace is still running.');
+        expect(backgroundTerminalsMessage(3)).toBe('3 background terminals from this workspace are still running.');
+        expect(backgroundTerminalsMessage(3)).not.toMatch(/tmux|session/i);
+    });
+
+    it('asks once, and closes them (canonical + legacy identities) on "Close them"', async () => {
+        const reaper = { countWorkspaceSessions: vi.fn(async () => 2), killWorkspaceSessions: vi.fn(async () => ({ killed: 2, failed: 0 })) };
+        const ask = vi.fn(async () => CLOSE_BACKGROUND_TERMINALS);
+
+        await offerBackgroundCleanup(IDENTITY, { reaper, ask });
+
+        expect(ask).toHaveBeenCalledWith(backgroundTerminalsMessage(2), CLOSE_BACKGROUND_TERMINALS, KEEP_BACKGROUND_TERMINALS);
+        expect(reaper.killWorkspaceSessions).toHaveBeenCalledWith([
+            { hostKey: 'dev@h:22', workspaceKey: '/w' },
+            { hostKey: 'h', workspaceKey: '/w/' },
+        ]);
+    });
+
+    it.each([KEEP_BACKGROUND_TERMINALS, undefined])('keeps them on %j', async (answer) => {
+        const reaper = { countWorkspaceSessions: vi.fn(async () => 2), killWorkspaceSessions: vi.fn() };
+
+        await offerBackgroundCleanup(IDENTITY, { reaper, ask: async () => answer });
+
+        expect(reaper.killWorkspaceSessions).not.toHaveBeenCalled();
+    });
+
+    it.each([0, undefined])('does not ask when there is nothing (or nothing known) running: %j', async (count) => {
+        const ask = vi.fn();
+
+        await offerBackgroundCleanup(IDENTITY, { reaper: { countWorkspaceSessions: async () => count, killWorkspaceSessions: vi.fn() }, ask });
+
+        expect(ask).not.toHaveBeenCalled();
+    });
+});
+
+describe('maybeWarnTerminalLifetime (05 k: a host that ends processes at logout)', () => {
+    function deps(over: { risk?: boolean; dismissed?: string[] } = {}) {
+        const store = new Map<string, unknown>(over.dismissed ? [['tmux.lifetimeWarningDismissed.v1', over.dismissed]] : []);
+        return {
+            probe: vi.fn(async () => ({ lifetimeRisk: over.risk ?? true })),
+            state: {
+                get: <T>(key: string, fallback: T): T => (store.has(key) ? store.get(key) as T : fallback),
+                update: vi.fn(async (key: string, value: unknown) => {
+                    store.set(key, value);
+                }),
+            },
+            show: vi.fn(async (): Promise<string | undefined> => undefined),
+            openDocs: vi.fn(),
+            log: { trace: vi.fn() },
+            store,
+        };
+    }
+
+    it('warns once, in plain words, and remembers the dismissal for this host', async () => {
+        const d = deps();
+
+        await maybeWarnTerminalLifetime('dev@h:22', d);
+
+        expect(d.show).toHaveBeenCalledWith(LIFETIME_WARNING_MESSAGE, LIFETIME_LEARN_MORE);
+        expect(LIFETIME_WARNING_MESSAGE).not.toMatch(/tmux|session|systemd|logind/i);
+        expect(d.store.get('tmux.lifetimeWarningDismissed.v1')).toEqual(['dev@h:22']);
+    });
+
+    it('opens the troubleshooting entry on "Learn more"', async () => {
+        const d = deps();
+        d.show.mockResolvedValue(LIFETIME_LEARN_MORE);
+
+        await maybeWarnTerminalLifetime('dev@h:22', d);
+
+        expect(d.openDocs).toHaveBeenCalledWith(LIFETIME_DOCS_URL);
+        expect(LIFETIME_DOCS_URL).toMatch(/docs\/troubleshooting\.md#terminals-closed-after-disconnect$/);
+    });
+
+    it('never asks again for a host already dismissed (not even probing)', async () => {
+        const d = deps({ dismissed: ['dev@h:22'] });
+
+        await maybeWarnTerminalLifetime('dev@h:22', d);
+
+        expect(d.probe).not.toHaveBeenCalled();
+        expect(d.show).not.toHaveBeenCalled();
+    });
+
+    it('stays silent when there is no risk', async () => {
+        const d = deps({ risk: false });
+
+        await maybeWarnTerminalLifetime('dev@h:22', d);
+
+        expect(d.show).not.toHaveBeenCalled();
+    });
+});
+
+describe('canonical identity (05 c: the same target reached by alias or address is one identity)', () => {
+    it('an alias resolves through HostName/User/Port to what typing the address gives', () => {
+        const viaAlias = resolveSshTarget(new SSHDestination('myvps'), { HostName: '203.0.113.7', User: 'dev' }, 'local');
+        const viaAddress = resolveSshTarget(new SSHDestination('203.0.113.7', 'dev'), {}, 'local');
+
+        expect(viaAlias).toEqual(viaAddress);
+        expect(viaAlias).toEqual({ hostName: '203.0.113.7', user: 'dev', port: 22 });
+    });
+
+    it('expands %h in HostName against the host as typed', () => {
+        expect(resolveSshTarget(new SSHDestination('box'), { HostName: '%h.lan' }, 'local').hostName).toBe('box.lan');
+    });
+
+    it('takes the config Port, then the typed one, then 22; the local user last', () => {
+        expect(resolveSshTarget(new SSHDestination('h', undefined, 2200), { Port: '2222' }, 'me').port).toBe(2222);
+        expect(resolveSshTarget(new SSHDestination('h', undefined, 2200), {}, 'me').port).toBe(2200);
+        expect(resolveSshTarget(new SSHDestination('h'), {}, 'me')).toEqual({ hostName: 'h', user: 'me', port: 22 });
+    });
+
+    it('builds the provider context: canonical keys, raw path as cwd, legacy kept for adoption', () => {
+        const ctx = canonicalTmuxIdentity({ hostKey: 'myvps', workspaceKey: '/home/dev/proj/' }, { hostName: 'H', user: 'dev', port: 22 });
+
+        expect(ctx).toEqual({
+            hostKey: 'dev@h:22',
+            workspaceKey: '/home/dev/proj',
+            cwd: '/home/dev/proj/',
+            legacy: { hostKey: 'myvps', workspaceKey: '/home/dev/proj/' },
+        });
     });
 });
 
@@ -134,12 +507,35 @@ describe('onceOnly: connect-time housekeeping that must not repeat on reconnect'
 describe('readTmuxSettings: the four remote.SSH.tmux.* settings are read', () => {
     beforeEach(() => configOverrides.clear());
 
+    it('reads orphanMaxAgeDays (default 14, 0 allowed, garbage → default)', () => {
+        expect(readTmuxSettings().orphanMaxAgeDays).toBe(14);
+        configOverrides.set('remote.SSH.tmux.orphanMaxAgeDays', 0);
+        expect(readTmuxSettings().orphanMaxAgeDays).toBe(0);
+        configOverrides.set('remote.SSH.tmux.orphanMaxAgeDays', 30);
+        expect(readTmuxSettings().orphanMaxAgeDays).toBe(30);
+        for (const bad of [-1, 2.5, '7', null]) {
+            configOverrides.set('remote.SSH.tmux.orphanMaxAgeDays', bad);
+            expect(readTmuxSettings().orphanMaxAgeDays).toBe(14);
+        }
+    });
+
     it('falls back to the package.json defaults when nothing is configured', () => {
         const settings = readTmuxSettings();
         expect(settings.enabled).toBe('auto');
         expect(settings.historyLimit).toBe(50000);
         expect(settings.reapOnConnect).toBe(true);
         expect(settings.setDefaultProfile).toBe(true);
+        expect(settings.handOff).toBe('auto');
+    });
+
+    it.each(['auto', 'ask', 'never'])('reads remote.SSH.tmux.handOff=%s', (handOff) => {
+        configOverrides.set('remote.SSH.tmux.handOff', handOff);
+        expect(readTmuxSettings().handOff).toBe(handOff);
+    });
+
+    it('falls back to auto for an unrecognised handOff value', () => {
+        configOverrides.set('remote.SSH.tmux.handOff', 'sometimes');
+        expect(readTmuxSettings().handOff).toBe('auto');
     });
 
     it.each([false, true])('reads seeded values with setDefaultProfile=%s from the remote.SSH configuration section', (setDefaultProfile) => {
@@ -154,27 +550,84 @@ describe('readTmuxSettings: the four remote.SSH.tmux.* settings are read', () =>
         expect(settings.reapOnConnect).toBe(false);
         expect(settings.setDefaultProfile).toBe(setDefaultProfile);
     });
+
+    // A value tmux rejects used to abort the attach chain before `new-session`, so no
+    // terminal could open. The read seam clamps, so no setting can stop a terminal.
+    it.each([
+        [1.5, 50000],
+        [-1, 50000],
+        [1e10, 1_000_000],
+        ['5000', 50000],
+    ] as const)('clamps historyLimit %j to %j', (configured, expected) => {
+        configOverrides.set('remote.SSH.tmux.historyLimit', configured);
+        expect(readTmuxSettings().historyLimit).toBe(expected);
+    });
 });
 
 describe('decideTmuxWiring: enabled setting × tmux availability', () => {
+    const AVAILABLE = { available: true } as const;
+    const MISSING = { available: false, reason: 'not-installed' } as const;
+    const UNREACHABLE = { available: false, reason: 'unreachable' } as const;
+
     it('off → skip, whether or not tmux is available', () => {
-        expect(decideTmuxWiring('off', true)).toBe('skip');
-        expect(decideTmuxWiring('off', false)).toBe('skip');
+        expect(decideTmuxWiring('off', AVAILABLE)).toBe('skip');
+        expect(decideTmuxWiring('off', MISSING)).toBe('skip');
+        expect(decideTmuxWiring('off', UNREACHABLE)).toBe('skip');
     });
 
     it('auto → wire when available, skip silently when not', () => {
-        expect(decideTmuxWiring('auto', true)).toBe('wire');
-        expect(decideTmuxWiring('auto', false)).toBe('skip');
+        expect(decideTmuxWiring('auto', AVAILABLE)).toBe('wire');
+        expect(decideTmuxWiring('auto', MISSING)).toBe('skip');
     });
 
     it('on → wire when available, require-error when not (the "fail if unavailable" contract)', () => {
-        expect(decideTmuxWiring('on', true)).toBe('wire');
-        expect(decideTmuxWiring('on', false)).toBe('require-error');
+        expect(decideTmuxWiring('on', AVAILABLE)).toBe('wire');
+        expect(decideTmuxWiring('on', MISSING)).toBe('require-error');
+        expect(decideTmuxWiring('on', { available: false, reason: 'too-old' })).toBe('require-error');
+        expect(decideTmuxWiring('on', undefined)).toBe('require-error');
+    });
+
+    // A probe that could not be asked (channel error, missed deadline) is not evidence that
+    // tmux is missing. Telling an `'on'` user to "install tmux" would be false — and would
+    // leak tmux wording for a transient condition. Plain shells this resolve, retry next.
+    it('unreachable → retry silently, never require-error, under on and auto alike', () => {
+        expect(decideTmuxWiring('on', UNREACHABLE)).toBe('retry');
+        expect(decideTmuxWiring('auto', UNREACHABLE)).toBe('retry');
     });
 
     it('an unknown value degrades to auto behaviour', () => {
-        expect(decideTmuxWiring('weird', true)).toBe('wire');
-        expect(decideTmuxWiring('weird', false)).toBe('skip');
+        expect(decideTmuxWiring('weird', AVAILABLE)).toBe('wire');
+        expect(decideTmuxWiring('weird', MISSING)).toBe('skip');
+    });
+});
+
+describe('clipboardExec: the image paste/sweep commands are deadline-bounded too', () => {
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it('passes the raw result through untouched (no exit-code wrapping for the clipboard)', async () => {
+        const connection = { exec: vi.fn(async () => ({ stdout: '/home/u\n', stderr: '' })) };
+        const { resolver } = fakeResolver(connection);
+
+        expect(await clipboardExec(resolver, CLIPBOARD_PASTE_DEADLINE_MS)('printf %s "$HOME"'))
+            .toEqual({ stdout: '/home/u\n', stderr: '' });
+        expect(connection.exec).toHaveBeenCalledWith('printf %s "$HOME"');
+    });
+
+    it.each([
+        ['paste', CLIPBOARD_PASTE_DEADLINE_MS, 60000],
+        ['sweep', CLIPBOARD_SWEEP_DEADLINE_MS, 15000],
+    ])('rejects with a DeadlineError once the %s deadline passes', async (_label, deadline, expected) => {
+        expect(deadline).toBe(expected);
+        vi.useFakeTimers();
+        const connection = { exec: vi.fn(() => new Promise(() => { /* half-dead link */ })) };
+        const { resolver } = fakeResolver(connection);
+
+        const pending = clipboardExec(resolver, deadline)('true');
+        const assertion = expect(pending).rejects.toBeInstanceOf(DeadlineError);
+        await vi.advanceTimersByTimeAsync(deadline);
+        await assertion;
     });
 });
 
@@ -348,6 +801,70 @@ describe('reconcileDefaultTerminalProfile: applies the decision to Workspace sco
         reconcileDefaultTerminalProfile(noopLog, false);
         expect(updateCalls).toHaveLength(0);
     });
+
+    // Bug B: "wired" was logged ~2 s before this write reached the remote settings file, and a
+    // terminal opened in between was a plain shell. The wiring now waits for it, so the write
+    // must say when it has landed.
+    describe('settles when the write has landed (bug B)', () => {
+        afterEach(() => {
+            updateControl.result = undefined;
+            vi.useRealTimers();
+        });
+
+        it('resolves only once the Workspace write has landed', async () => {
+            let land!: () => void;
+            updateControl.result = () => new Promise<void>(resolve => {
+                land = resolve;
+            });
+            let settled = false;
+            const done = reconcileDefaultTerminalProfile(noopLog, true).then(() => { settled = true; });
+            await new Promise(res => setTimeout(res, 0));
+            expect(settled).toBe(false);
+
+            land();
+            await done;
+            expect(settled).toBe(true);
+        });
+
+        it('resolves at once when there is nothing to write', async () => {
+            inspectOverrides.set(DEFAULT_PROFILE_ID, { workspaceValue: 'zsh' });
+            await expect(reconcileDefaultTerminalProfile(noopLog, true)).resolves.toBeUndefined();
+        });
+
+        it('never rejects when the write fails, and says why in the log', async () => {
+            updateControl.result = () => Promise.reject(new Error('no workspace'));
+            const log = { trace: vi.fn() } as unknown as Log;
+            await expect(reconcileDefaultTerminalProfile(log, true)).resolves.toBeUndefined();
+            expect((log.trace as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain('no workspace');
+        });
+
+        it('stops waiting for a write that never lands (a hung remote must not hold the wiring)', async () => {
+            vi.useFakeTimers();
+            updateControl.result = () => new Promise<void>(() => { /* never lands */ });
+            let settled = false;
+            void reconcileDefaultTerminalProfile(noopLog, true).then(() => { settled = true; });
+
+            await vi.advanceTimersByTimeAsync(DEFAULT_PROFILE_WRITE_DEADLINE_MS);
+
+            expect(settled).toBe(true);
+        });
+
+        // Field replay (plan 101, step 6): over a real-latency link the remote settings write took
+        // ~6 s on a folder's first connect; a 5 s cap declared the layer wired before tmux was the
+        // default, so the first New Terminal was a plain shell. The cap must cover that with margin.
+        it('waits long enough for a real-latency remote write (~6 s measured) to land before wiring', async () => {
+            vi.useFakeTimers();
+            updateControl.result = () => new Promise<void>((resolve) => setTimeout(resolve, 6000));
+            let settled = false;
+            void reconcileDefaultTerminalProfile(noopLog, true).then(() => { settled = true; });
+
+            await vi.advanceTimersByTimeAsync(5999);
+            expect(settled).toBe(false);
+            await vi.advanceTimersByTimeAsync(1);
+            expect(settled).toBe(true);
+            expect(DEFAULT_PROFILE_WRITE_DEADLINE_MS).toBeGreaterThanOrEqual(15000);
+        });
+    });
 });
 
 // When tmux is unavailable or disabled, the "Persistent Shell" profile should still be
@@ -403,5 +920,34 @@ describe('FallbackTerminalProvider: graceful degradation when tmux is not wired'
     it('returns a fresh profile instance on every call (no shared/stale state)', () => {
         const provider = new FallbackTerminalProvider();
         expect(provider.provideTerminalProfile()).not.toBe(provider.provideTerminalProfile());
+    });
+});
+
+describe('hand-off UI and window close (03)', () => {
+    afterEach(() => {
+        vi.useRealTimers();
+        shownMessages.information.length = 0;
+        messageResponses.information = undefined;
+    });
+
+    // One non-modal notification, no tmux wording; only an explicit "Take over" counts.
+    it('offers with one plain-language notification and two buttons', async () => {
+        messageResponses.information = HAND_OFF_TAKE_OVER;
+
+        expect(await offerHandOff()).toBe(true);
+        expect(shownMessages.information).toEqual([[HAND_OFF_OFFER_MESSAGE, HAND_OFF_TAKE_OVER, HAND_OFF_NOT_NOW]]);
+        expect(HAND_OFF_OFFER_MESSAGE).not.toMatch(/tmux|session|detach/i);
+    });
+
+    it.each([HAND_OFF_NOT_NOW, undefined])('treats %j as not now', async (answer) => {
+        messageResponses.information = answer;
+        expect(await offerHandOff()).toBe(false);
+    });
+
+    // A closing window cannot reach the remote from here: VS Code kills the extension host
+    // ~4 ms after "terminate" (EDH bug A). The remote learns of the close from the connection
+    // dropping (the close watch), so deactivate has nothing to send.
+    it('sends nothing on deactivate', () => {
+        expect(deactivate()).toBeUndefined();
     });
 });

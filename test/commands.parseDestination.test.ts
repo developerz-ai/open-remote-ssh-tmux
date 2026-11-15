@@ -1,26 +1,25 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { promptOpenRemoteSSHWindow } from '../src/commands';
-import { executedCommands, inputBoxResponses, shownInputBoxes, shownMessages } from './mocks/vscode';
+import { executedCommands, shownMessages } from './mocks/vscode';
 
 // `promptOpenRemoteSSHWindow` is the command-input boundary: whatever the user
-// types into the "Enter [user@]hostname[:port]" box becomes the destination. It
+// picks or types into the "Connect to Host" pick becomes the destination. It
 // must go through `SSHDestination.parse` (the same parser used everywhere else —
 // bracketed IPv6, user@, :port) rather than being stuffed unparsed into the
 // hostname field via `new SSHDestination(raw)`, and it must reject input that
 // doesn't parse to a usable hostname instead of opening a window to "".
 
+/** The pick, as the simulated user answers it (`undefined` = dismissed). */
+const answer = (value: string | undefined) => (): Promise<string | undefined> => Promise.resolve(value);
+
 beforeEach(() => {
-    inputBoxResponses.value = undefined;
-    shownInputBoxes.length = 0;
     executedCommands.length = 0;
     shownMessages.error.length = 0;
 });
 
 describe('promptOpenRemoteSSHWindow', () => {
     it('parses user@host:port typed by the user instead of treating the raw string as the hostname', async () => {
-        inputBoxResponses.value = 'john@dev.example.com:2222';
-
-        await promptOpenRemoteSSHWindow(false);
+        await promptOpenRemoteSSHWindow(false, answer('john@dev.example.com:2222'));
 
         expect(executedCommands).toHaveLength(1);
         const [{ command, args }] = executedCommands;
@@ -33,31 +32,29 @@ describe('promptOpenRemoteSSHWindow', () => {
     });
 
     it('parses a bracketed IPv6 destination typed by the user', async () => {
-        inputBoxResponses.value = '[::1]:2222';
-
-        await promptOpenRemoteSSHWindow(false);
+        await promptOpenRemoteSSHWindow(false, answer('[::1]:2222'));
 
         expect(executedCommands).toHaveLength(1);
     });
 
     it('rejects input that does not parse to a usable hostname and opens no window', async () => {
-        inputBoxResponses.value = '@:22';
-
-        await promptOpenRemoteSSHWindow(false);
+        await promptOpenRemoteSSHWindow(false, answer('@:22'));
 
         expect(executedCommands).toHaveLength(0);
         expect(shownMessages.error).toHaveLength(1);
     });
 
-    it('wires a validateInput that rejects destinations with no hostname', async () => {
-        inputBoxResponses.value = undefined; // user cancels; we only inspect the wired options
+    it('opens nothing when the pick is dismissed', async () => {
+        await promptOpenRemoteSSHWindow(false, answer(undefined));
 
-        await promptOpenRemoteSSHWindow(false);
+        expect(executedCommands).toHaveLength(0);
+        expect(shownMessages.error).toHaveLength(0);
+    });
 
-        expect(shownInputBoxes).toHaveLength(1);
-        const { validateInput } = shownInputBoxes[0];
-        expect(validateInput).toBeTypeOf('function');
-        expect(validateInput?.('@:22')).toBeTruthy(); // error message for invalid input
-        expect(validateInput?.('dev.example.com')).toBeFalsy(); // no error for valid input
+    it('passes the window choice through to vscode.newWindow', async () => {
+        await promptOpenRemoteSSHWindow(true, answer('dev'));
+        await promptOpenRemoteSSHWindow(false, answer('dev'));
+
+        expect(executedCommands.map(({ args }) => (args[0] as { reuseWindow: boolean }).reuseWindow)).toEqual([true, false]);
     });
 });

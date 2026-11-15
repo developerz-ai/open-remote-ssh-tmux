@@ -29,7 +29,8 @@ $ARGUMENTS
    `TerminalProfileProvider` seam, session naming/attach-or-create/reap logic,
    `src/hostTreeView.ts` (session-manager UI), `package.json` `contributes`
    (commands/config/menus/views/terminal), and the connection plumbing in
-   `src/ssh/*` (we run tmux *over* it — read-only). Confirm the change stays in
+   `src/ssh/*` (we run tmux *over* it; upstream's — change only as a minimal
+   `Fork:` hunk, see `docs/upstream-sync.md`). Confirm the change stays in
    **scope: terminals only** and preserves the two hard invariants (**invisible
    UX**, **no zombie sessions**). Prefer `codegraph_*` for structural lookups.
    Skip only for trivial asks.
@@ -86,10 +87,14 @@ $ARGUMENTS
 
 ## Tests (write first — TDD)
 - The failing unit tests to author *before* the code, and what they assert (the
-  spec for this slice's pure logic). Command: `npm run compile:src`, `npm run lint`.
+  spec for this slice's pure logic), plus the rig specs (`test/integration/*.itest.ts`)
+  for anything that depends on how tmux really behaves. Commands: `npm test`,
+  `npm run test:tmux`, `npm run compile:src`, `npm run lint`.
 
 ## Verify
-- Unit tests green (test-first); `npm run compile:src` (tsc), `npm run lint`,
+- Unit tests green (test-first); `npm run test:tmux` green on every tmux version
+  for changes to `src/tmux/*` or any command line sent to the remote;
+  `npm run compile:src` (tsc), `npm run lint`,
   `npm run bundle`; for terminal changes, an F5 Extension Development Host connect
   proving persistence (disconnect→reconnect→same session; re-open workspace→no
   zombie) with tmux invisible to the user.
@@ -149,8 +154,8 @@ last_updated: <YYYY-MM-DD>
   `## Tests (write first — TDD)` section is the spec); no test, no merge.
 - Stack rules: TypeScript strict, no `any`, no unused locals/params, explicit
   `override`. 4-space indent (`.editorconfig`). npm + Node 20. Conventional
-  Commits (commitlint types: `build ci docs enhance feat fix perf refactor remodel
-  revert style test vcs`). Branch off `main`.
+  Commits (commitlint types: `build chore ci docs enhance feat fix perf refactor
+  remodel revert style test vcs`). Branch off `main`.
 - Dependency direction: `extension` → feature modules (`tmux/*`, `hostTreeView`,
   `commands`) → `ssh/*` | `serverSetup` → `common/*`; `common/*` never imports
   upward.

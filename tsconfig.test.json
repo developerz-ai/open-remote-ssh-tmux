@@ -27,7 +27,7 @@
 		"moduleResolution": "bundler",
 		"strict": true,
 		"exactOptionalPropertyTypes": false,
-		"useUnknownInCatchVariables": false,
+		"useUnknownInCatchVariables": true,
 		"alwaysStrict": true,
 		"noImplicitAny": true,
 		"noImplicitReturns": true,
@@ -50,6 +50,7 @@
 	],
 	"exclude": [
 		"node_modules",
-		".vscode-test"
+		".vscode-test",
+		"test/fixtures/lint"
 	]
 }

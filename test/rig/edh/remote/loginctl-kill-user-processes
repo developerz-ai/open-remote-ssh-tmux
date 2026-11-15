@@ -1,0 +1,10 @@
+#!/bin/sh
+# Row 36 stub: the rig has no systemd, so this stands in for logind's `loginctl` on a host
+# configured with `KillUserProcesses=yes` (logind.conf). It answers exactly the two queries
+# LIFETIME_PROBE_COMMAND (src/tmux/tmuxBootstrap.ts) sends, in loginctl's `-p` output form,
+# and fails anything else the way loginctl does without a running logind.
+case "$*" in
+  'show-session -p KillUserProcesses') echo 'KillUserProcesses=yes' ;;
+  'show-user '*' -p Linger') echo 'Linger=no' ;;
+  *) echo 'Failed to connect to bus: No such file or directory' >&2; exit 1 ;;
+esac

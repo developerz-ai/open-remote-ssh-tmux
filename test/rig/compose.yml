@@ -1,0 +1,65 @@
+# Real-tmux rig matrix: one sshd + tmux container per version. Started by run.sh only —
+# it generates the throwaway key, discovers the ephemeral ports and runs the
+# `integration` vitest project against them.
+#
+#   2.6  — the floor `tmuxBootstrap` claims (FLOOR_MAJOR/FLOOR_MINOR)
+#   3.0a — oldest 3.x line still shipped by LTS distros
+#   3.4  — the version the field remote (and the v1 acceptance rig) runs
+#   3.5a — first release whose `escape-time` default is no longer 500 ms
+#   3.8  — latest stable release at the time the rig was written (2026-11)
+#
+# Ports are published on 127.0.0.1 only, on a port Docker picks (`127.0.0.1::22`), so
+# the rig never listens on the network and never collides with a local sshd.
+
+x-rig: &rig
+  environment:
+    RIG_AUTHORIZED_KEY: ${RIG_AUTHORIZED_KEY:?start the rig through test/rig/run.sh}
+  ports:
+    - "127.0.0.1::22"
+  healthcheck:
+    test: ["CMD-SHELL", "pgrep -x sshd >/dev/null"]
+    interval: 1s
+    timeout: 2s
+    retries: 30
+
+services:
+  tmux-2.6:
+    <<: *rig
+    image: orst-tmux-rig:2.6
+    build:
+      context: .
+      args:
+        TMUX_VERSION: "2.6"
+        TMUX_SHA256: b17cd170a94d7b58c0698752e1f4f263ab6dc47425230df7e53a6435cc7cd7e8
+  tmux-3.0a:
+    <<: *rig
+    image: orst-tmux-rig:3.0a
+    build:
+      context: .
+      args:
+        TMUX_VERSION: "3.0a"
+        TMUX_SHA256: 4ad1df28b4afa969e59c08061b45082fdc49ff512f30fc8e43217d7b0e5f8db9
+  tmux-3.4:
+    <<: *rig
+    image: orst-tmux-rig:3.4
+    build:
+      context: .
+      args:
+        TMUX_VERSION: "3.4"
+        TMUX_SHA256: 551ab8dea0bf505c0ad6b7bb35ef567cdde0ccb84357df142c254f35a23e19aa
+  tmux-3.5a:
+    <<: *rig
+    image: orst-tmux-rig:3.5a
+    build:
+      context: .
+      args:
+        TMUX_VERSION: "3.5a"
+        TMUX_SHA256: 16216bd0877170dfcc64157085ba9013610b12b082548c7c9542cc0103198951
+  tmux-3.8:
+    <<: *rig
+    image: orst-tmux-rig:3.8
+    build:
+      context: .
+      args:
+        TMUX_VERSION: "3.8"
+        TMUX_SHA256: e79c699c7e949dccd0a4a125e17b8d1261e311b16979dbc8eb34542f3966d82e

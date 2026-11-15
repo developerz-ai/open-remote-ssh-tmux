@@ -44,13 +44,13 @@ const ANCHOR_3 = [
 ].join('\n');
 
 const UTILS_FIXTURE = [
-    "'use strict';",
+    `'use strict';`,
     '',
     ANCHOR_1,
     '',
     'function sigSSHToASN1(sig, type) {',
     '  switch (type) {',
-    "    case 'ecdsa-sha2-nistp256':",
+    `    case 'ecdsa-sha2-nistp256':`,
     '      {',
     ANCHOR_2,
     '      }',
@@ -66,8 +66,8 @@ const UTILS_FIXTURE = [
 ].join('\n');
 
 const KEX_FIXTURE = [
-    "const c = 'kex-strict-c-v00@openssh.com';",
-    "const s = 'kex-strict-s-v00@openssh.com';",
+    `const c = 'kex-strict-c-v00@openssh.com';`,
+    `const s = 'kex-strict-s-v00@openssh.com';`,
     '',
 ].join('\n');
 
@@ -194,7 +194,7 @@ describe('scripts/patch-ssh2.js', () => {
     });
 
     it('fails when kex.js lacks strict-kex (Terrapin guard)', () => {
-        fixture = makeFixture({ kex: "const c = 'kex-strict-c-v00@openssh.com';\n" });
+        fixture = makeFixture({ kex: `const c = 'kex-strict-c-v00@openssh.com';\n` });
         const before = fs.readFileSync(fixture.utilsPath);
 
         const result = fixture.run();

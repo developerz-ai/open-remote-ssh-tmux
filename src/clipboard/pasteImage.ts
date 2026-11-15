@@ -8,6 +8,7 @@ import {
     bracketedPaste,
     buildCleanupCommand,
     buildLocalCaptureCandidates,
+    buildRemoteHomeCommand,
     buildRemoteMkdirCommand,
     MKDIR_OK_MARKER,
     remoteImageDir,
@@ -138,7 +139,8 @@ export async function pasteClipboardImage(deps: PasteImageDeps): Promise<boolean
             return false;
         }
         if (capture.bytes.byteLength > MAX_IMAGE_BYTES) {
-            vscode.window.showErrorMessage(`Clipboard image is too large to upload (${Math.round(capture.bytes.byteLength / 1048576)} MB).`);
+            // Not awaited: the message resolves only when dismissed, and never rejects.
+            void vscode.window.showErrorMessage(`Clipboard image is too large to upload (${Math.round(capture.bytes.byteLength / 1048576)} MB).`);
             return true;
         }
 
@@ -165,7 +167,8 @@ export async function pasteClipboardImage(deps: PasteImageDeps): Promise<boolean
         // failure with nothing sensible to fall back to, so say it out loud rather than
         // performing a text paste the user did not ask for.
         deps.log.info(`clipboard image paste failed: ${errorText(err)}`);
-        vscode.window.showErrorMessage(`Could not paste the image into the remote terminal: ${errorText(err)}`);
+        // Not awaited: the message resolves only when dismissed, and never rejects.
+        void vscode.window.showErrorMessage(`Could not paste the image into the remote terminal: ${errorText(err)}`);
         return true;
     } finally {
         await rm(localPath, { force: true }).catch(() => { /* best-effort temp cleanup */ });
@@ -258,12 +261,10 @@ function runCaptureCandidate(candidate: CaptureCandidate, outPath: string): Prom
  * stdout, a restricted shell, `id` off PATH, a Windows remote). Since `SSHConnection#exec`
  * surfaces no exit code, a failed probe is indistinguishable from an odd one, so the only
  * safe answer to "I could not determine where this user's home is" is to refuse the upload.
- *
- * `printf` rather than `echo` because `echo` mangles a home path containing a backslash on
- * some shells; the result is validated as a plain absolute path before it is used.
+ * The result is validated as a plain absolute path before it is used.
  */
 async function resolveRemoteHome(exec: RemoteExec): Promise<string> {
-    const { stdout } = await exec('printf %s "$HOME"');
+    const { stdout } = await exec(buildRemoteHomeCommand());
     // A login shell can print a banner before the value, so take the last non-empty line
     // rather than the whole of stdout.
     const home = stdout.split('\n').map(line => line.trim()).filter(Boolean).pop() ?? '';

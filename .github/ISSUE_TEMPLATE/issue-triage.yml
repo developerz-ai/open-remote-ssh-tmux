@@ -62,14 +62,14 @@ body:
       value: |-
         # User Acknowledgements
         > [!TIP]
-        > Use these links to review the existing [Issues](https://github.com/jeanp413/open-remote-ssh/issues?q=sort%3Areactions-desc).
+        > Use these links to review the existing [Issues](https://github.com/developerz-ai/open-remote-ssh-tmux/issues?q=sort%3Areactions-desc).
 
   - type: checkboxes
     attributes:
       label: Validations
       description: "Before submitting the issue, please make sure you acknowledge that:"
       options:
-        - label: I have reviewed the FAQ and confirm that my issue is NOT among them.
+        - label: I have read the troubleshooting guide (docs/troubleshooting.md) and confirm that my issue is NOT covered there.
           required: true
         - label: I have searched the repository (both open and closed Issues) and confirm this is not a duplicate of an existing issue.
           required: true

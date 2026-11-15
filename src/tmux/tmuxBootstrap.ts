@@ -8,15 +8,22 @@
 // than an `SSHConnection`/`ssh2` handle, so the whole decision is pure and unit-
 // testable. It is also side-effect-free by design — no logging here; the caller
 // (the resolver wiring) logs one line from `reason`, keeping this module a leaf.
+// The second, advisory probe here (`probeLifetimeRisk`) asks whether the host ends a
+// user's processes at logout, which would take every terminal down on disconnect.
 // See docs/plans/2026/07/24/101-v1-tmux-release/03-remote-bootstrap.md.
+
+import { withDeadline } from '../common/deadline';
 
 /** The single remote-exec capability the probe needs. Matches the shape of
  * `SSHConnection#exec` (whose extra optional params are compatible), but named as
  * its own abstraction so this module never imports `ssh2`/`ssh`. */
 export type TmuxExec = (command: string) => Promise<{ stdout: string; stderr: string }>;
 
-/** Why tmux terminals are unavailable, when they are. Absent when available. */
-export type TmuxUnavailableReason = 'windows' | 'not-installed' | 'too-old';
+/** Why tmux terminals are unavailable, when they are. Absent when available.
+ * `unreachable` is the one transient reason: the probe could not be asked (channel error
+ * or {@link PROBE_DEADLINE_MS} passed). Nothing is cached — the resolver probes again on
+ * the next resolve, and the wiring retries then (`idempotentResolveHandler`). */
+export type TmuxUnavailableReason = 'windows' | 'not-installed' | 'too-old' | 'unreachable';
 
 /** The capability decision for one remote. */
 export interface TmuxCapability {
@@ -49,6 +56,11 @@ const PROBE_COMMAND = `sh -c 'command -v tmux && tmux -V'`;
 const FLOOR_MAJOR = 2;
 const FLOOR_MINOR = 6;
 
+/** How long the probe may take. It is awaited inside the resolver's `resolve()`, so this is
+ * the most a hung channel can ever delay the base SSH connect — the bound lives here, in the
+ * probe, rather than at the (upstream-derived) call site. */
+export const PROBE_DEADLINE_MS = 5000;
+
 /**
  * Probe a remote for a usable tmux.
  *
@@ -62,19 +74,21 @@ const FLOOR_MINOR = 6;
  * @param exec dependency-inverted remote command runner.
  * @param platform remote platform as surfaced by `serverSetup` (`'windows'` for a
  *   Windows remote, otherwise a Unix label or `undefined`).
+ * @param deadlineMs how long to wait for the probe before settling as `unreachable`.
  */
-export async function probeTmux(exec: TmuxExec, platform?: string): Promise<TmuxCapability> {
+export async function probeTmux(exec: TmuxExec, platform?: string, deadlineMs = PROBE_DEADLINE_MS): Promise<TmuxCapability> {
     if (platform === 'windows') {
         return { available: false, reason: 'windows' };
     }
 
     let stdout: string;
     try {
-        ({ stdout } = await exec(PROBE_COMMAND));
+        ({ stdout } = await withDeadline(exec(PROBE_COMMAND), deadlineMs, 'tmux probe'));
     } catch {
-        // The probe channel failed — not a tmux problem, but tmux is unusable
-        // here. Degrade gracefully (terminals off) rather than break the connect.
-        return { available: false, reason: 'not-installed' };
+        // The probe channel failed or hung — not a tmux verdict, but tmux is unusable for
+        // this resolve. Degrade gracefully (terminals off) rather than break or stall the
+        // connect; `unreachable` (not `not-installed`) so the log says what happened.
+        return { available: false, reason: 'unreachable' };
     }
 
     const version = parseVersionToken(stdout);
@@ -104,17 +118,18 @@ function parseVersionToken(stdout: string): string | undefined {
     return /^tmux (\S+)/m.exec(stdout)?.[1];
 }
 
-/** Extract the resolved binary path that `command -v tmux` prints on the first
- * stdout line. POSIX `command -v` prints an absolute path for an external command,
- * so we require a leading `/` — that also cleanly rejects the `tmux <version>` line
- * (present when the probe skipped straight to `tmux -V`) so it is never mistaken for
- * a path. Returns `undefined` when no such line was printed. */
+/** Extract the resolved binary path that `command -v tmux` prints. POSIX `command -v`
+ * prints an absolute path for an external command, so we require a leading `/` — that
+ * also rejects the `tmux <version>` line, so it is never mistaken for a path. Only lines
+ * BEFORE the version line count (the path is printed right before it), and the last
+ * absolute one wins: a login shell's rc file may print a banner first (verified on the
+ * real-tmux rig — reading line 1 only dropped the path and fell back to a bare `tmux`).
+ * Returns `undefined` when no such line was printed. */
 function parsePath(stdout: string): string | undefined {
-    const firstLine = stdout.split('\n', 1)[0]?.trim();
-    if (firstLine === undefined || !firstLine.startsWith('/')) {
-        return undefined;
-    }
-    return firstLine;
+    const lines = stdout.split('\n').map(line => line.trim());
+    const versionLine = lines.findIndex(line => /^tmux \S/.test(line));
+    const candidates = versionLine === -1 ? lines : lines.slice(0, versionLine);
+    return candidates.filter(line => line.startsWith('/')).pop();
 }
 
 /** Whether a version token clears the floor. `undefined` when the token has no
@@ -130,4 +145,57 @@ function versionMeetsFloor(versionToken: string): boolean | undefined {
         return major > FLOOR_MAJOR;
     }
     return minor >= FLOOR_MINOR;
+}
+
+/** What the remote's service manager says about the tmux server outliving the SSH login. */
+export interface LifetimeFacts {
+    /** logind's `KillUserProcesses`; `undefined` when it could not be read. */
+    readonly killUserProcesses?: boolean;
+    /** This user's `Linger`; `undefined` when it could not be read. Informational only. */
+    readonly linger?: boolean;
+    /** The terminals will probably not survive a disconnect on this host. */
+    readonly lifetimeRisk: boolean;
+}
+
+/**
+ * Ask systemd-logind whether it ends a user's processes at logout. The tmux server is
+ * started from the SSH login, so it lives in that login's session scope; with logind's
+ * `KillUserProcesses=yes` the scope — server and every terminal in it — is terminated when
+ * the connection closes. `Linger` is read too, for the log: it keeps the user's service
+ * manager running but does NOT exempt the session scope, so it does not change the verdict.
+ * `loginctl show-session` with no id prints the manager's properties. Each call is bounded
+ * by `timeout` where it exists (a wedged D-Bus must not hold the channel) and silenced; no
+ * loginctl at all (non-systemd, macOS) answers nothing, which reads as "unknown". One line:
+ * it runs under the remote login shell, and csh rejects a newline inside quotes.
+ */
+export const LIFETIME_PROBE_COMMAND = 'if command -v loginctl >/dev/null 2>&1; then '
+    + 't=; command -v timeout >/dev/null 2>&1 && t="timeout 3"; '
+    + '$t loginctl show-session -p KillUserProcesses 2>/dev/null; '
+    + '$t loginctl show-user "$(id -un)" -p Linger 2>/dev/null; fi; true';
+
+/** Read {@link LIFETIME_PROBE_COMMAND} output. Anything unrecognised is "unknown" — and
+ * unknown is never a risk: the warning is only worth showing on evidence. */
+export function parseLifetimeFacts(stdout: string): LifetimeFacts {
+    const flag = (key: string): boolean | undefined => {
+        const value = new RegExp(`^${key}=(yes|no)\\s*$`, 'm').exec(stdout)?.[1];
+        return value === undefined ? undefined : value === 'yes';
+    };
+    const killUserProcesses = flag('KillUserProcesses');
+    const linger = flag('Linger');
+    return {
+        ...(killUserProcesses === undefined ? {} : { killUserProcesses }),
+        ...(linger === undefined ? {} : { linger }),
+        lifetimeRisk: killUserProcesses === true,
+    };
+}
+
+/** Run the lifetime probe over a deadline-bounded runner. Never throws: a failed probe is
+ * "unknown". Kept apart from {@link probeTmux}, which the resolver awaits on every connect —
+ * this is advisory, so it must never be able to delay or fail the connect. */
+export async function probeLifetimeRisk(exec: TmuxExec): Promise<LifetimeFacts> {
+    try {
+        return parseLifetimeFacts((await exec(LIFETIME_PROBE_COMMAND)).stdout);
+    } catch {
+        return { lifetimeRisk: false };
+    }
 }

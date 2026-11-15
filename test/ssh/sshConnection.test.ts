@@ -1,3 +1,4 @@
+import * as net from 'net';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // A minimal stand-in for ssh2's `Client` — an EventEmitter whose `connect`/`end`
@@ -54,6 +55,15 @@ const { fakeClients, Client } = vi.hoisted(() => {
             const stream = new FakeExecStream();
             this.execStreams.push(stream);
             callback(undefined, stream);
+            return this;
+        }
+
+        forwardOutCalls = 0;
+
+        // Models a half-dead link: the channel-open request is sent and never
+        // answered, so the tunnel's accepted socket is left waiting forever.
+        forwardOut(): this {
+            this.forwardOutCalls++;
             return this;
         }
     }
@@ -232,5 +242,85 @@ describe('exec()/execPartial(): shell-quote params so each lands as one remote t
         await result;
 
         expect(client.execCalls).toEqual(['uname -s']);
+    });
+});
+
+async function connectedConnection() {
+    const conn = new SSHConnection({ host: 'h', username: 'u' });
+    const connectPromise = conn.connect();
+    fakeClients[0].emit('ready');
+    await connectPromise;
+    return { conn, client: fakeClients[0] };
+}
+
+// `.listen(port)` with no host binds every interface (`::`/`0.0.0.0`). The SOCKS
+// tunnel is an unauthenticated relay into the remote's network, so anyone on the
+// client's LAN could use it. Both tunnel kinds must bind loopback only.
+describe('addTunnel(): listeners bind loopback only', () => {
+    it('binds a port-forward tunnel to 127.0.0.1', async () => {
+        const { conn } = await connectedConnection();
+
+        const tunnel = await conn.addTunnel({ name: 't', remoteAddr: '127.0.0.1', remotePort: 1234, localPort: 0 });
+        try {
+            expect((tunnel.server.address() as net.AddressInfo).address).toBe('127.0.0.1');
+        } finally {
+            tunnel.server.close();
+        }
+    });
+
+    it('binds the SOCKS tunnel to 127.0.0.1', async () => {
+        const { conn } = await connectedConnection();
+
+        const tunnel = await conn.addTunnel({ name: 's', socks: true, localPort: 0 });
+        try {
+            expect((tunnel.server.address() as net.AddressInfo).address).toBe('127.0.0.1');
+        } finally {
+            tunnel.server.close();
+        }
+    });
+});
+
+// `close()` awaited `server.close(cb)`, which only calls back once every accepted
+// socket has ended. On a dead link the socket waiting on `forwardOut` never ends,
+// so `close()` never settled and the ssh2 client was never ended.
+describe('close(): settles on a dead link', () => {
+    it('settles and drops the tunnel socket when forwardOut never answers', async () => {
+        const { conn, client } = await connectedConnection();
+        const tunnel = await conn.addTunnel({ name: 't', remoteAddr: '127.0.0.1', remotePort: 1234, localPort: 0 });
+
+        const socket = net.connect(tunnel.localPort!, '127.0.0.1');
+        const socketClosed = new Promise<void>((resolve) => socket.on('close', () => resolve()));
+        socket.on('error', () => { /* reset by the destroy is expected */ });
+        await vi.waitFor(() => expect(client.forwardOutCalls).toBe(1));
+
+        const end = vi.spyOn(client, 'end');
+        await conn.close();
+
+        expect(end).toHaveBeenCalled();
+        await socketClosed;
+    }, 5000);
+});
+
+describe('connect(): never rejects with null', () => {
+    it('rejects with an Error when the link closes before ready without an error event', async () => {
+        const conn = new SSHConnection({ host: 'h', username: 'u' });
+        const connecting = conn.connect();
+
+        fakeClients[0].emit('close');
+
+        await expect(connecting).rejects.toBeInstanceOf(Error);
+    });
+});
+
+describe('exec(): a channel error rejects instead of hanging', () => {
+    it('rejects with the stream error', async () => {
+        const { conn, client } = await connectedConnection();
+
+        const result = conn.exec('true');
+        await vi.waitFor(() => expect(client.execStreams).toHaveLength(1));
+        const err = new Error('channel broke');
+        client.execStreams[0].emit('error', err);
+
+        await expect(result).rejects.toBe(err);
     });
 });

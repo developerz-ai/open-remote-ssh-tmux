@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from 'vitest';
-import { probeTmux } from '../../src/tmux/tmuxBootstrap';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { LIFETIME_PROBE_COMMAND, parseLifetimeFacts, PROBE_DEADLINE_MS, probeLifetimeRisk, probeTmux } from '../../src/tmux/tmuxBootstrap';
 
 // The capability probe is dependency-inverted: it takes an exec function (not an
 // `SSHConnection`), so the whole gate is unit-testable here with no ssh2. It
@@ -50,10 +50,6 @@ describe('probeTmux — not installed', () => {
         expect(await probeTmux(execWith('/usr/bin/tmux'))).toEqual({ available: false, reason: 'not-installed' });
     });
 
-    it('degrades to not-installed if the probe channel errors (never breaks the connect)', async () => {
-        const exec = vi.fn(async () => { throw new Error('channel closed'); });
-        expect(await probeTmux(exec)).toEqual({ available: false, reason: 'not-installed' });
-    });
 
     it('degrades (no throw) on a csh-style failure — error on stderr, empty stdout', async () => {
         // A csh/tcsh login shell that still choked on the probe: its complaint on
@@ -107,6 +103,29 @@ describe('probeTmux — resolved path', () => {
         const result = await probeTmux(execWith('tmux 3.2a'));
         expect(result.path).toBeUndefined();
     });
+
+    // A login shell's rc file can print before the probe runs (`echo Welcome` in
+    // ~/.bashrc, a motd). Reading only line 1 dropped the path and launched a bare `tmux`,
+    // which breaks nix / ~/.local/bin installs — reproduced on the real-tmux rig.
+    it('finds the path after login-shell banner lines', async () => {
+        const exec = execWith('Welcome to the rig\nLast login: today\n/usr/local/bin/tmux\ntmux 3.4\n');
+        expect(await probeTmux(exec)).toEqual({ available: true, version: '3.4', path: '/usr/local/bin/tmux' });
+    });
+
+    it('takes the LAST absolute-path line when a banner line also starts with /', async () => {
+        const exec = execWith('/etc/motd says hi\n/home/u/.nix-profile/bin/tmux\ntmux 3.4\n');
+        expect((await probeTmux(exec)).path).toBe('/home/u/.nix-profile/bin/tmux');
+    });
+
+    it('keeps a path containing spaces whole', async () => {
+        const exec = execWith('/home/a b/.local/bin/tmux\r\ntmux 3.4\r\n');
+        expect((await probeTmux(exec)).path).toBe('/home/a b/.local/bin/tmux');
+    });
+
+    it('ignores absolute-path lines printed after the version line', async () => {
+        const exec = execWith('/usr/bin/tmux\ntmux 3.4\n/etc/logout-noise\n');
+        expect((await probeTmux(exec)).path).toBe('/usr/bin/tmux');
+    });
 });
 
 describe('probeTmux — version token edges', () => {
@@ -140,5 +159,91 @@ describe('probeTmux — platform gate', () => {
         const exec = execWith('tmux 3.2a');
         await probeTmux(exec, 'linux');
         expect(exec).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('probeTmux — unreachable (bounded, never breaks the connect)', () => {
+    // `probeTmux` is awaited inside the resolver's `resolve()`, so a probe that hangs on a
+    // half-dead channel would hang the base SSH connect with it. The deadline lives here,
+    // in the probe itself, so no caller can forget it.
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it('degrades to unreachable if the probe channel errors', async () => {
+        const exec = vi.fn(async () => { throw new Error('channel closed'); });
+        expect(await probeTmux(exec)).toEqual({ available: false, reason: 'unreachable' });
+    });
+
+    it('settles as unreachable (no throw) when the probe never answers', async () => {
+        vi.useFakeTimers();
+        const exec = vi.fn(() => new Promise<{ stdout: string; stderr: string }>(() => { /* hung */ }));
+
+        const result = probeTmux(exec);
+        await vi.advanceTimersByTimeAsync(PROBE_DEADLINE_MS);
+
+        await expect(result).resolves.toEqual({ available: false, reason: 'unreachable' });
+    });
+
+    it('does not give up before the deadline', async () => {
+        vi.useFakeTimers();
+        let answer!: (value: { stdout: string; stderr: string }) => void;
+        const exec = vi.fn(() => new Promise<{ stdout: string; stderr: string }>(res => { answer = res; }));
+
+        const result = probeTmux(exec);
+        await vi.advanceTimersByTimeAsync(PROBE_DEADLINE_MS - 1);
+        answer({ stdout: 'tmux 3.4', stderr: '' });
+
+        await expect(result).resolves.toEqual({ available: true, version: '3.4' });
+    });
+
+    it('uses a five-second deadline', () => {
+        expect(PROBE_DEADLINE_MS).toBe(5000);
+    });
+});
+
+describe('terminal lifetime facts (05 k: hosts that end a user\'s processes at logout)', () => {
+    // systemd-logind with `KillUserProcesses=yes` terminates the login session's scope —
+    // and the tmux server started from it — when the SSH connection closes. Every terminal
+    // then dies on disconnect, silently. We only detect and warn (no wrapper).
+
+    it('flags the risk when logind kills user processes at logout', () => {
+        expect(parseLifetimeFacts('KillUserProcesses=yes\nLinger=no\n')).toEqual({ killUserProcesses: true, linger: false, lifetimeRisk: true });
+    });
+
+    it('lingering does not protect the login session scope — still a risk', () => {
+        expect(parseLifetimeFacts('KillUserProcesses=yes\nLinger=yes\n').lifetimeRisk).toBe(true);
+    });
+
+    it('no risk on the common default (processes survive logout)', () => {
+        expect(parseLifetimeFacts('KillUserProcesses=no\nLinger=no\n')).toEqual({ killUserProcesses: false, linger: false, lifetimeRisk: false });
+    });
+
+    it('unknown (no loginctl, a non-systemd host, garbage) is not a risk', () => {
+        expect(parseLifetimeFacts('')).toEqual({ lifetimeRisk: false });
+        expect(parseLifetimeFacts('Failed to connect to bus: No such file or directory')).toEqual({ lifetimeRisk: false });
+        expect(parseLifetimeFacts('KillUserProcesses=maybe')).toEqual({ lifetimeRisk: false });
+    });
+
+    it('tolerates banner noise and CRLF', () => {
+        expect(parseLifetimeFacts('Welcome!\r\nKillUserProcesses=yes\r\n').lifetimeRisk).toBe(true);
+    });
+
+    it('asks logind only, with every call bounded and every failure silent', () => {
+        expect(LIFETIME_PROBE_COMMAND).toContain('loginctl show-session -p KillUserProcesses');
+        expect(LIFETIME_PROBE_COMMAND).toContain('loginctl show-user "$(id -un)" -p Linger');
+        expect(LIFETIME_PROBE_COMMAND).toContain('timeout');
+        expect(LIFETIME_PROBE_COMMAND).not.toContain('\n'); // one line: a csh login shell rejects newlines
+    });
+
+    it('probeLifetimeRisk runs the command and reads its answer', async () => {
+        const exec = vi.fn(async () => ({ stdout: 'KillUserProcesses=yes\nLinger=no\n', stderr: '', code: 0 }));
+
+        expect(await probeLifetimeRisk(exec)).toMatchObject({ lifetimeRisk: true });
+        expect(exec).toHaveBeenCalledWith(LIFETIME_PROBE_COMMAND);
+    });
+
+    it('probeLifetimeRisk reads a failed or rejected probe as "unknown", never throws', async () => {
+        expect(await probeLifetimeRisk(vi.fn(async () => { throw new Error('deadline'); }))).toEqual({ lifetimeRisk: false });
     });
 });

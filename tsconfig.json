@@ -28,7 +28,7 @@
 		"outDir": "./out",
 		"sourceMap": true,
 		"exactOptionalPropertyTypes": false,
-		"useUnknownInCatchVariables": false,
+		"useUnknownInCatchVariables": true,
 		"alwaysStrict": true,
 		"noImplicitAny": true,
 		"noImplicitReturns": true,

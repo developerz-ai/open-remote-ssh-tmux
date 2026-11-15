@@ -130,8 +130,11 @@ describe('package.json manifest drift guard', () => {
         it('declares remote.SSH.tmux.historyLimit with the documented default', () => {
             const historyLimit = properties['remote.SSH.tmux.historyLimit'];
             expect(historyLimit).toBeDefined();
-            expect(historyLimit.type).toBe('number');
+            expect(historyLimit.type).toBe('integer');
             expect(historyLimit.default).toBe(50000);
+            // Same bounds as clampHistoryLimit, so the Settings UI rejects what tmux would.
+            expect(historyLimit.minimum).toBe(0);
+            expect(historyLimit.maximum).toBe(1_000_000);
         });
 
         it('declares remote.SSH.tmux.reapOnConnect with the documented default', () => {
@@ -141,10 +144,42 @@ describe('package.json manifest drift guard', () => {
             expect(reapOnConnect.default).toBe(true);
         });
 
+        it('declares remote.SSH.tmux.orphanMaxAgeDays with the documented default (05)', () => {
+            const orphanMaxAgeDays = properties['remote.SSH.tmux.orphanMaxAgeDays'];
+            expect(orphanMaxAgeDays).toBeDefined();
+            expect(orphanMaxAgeDays.type).toBe('integer');
+            expect(orphanMaxAgeDays.default).toBe(14);
+            expect(orphanMaxAgeDays.minimum).toBe(0);
+            expect(orphanMaxAgeDays.scope).toBe('application');
+            // Invisible UX: the setting describes terminals, not the tmux machinery behind them.
+            expect(String(orphanMaxAgeDays.markdownDescription)).not.toMatch(/tmux/i);
+        });
+
+        it('declares remote.SSH.tmux.handOff with the documented default', () => {
+            const handOff = properties['remote.SSH.tmux.handOff'];
+            expect(handOff).toBeDefined();
+            expect(handOff.type).toBe('string');
+            expect(handOff.default).toBe('auto');
+            // Same values toHandOffPolicy accepts; anything else falls back to the default.
+            expect(handOff.enum).toEqual(['auto', 'ask', 'never']);
+            expect((handOff.enumDescriptions as string[]).length).toBe(3);
+            // Invisible UX: the setting describes machines and terminals, never tmux.
+            expect(String(handOff.markdownDescription)).not.toMatch(/tmux|detach|session/i);
+        });
+
+        it('every declared remote.SSH.tmux.handOff enum value is understood by src/tmux/slotState.ts', () => {
+            const slotStateSrc = fs.readFileSync(path.resolve(srcDir, 'tmux', 'slotState.ts'), 'utf8');
+            const values = properties['remote.SSH.tmux.handOff'].enum as string[];
+            expect(values.filter(value => !slotStateSrc.includes(`'${value}'`))).toEqual([]);
+        });
+
         it('every remote.SSH.tmux.* setting mentioned in docs/ exists in package.json', () => {
-            // Collect all `remote.SSH.tmux.*` setting names from docs/
+            // Collect all `remote.SSH.tmux.*` setting names from docs/. Plans under
+            // docs/plans/ are excluded: they propose settings that do not exist *yet*
+            // (a plan is a work order, not a promise to users).
             const docsDir = path.resolve(repoRoot, 'docs');
-            const allMarkdownFiles = collectAllMarkdownFiles(docsDir);
+            const plansDir = path.join(docsDir, 'plans') + path.sep;
+            const allMarkdownFiles = collectAllMarkdownFiles(docsDir).filter(file => !file.startsWith(plansDir));
 
             const mentionedSettingsInDocs = new Set<string>();
             const tmuxSettingRegex = /remote\.SSH\.tmux\.\w+/g;
@@ -173,10 +208,12 @@ describe('package.json manifest drift guard', () => {
         // Reverse of the guard above: catches a setting shipped in package.json that nobody
         // documented (the forward guard at :126 only catches docs promising a setting that
         // doesn't exist; this one catches a setting existing that docs never mention).
-        it('every remote.SSH.tmux.* setting in package.json is mentioned in docs/', () => {
+        // Plans don't count here either: a plan naming a setting documents nothing for users.
+        it('every remote.SSH.tmux.* setting in package.json is mentioned in README.md or docs/ (plans excluded)', () => {
             const docsDir = path.resolve(repoRoot, 'docs');
-            const allMarkdownFiles = collectAllMarkdownFiles(docsDir);
-            const docsContents = allMarkdownFiles.map(file => fs.readFileSync(file, 'utf8')).join('\n');
+            const plansDir = path.join(docsDir, 'plans') + path.sep;
+            const userDocs = [path.resolve(repoRoot, 'README.md'), ...collectAllMarkdownFiles(docsDir).filter(file => !file.startsWith(plansDir))];
+            const docsContents = userDocs.map(file => fs.readFileSync(file, 'utf8')).join('\n');
 
             const tmuxSettingKeys = Object.keys(properties).filter(key => key.startsWith('remote.SSH.tmux.'));
             expect(tmuxSettingKeys.length).toBeGreaterThan(0);
@@ -185,7 +222,7 @@ describe('package.json manifest drift guard', () => {
 
             expect(
                 undocumented,
-                `These remote.SSH.tmux.* settings exist in package.json but are never mentioned in docs/: ${undocumented.join(', ')}`
+                `These remote.SSH.tmux.* settings exist in package.json but are never mentioned in README.md or docs/: ${undocumented.join(', ')}`
             ).toEqual([]);
         });
 
@@ -235,8 +272,9 @@ describe('package.json manifest drift guard', () => {
             expect(activationEvents!.some(e => e === 'onTerminalProfile:tmux')).toBe(true);
         });
 
-        // `engines.vscode` (^1.70.2) predates VS Code's implicit-activation-events cutoff
-        // (~1.74), so every command that can actually be invoked before the extension is
+        // `engines.vscode` was ^1.70.2 when this was written — before VS Code's
+        // implicit-activation-events cutoff (~1.74) — and the explicit entries stay so the
+        // manifest is self-describing whatever the floor. Every command that can actually be invoked before the extension is
         // otherwise activated needs its own `onCommand:<id>` entry — pins the 06 fix
         // (`onCommand:openremotessh.tmux.killWorkspaceSessions` was missing, breaking
         // palette invocation pre-1.74). Commands hidden from the palette via a
@@ -306,6 +344,7 @@ describe('package.json manifest drift guard', () => {
             const stripComments = (source: string): string => source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
             const callers = fs.readdirSync(srcDir, { recursive: true, encoding: 'utf8' })
                 .filter(file => file.endsWith('.ts'))
+                .map(file => file.split(path.sep).join('/'))
                 .filter(file => /registerTerminalProfileProvider\s*\(/.test(stripComments(fs.readFileSync(path.resolve(srcDir, file), 'utf8'))));
             expect(callers, 'registerTerminalProfileProvider must be called only by tmux/profileRegistration.ts')
                 .toEqual(['tmux/profileRegistration.ts']);
@@ -371,8 +410,8 @@ describe('package.json manifest drift guard', () => {
         });
 
         it('documents both installation steps, npm PATH, and non-mutating help checks', () => {
-            const readme = fs.readFileSync(path.join(repoRoot, 'README.md'), 'utf8');
-            const maintenance = readme.split('### Maintenance tools (Linux/macOS)')[1]?.split('\n### ')[0];
+            const contributing = fs.readFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), 'utf8');
+            const maintenance = contributing.split('### Maintenance tools (Linux/macOS)')[1]?.split('\n### ')[0];
             expect(maintenance).toBeDefined();
             const text = maintenance!.replace(/\s+/g, ' ');
             expect(text).toContain('Complete maintenance setup requires **both** steps');
@@ -514,6 +553,13 @@ describe('package.json manifest drift guard', () => {
             expect(scripts['update:dts']).not.toMatch(/vscode-dts/);
         });
 
+        // The honest floor: the bundled runtime deps need Node 20 (lru-cache@11 under
+        // glob@14 declares `20 || >=22`), and VS Code 1.90 (Electron 29) is the first whose
+        // extension host runs Node 20. A lower floor promises hosts the bundle cannot run on.
+        it('engines.vscode floor is ^1.90.0, the first release with a Node 20 extension host', () => {
+            expect(engines.vscode).toBe('^1.90.0');
+        });
+
         it('fetches typings from a literal VS Code release at every invocation, engines-compatible', () => {
             const updateDts = scripts['update:dts'];
 
@@ -638,6 +684,11 @@ describe('package.json manifest drift guard', () => {
         it('is published under the fork org, not upstream\'s jeanp413', () => {
             expect(pkg.publisher).not.toBe('jeanp413');
             expect(pkg.publisher).toBe('developerz-ai');
+        });
+
+        it('declares the MIT license LICENSE.txt grants', () => {
+            expect(fs.readFileSync(path.join(repoRoot, 'LICENSE.txt'), 'utf8')).toMatch(/^MIT License/);
+            expect(pkg.license).toBe('MIT');
         });
 
         it('repository url points at the fork org, not upstream jeanp413/open-remote-ssh', () => {

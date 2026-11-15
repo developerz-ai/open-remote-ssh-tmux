@@ -1,4 +1,8 @@
 #!/bin/sh
-# Compile, lint, and test
+# Compile, lint, and test. `--full` also runs the real-tmux rig (needs docker; slow).
 
-npm run compile:src && npm run lint && npm test
+npm run compile:src && npm run lint && npm test || exit 1
+
+if [ "${1:-}" = "--full" ]; then
+  npm run test:tmux
+fi

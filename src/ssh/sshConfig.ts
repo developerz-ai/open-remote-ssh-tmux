@@ -63,6 +63,12 @@ const SSH_CONFIG_PROPERTIES: Record<string, string> = {
     'proxyjump': 'ProxyJump',
     'proxycommand': 'ProxyCommand',
     'include': 'Include',
+    // Fork: read by the host verifier and the connect config's keepalive.
+    'userknownhostsfile': 'UserKnownHostsFile',
+    'globalknownhostsfile': 'GlobalKnownHostsFile',
+    'hostkeyalias': 'HostKeyAlias',
+    'serveraliveinterval': 'ServerAliveInterval',
+    'serveralivecountmax': 'ServerAliveCountMax',
 };
 
 function normalizeProp(prop: Directive) {

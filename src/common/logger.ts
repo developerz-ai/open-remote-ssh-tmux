@@ -4,6 +4,9 @@ import { inspect } from 'node:util';
 
 type LogLevel = 'Trace' | 'Info' | 'Error';
 
+/** `vscode.LogLevel.Trace`, as a literal so a host without `env.logLevel` cannot throw here. */
+const TRACE_LOG_LEVEL = 1;
+
 export default class Log {
     private output: vscode.OutputChannel;
 
@@ -12,6 +15,12 @@ export default class Log {
     }
 
     public trace(message: string, data?: unknown): void {
+        // Fork: a plain OutputChannel has no level of its own, so follow VS Code's
+        // (`env.logLevel`, 1.74+; absent on older hosts, which keep the old always-on).
+        const level = (vscode.env as { logLevel?: number }).logLevel;
+        if (level !== undefined && level !== TRACE_LOG_LEVEL) {
+            return;
+        }
         this.logLevel('Trace', message, data);
     }
 

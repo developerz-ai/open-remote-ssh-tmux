@@ -1,0 +1,18 @@
+{
+	"name": "edh-probe",
+	"displayName": "EDH probe",
+	"description": "Row 17 fixture: a workspace-kind extension that records where it runs.",
+	"publisher": "edh",
+	"version": "0.0.1",
+	"license": "MIT",
+	"engines": {
+		"vscode": "^1.80.0"
+	},
+	"extensionKind": [
+		"workspace"
+	],
+	"activationEvents": [
+		"*"
+	],
+	"main": "./extension.js"
+}

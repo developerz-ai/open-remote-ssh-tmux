@@ -1,4 +1,5 @@
 import { describe, expect, it, afterEach, vi } from 'vitest';
+import { env } from '../mocks/vscode';
 import Log from '../../src/common/logger';
 
 // `now()` is private but its only observable effect is the timestamp prefix
@@ -38,5 +39,41 @@ describe('Log timestamp formatting', () => {
         const [line] = linesOf(log);
         expect(line).toContain('00:00:00.007');
         expect(line).not.toContain('00:00:00.7]');
+    });
+});
+
+// `trace` used to append unconditionally, so every connect dumped the full install
+// script into the default-visible channel. It now follows VS Code's log level
+// (`env.logLevel`, 1.74+; `Trace` = 1): trace lines only when the user asked for them.
+describe('Log.trace level gating', () => {
+    const mutableEnv = env as { logLevel?: number };
+
+    afterEach(() => {
+        delete mutableEnv.logLevel;
+    });
+
+    it('suppresses trace above the Trace level', () => {
+        mutableEnv.logLevel = 3; // Info
+        const log = new Log('test');
+        log.trace('hidden');
+        log.info('shown');
+
+        expect(linesOf(log)).toHaveLength(1);
+        expect(linesOf(log)[0]).toContain('shown');
+    });
+
+    it('emits trace at the Trace level', () => {
+        mutableEnv.logLevel = 1; // Trace
+        const log = new Log('test');
+        log.trace('visible', 'data');
+
+        expect(linesOf(log)).toHaveLength(2);
+    });
+
+    it('emits trace on a host without env.logLevel (pre-1.74), as before', () => {
+        const log = new Log('test');
+        log.trace('visible');
+
+        expect(linesOf(log)).toHaveLength(1);
     });
 });

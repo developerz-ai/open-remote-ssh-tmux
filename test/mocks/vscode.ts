@@ -5,8 +5,12 @@
 
 export const version = '1.70.2';
 
-export const env = {
+export const env: { appRoot: string; machineId: string; remoteName?: string; remoteAuthority?: string } = {
     appRoot: '/vscode/appRoot',
+    machineId: 'test-machine-id',
+    // Undefined models a local window; a test sets these to model a remote one.
+    remoteName: undefined,
+    remoteAuthority: undefined,
 };
 
 /**
@@ -29,6 +33,10 @@ export const inspectOverrides = new Map<string, { globalValue?: unknown; workspa
  * what — and whether — the extension wrote, and at which scope.
  */
 export const updateCalls: { id: string; value: unknown; target: unknown }[] = [];
+
+/** What the next `config.update(...)` calls settle with. Unset: they resolve at once. A test
+ * sets `result` to hold a write open (the remote settings file not written yet) or fail it. */
+export const updateControl: { result?: () => Promise<void> } = {};
 
 /** Mirror of `vscode.ConfigurationTarget` (values match the real enum) — the default-profile
  * write targets `Workspace`; exposed so a test can assert the scope. */
@@ -60,7 +68,7 @@ class MockWorkspaceConfiguration {
     public update(key: string, value: unknown, target?: unknown): Promise<void> {
         const id = this.section ? `${this.section}.${key}` : key;
         updateCalls.push({ id, value, target });
-        return Promise.resolve();
+        return updateControl.result ? updateControl.result() : Promise.resolve();
     }
 }
 
@@ -74,6 +82,13 @@ export interface UriLike {
     authority: string;
     path: string;
 }
+
+/** `vscode.Uri.from` — the components are all a test inspects, so they are the "Uri". */
+export const Uri = {
+    from(components: UriLike): UriLike {
+        return { ...components };
+    },
+};
 
 export const workspace: {
     workspaceFile?: UriLike;
@@ -128,7 +143,7 @@ class MockOutputChannel {
  * button label it wants the simulated user to click (or leaves it `undefined` to
  * model dismiss/cancel). Mirrors the real API returning the chosen item.
  */
-export const messageResponses: { warning: unknown } = { warning: undefined };
+export const messageResponses: { warning: unknown; information: unknown } = { warning: undefined, information: undefined };
 
 /** Messages surfaced via the `window.show*Message` APIs, recorded (message + items)
  * per call so a test can assert what — and whether — a dialog was shown. */
@@ -143,7 +158,88 @@ export const inputBoxResponses: { value: string | undefined } = { value: undefin
  * before the value is even returned to the caller. */
 export const shownInputBoxes: { title?: string; validateInput?: (value: string) => string | undefined | null }[] = [];
 
+/** Mirror of `vscode.QuickPickItemKind` (values match the real enum). */
+export enum QuickPickItemKind {
+    Separator = -1,
+    Default = 0,
+}
+
+type Listener<T> = (value: T) => void;
+
+/** A tiny event: `fire` calls every listener; the returned disposable unsubscribes. */
+class MockEvent<T> {
+    private readonly listeners = new Set<Listener<T>>();
+
+    public readonly event = (listener: Listener<T>): { dispose(): void } => {
+        this.listeners.add(listener);
+        return { dispose: () => void this.listeners.delete(listener) };
+    };
+
+    public fire(value: T): void {
+        for (const listener of [...this.listeners]) {
+            listener(value);
+        }
+    }
+}
+
+/**
+ * Stand-in for `vscode.QuickPick`: holds the properties production sets, and lets a test
+ * play the user — `type(value)` (fires `onDidChangeValue`), `accept(item?)` (selects, then
+ * fires `onDidAccept`), `hide()` (Escape).
+ */
+export class MockQuickPick<T> {
+    public title: string | undefined;
+    public placeholder: string | undefined;
+    public matchOnDescription = false;
+    public items: readonly T[] = [];
+    public selectedItems: readonly T[] = [];
+    public activeItems: readonly T[] = [];
+    public value = '';
+    public shown = false;
+    public disposed = false;
+
+    private readonly changeValue = new MockEvent<string>();
+    private readonly didAccept = new MockEvent<void>();
+    private readonly didHide = new MockEvent<void>();
+    public readonly onDidChangeValue = this.changeValue.event;
+    public readonly onDidAccept = this.didAccept.event;
+    public readonly onDidHide = this.didHide.event;
+
+    public show(): void {
+        this.shown = true;
+    }
+
+    public hide(): void {
+        if (this.shown) {
+            this.shown = false;
+            this.didHide.fire();
+        }
+    }
+
+    public dispose(): void {
+        this.disposed = true;
+    }
+
+    public type(value: string): void {
+        this.value = value;
+        this.changeValue.fire(value);
+    }
+
+    public accept(item?: T): void {
+        this.selectedItems = item ? [item] : [];
+        this.didAccept.fire();
+    }
+}
+
+/** Every quick pick production created, newest last — a test drives `.at(-1)`. */
+export const createdQuickPicks: MockQuickPick<unknown>[] = [];
+
 export const window = {
+    createQuickPick<T>(): MockQuickPick<T> {
+        const pick = new MockQuickPick<T>();
+        createdQuickPicks.push(pick as MockQuickPick<unknown>);
+        return pick;
+    },
     createOutputChannel(channelName: string): MockOutputChannel {
         return new MockOutputChannel(channelName);
     },
@@ -157,7 +253,7 @@ export const window = {
     },
     showInformationMessage(message: string, ...items: unknown[]): Promise<unknown> {
         shownMessages.information.push([message, ...items]);
-        return Promise.resolve(undefined);
+        return Promise.resolve(messageResponses.information);
     },
     showErrorMessage(message: string, ...items: unknown[]): Promise<unknown> {
         shownMessages.error.push([message, ...items]);

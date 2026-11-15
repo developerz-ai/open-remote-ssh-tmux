@@ -1,9 +1,10 @@
 {
 	"name": "open-remote-ssh-tmux",
 	"displayName": "Open Remote - SSH (tmux)",
-	"description": "Use any remote machine with a SSH server as your development environment.",
-	"version": "1.2.0",
+	"description": "Remote development over SSH with tmux-backed persistent terminals that survive disconnects and follow you between machines.",
+	"version": "1.4.2",
 	"publisher": "developerz-ai",
+	"license": "MIT",
 	"repository": {
 		"type": "git",
 		"url": "https://github.com/developerz-ai/open-remote-ssh-tmux.git"
@@ -12,7 +13,7 @@
 		"url": "https://github.com/developerz-ai/open-remote-ssh-tmux/issues"
 	},
 	"engines": {
-		"vscode": "^1.70.2"
+		"vscode": "^1.90.0"
 	},
 	"main": "./lib/extension.js",
 	"scripts": {
@@ -25,20 +26,23 @@
 		"clean": "rimraf lib out *.vsix",
 		"compile:src": "tsc -b && npm run compile:test",
 		"compile:test": "tsc -p tsconfig.test.json",
-		"lint": "eslint",
+		"lint": "eslint --max-warnings 0",
 		"lint:all": "npm run lint:package && npm audit && npm run ci:lint && npm run lint",
 		"lint:fix": "eslint --fix",
-		"lint:package": "fixpack || true",
+		"lint:package": "fixpack",
 		"package": "rimraf *.vsix && vsce package",
 		"postinstall": "node scripts/patch-ssh2.js && npm run update:dts",
 		"prepare": "husky; npm run lint:package",
 		"release": "release-it",
-		"test": "vitest run",
-		"test:watch": "vitest",
+		"test": "vitest run --project unit",
+		"test:coverage": "vitest run --project unit --coverage",
+		"test:tmux": "test/rig/run.sh",
+		"test:tmux:one": "test/rig/run.sh --one",
+		"test:watch": "vitest --project unit",
 		"update:artifacts": "artifact update",
 		"update:ci": "PINACT_MIN_AGE=7 pinact run --update",
 		"update:deps": "taze --all",
-		"update:dts": "dts dev 1.70.2 && dts 1.70.2",
+		"update:dts": "dts dev 1.90.0 && dts 1.90.0",
 		"vscode:prepublish": "npm run build",
 		"watch:src": "tsc-watch -p . --onSuccess 'npm run bundle:dev'"
 	},
@@ -63,6 +67,7 @@
 		"@types/webpack": "5.28.5",
 		"@typescript-eslint/eslint-plugin": "8.61.0",
 		"@typescript-eslint/parser": "8.61.0",
+		"@vitest/coverage-v8": "4.1.12",
 		"@vscode/dts": "0.4.1",
 		"@vscode/vsce": "3.9.2",
 		"@zokugun/artifact": "0.13.1",
@@ -109,6 +114,22 @@
 					"default": 60,
 					"scope": "application",
 					"minimum": 1
+				},
+				"remote.SSH.openInWindow": {
+					"type": "string",
+					"markdownDescription": "Where **Connect to Host...** and a click on a host or recent folder in **SSH Targets** open the remote. `auto` (default): in this window when it is an empty local window (no folder or workspace open), otherwise in a new window. `current`: always replace this window. `new`: always open a new window. The explicit \"…in Current Window\" / \"…in New Window\" actions are not affected.",
+					"scope": "application",
+					"default": "auto",
+					"enum": [
+						"auto",
+						"current",
+						"new"
+					],
+					"enumDescriptions": [
+						"Reuse an empty local window; otherwise open a new window.",
+						"Always open in the current window.",
+						"Always open in a new window."
+					]
 				},
 				"remote.SSH.defaultExtensions": {
 					"type": "array",
@@ -208,17 +229,41 @@
 					]
 				},
 				"remote.SSH.tmux.historyLimit": {
-					"type": "number",
+					"type": "integer",
 					"description": "Maximum number of lines to retain in each tmux terminal's history buffer.",
 					"scope": "application",
 					"default": 50000,
-					"minimum": 0
+					"minimum": 0,
+					"maximum": 1000000
+				},
+				"remote.SSH.tmux.handOff": {
+					"type": "string",
+					"markdownDescription": "What to do when this workspace's terminals are still open on another machine. `auto` (default): if that machine has been idle for two minutes (its window was closed, crashed or went to sleep), move the terminals here without asking; otherwise offer to take them over. `ask`: always offer, never move them without a click. `never`: leave them on the other machine.",
+					"scope": "application",
+					"default": "auto",
+					"enum": [
+						"auto",
+						"ask",
+						"never"
+					],
+					"enumDescriptions": [
+						"Take over terminals from an idle machine silently; offer to take over from an active one.",
+						"Always offer; never take over without a click.",
+						"Never take over terminals from another machine."
+					]
 				},
 				"remote.SSH.tmux.reapOnConnect": {
 					"type": "boolean",
 					"description": "Automatically clean up empty and dead tmux sessions when connecting to a remote.",
 					"scope": "application",
 					"default": true
+				},
+				"remote.SSH.tmux.orphanMaxAgeDays": {
+					"type": "integer",
+					"markdownDescription": "Close a persistent terminal that no window has been attached to and that has had no activity for this many days — for example one left behind by a folder that was renamed or never reopened. Checked when connecting. `0` keeps such terminals forever.",
+					"scope": "application",
+					"default": 14,
+					"minimum": 0
 				},
 				"remote.SSH.tmux.setDefaultProfile": {
 					"type": "boolean",
@@ -238,6 +283,12 @@
 				}
 			]
 		},
+		"viewsWelcome": [
+			{
+				"view": "sshHosts",
+				"contents": "No SSH hosts yet.\n[Add New SSH Host](command:openremotessh.explorer.add)\n[Open SSH Config File](command:openremotessh.openConfigFile)"
+			}
+		],
 		"commands": [
 			{
 				"command": "openremotessh.openEmptyWindow",
@@ -271,16 +322,18 @@
 			},
 			{
 				"command": "openremotessh.explorer.emptyWindowInCurrentWindow",
-				"title": "Connect to Host in Current Window"
+				"title": "Connect to Host in Current Window",
+				"icon": "$(arrow-right)"
 			},
 			{
 				"command": "openremotessh.explorer.reopenFolderInCurrentWindow",
-				"title": "Open on SSH Host in Current Window"
+				"title": "Open on SSH Host in Current Window",
+				"icon": "$(arrow-right)"
 			},
 			{
 				"command": "openremotessh.explorer.reopenFolderInNewWindow",
 				"title": "Open on SSH Host in New Window",
-				"icon": "$(folder-opened)"
+				"icon": "$(empty-window)"
 			},
 			{
 				"command": "openremotessh.explorer.deleteFolderHistoryItem",
@@ -439,9 +492,14 @@
 			],
 			"view/item/context": [
 				{
-					"command": "openremotessh.explorer.emptyWindowInNewWindow",
+					"command": "openremotessh.explorer.emptyWindowInCurrentWindow",
 					"when": "viewItem =~ /^openremotessh.explorer.host$/",
 					"group": "inline@1"
+				},
+				{
+					"command": "openremotessh.explorer.emptyWindowInNewWindow",
+					"when": "viewItem =~ /^openremotessh.explorer.host$/",
+					"group": "inline@2"
 				},
 				{
 					"command": "openremotessh.explorer.emptyWindowInNewWindow",
@@ -454,9 +512,14 @@
 					"group": "navigation@1"
 				},
 				{
-					"command": "openremotessh.explorer.reopenFolderInNewWindow",
+					"command": "openremotessh.explorer.reopenFolderInCurrentWindow",
 					"when": "viewItem == openremotessh.explorer.folder",
 					"group": "inline@1"
+				},
+				{
+					"command": "openremotessh.explorer.reopenFolderInNewWindow",
+					"when": "viewItem == openremotessh.explorer.folder",
+					"group": "inline@2"
 				},
 				{
 					"command": "openremotessh.explorer.reopenFolderInNewWindow",
@@ -476,7 +539,7 @@
 				{
 					"command": "openremotessh.explorer.deleteFolderHistoryItem",
 					"when": "viewItem =~ /^openremotessh.explorer.folder/",
-					"group": "inline@2"
+					"group": "inline@3"
 				}
 			]
 		},
@@ -504,9 +567,13 @@
 		"undici": "7.30.1"
 	},
 	"keywords": [
+		"persistent terminal",
 		"remote",
 		"remote development",
-		"ssh"
+		"ssh",
+		"terminal",
+		"tmux",
+		"vscodium"
 	],
 	"api": "none",
 	"enabledApiProposals": [

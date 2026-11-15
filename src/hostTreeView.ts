@@ -1,15 +1,19 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import SSHConfiguration, { getSSHConfigPath } from './ssh/sshConfig';
-import { RemoteLocationHistory } from './remoteLocationHistory';
+import { getRemoteWorkspaceLocationData, RemoteLocationHistory } from './remoteLocationHistory';
 import { Disposable } from './common/disposable';
 import { addNewHost, openRemoteSSHLocationWindow, openRemoteSSHWindow, openSSHConfigFile } from './commands';
 import SSHDestination from './ssh/sshDestination';
+import { connectedDestination, folderItemLook, hostAddress, hostItemLook, isConnectedFolder, isConnectedHost } from './hostPresentation';
+import { reuseCurrentWindow } from './windowTarget';
 
 class HostItem {
     constructor(
         public hostname: string,
-        public locations: string[]
+        public locations: string[],
+        // Fork: `user@hostname:port` from the SSH config, for the tooltip.
+        public address: string
     ) {
     }
 }
@@ -70,6 +74,10 @@ export class HostTreeDataProvider extends Disposable implements vscode.TreeDataP
         this._register(vscode.commands.registerCommand('openremotessh.explorer.reopenFolderInNewWindow', e => this.openRemoteSSHLocationWindow(e, false)));
         this._register(vscode.commands.registerCommand('openremotessh.explorer.reopenFolderInCurrentWindow', e => this.openRemoteSSHLocationWindow(e, true)));
         this._register(vscode.commands.registerCommand('openremotessh.explorer.deleteFolderHistoryItem', e => this.deleteHostLocation(e)));
+        // Fork: what clicking a host / folder does — current or new window per
+        // `remote.SSH.openInWindow` (see windowTarget.ts). Not contributed: only the tree runs them.
+        this._register(vscode.commands.registerCommand('openremotessh.explorer.emptyWindow', e => this.openRemoteSSHWindow(e, reuseCurrentWindow())));
+        this._register(vscode.commands.registerCommand('openremotessh.explorer.reopenFolder', e => this.openRemoteSSHLocationWindow(e, reuseCurrentWindow())));
 
         this._register(vscode.workspace.onDidChangeConfiguration(e => {
             if (e.affectsConfiguration('remote.SSH.configFile')) {
@@ -87,16 +95,26 @@ export class HostTreeDataProvider extends Disposable implements vscode.TreeDataP
         if (element instanceof HostLocationItem) {
             const label = path.posix.basename(element.path).replace(/\.code-workspace$/, ' (Workspace)');
             const treeItem = new vscode.TreeItem(label);
-            treeItem.description = path.posix.dirname(element.path);
-            treeItem.iconPath = new vscode.ThemeIcon('folder');
+            // Fork: mark the folder open in this window; a click opens it, full path on hover.
+            const look = folderItemLook(path.posix.dirname(element.path), isConnectedFolder(element.hostname, element.path, getRemoteWorkspaceLocationData()));
+            treeItem.description = look.description;
+            treeItem.tooltip = element.path;
+            treeItem.iconPath = new vscode.ThemeIcon(look.icon);
             treeItem.contextValue = 'openremotessh.explorer.folder';
+            treeItem.command = { command: 'openremotessh.explorer.reopenFolder', title: 'Open Folder', arguments: [element] };
             return treeItem;
         }
 
         const treeItem = new vscode.TreeItem(element.hostname);
         treeItem.collapsibleState = element.locations.length ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None;
-        treeItem.iconPath = new vscode.ThemeIcon('vm');
+        // Fork: mark the host this window is connected to; a label click connects, and VS Code
+        // then expands an item that has a command only from its twistie.
+        const look = hostItemLook(isConnectedHost(element.hostname, connectedDestination(vscode.env.remoteAuthority)));
+        treeItem.description = look.description;
+        treeItem.tooltip = element.address;
+        treeItem.iconPath = new vscode.ThemeIcon(look.icon);
         treeItem.contextValue = 'openremotessh.explorer.host';
+        treeItem.command = { command: 'openremotessh.explorer.emptyWindow', title: 'Connect to Host', arguments: [element] };
         return treeItem;
     }
 
@@ -104,7 +122,7 @@ export class HostTreeDataProvider extends Disposable implements vscode.TreeDataP
         if (!element) {
             const sshConfigFile = await SSHConfiguration.loadFromFS();
             const hosts = rootHostList(sshConfigFile.getAllConfiguredHosts(), this.locationHistory.getHosts());
-            return hosts.map(hostname => new HostItem(hostname, this.locationHistory.getHistory(hostname)));
+            return hosts.map(hostname => new HostItem(hostname, this.locationHistory.getHistory(hostname), hostAddress(hostname, sshConfigFile.getHostConfiguration(hostname))));
         }
         if (element instanceof HostItem) {
             return element.locations.map(location => new HostLocationItem(location, element.hostname));

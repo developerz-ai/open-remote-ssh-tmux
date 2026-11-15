@@ -1,0 +1,10 @@
+# Rig-only sshd settings (drop-in under the image's stock sshd_config).
+# Key auth only, never root; the published port is bound to 127.0.0.1 (compose.yml).
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AllowUsers u-* w*
+# Tests open several channels per connection and several connections per user.
+MaxSessions 64
+MaxStartups 100:30:200

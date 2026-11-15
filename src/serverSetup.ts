@@ -6,6 +6,7 @@ import { escapePowerShellArg, escapeShellArg } from './common/shellQuote';
 import { getVSCodeServerConfig, ServerVersion, ServerValidation } from './serverConfig';
 import SSHConnection from './ssh/sshConnection';
 import { fetchRelease, IRelease } from './fetchRelease';
+import { withDeadline } from './common/deadline';
 
 /**
  * Reads a script template from <extensionPath>/scripts/<templateName> and
@@ -114,6 +115,12 @@ export class ServerInstallError extends Error {
     }
 }
 
+// Fork: no remote exec on the connect path may wait forever on a half-dead link.
+// Platform detection is one tiny command; the install downloads and unpacks the
+// server (and installs default extensions), which on a slow link takes many minutes.
+export const PLATFORM_DETECT_DEADLINE_MS = 30_000;
+export const INSTALL_DEADLINE_MS = 30 * 60_000;
+
 const DEFAULT_DOWNLOAD_URL_TEMPLATE = 'https://github.com/VSCodium/vscodium/releases/download/${version}.${release}/vscodium-reh-${os}-${arch}-${version}.${release}.tar.gz';
 
 export async function installCodeServer(
@@ -132,7 +139,7 @@ export async function installCodeServer(
 
     // detect platform and shell for windows
     if (!platform || platform === 'windows') {
-        const result = await conn.exec('uname -s');
+        const result = await withDeadline(conn.exec('uname -s'), PLATFORM_DETECT_DEADLINE_MS, 'remote platform detection (uname -s)');
 
         if (result.stdout) {
             if (result.stdout.includes('windows32')) {
@@ -185,7 +192,7 @@ export async function installCodeServer(
     if (platform === 'windows') {
         const installServerScript = generatePowerShellInstallScript(installOptions, extensionPath);
 
-        logger.trace('Server install command:', redactConnectionToken(installServerScript));
+        logInstallScript(logger, installServerScript, scriptId);
 
         const installDir = `$HOME\\${vscodeServerConfig.serverDataFolderName}\\install`;
         const installScript = `${installDir}\\${vscodeServerConfig.commit}.ps1`;
@@ -228,15 +235,15 @@ export async function installCodeServer(
             throw new ServerInstallError(`Not supported shell: ${shell}`);
         }
 
-        commandOutput = await conn.execPartial(command, (stdout: string) => endRegex.test(stdout));
+        commandOutput = await withDeadline(conn.execPartial(command, (stdout: string) => endRegex.test(stdout)), INSTALL_DEADLINE_MS, 'server install');
     } else {
         const installServerScript = generateBashInstallScript(installOptions, extensionPath);
 
-        logger.trace('Server install command:', redactConnectionToken(installServerScript));
+        logInstallScript(logger, installServerScript, scriptId);
         // Use base64 encoding to avoid shell quoting issues across different login shells (bash, csh, tcsh, fish).
         // csh cannot handle multi-line strings inside single quotes with -c, so piping via base64 is the most portable approach.
         const base64Script = Buffer.from(installServerScript).toString('base64');
-        commandOutput = await conn.exec(`echo ${base64Script} | base64 -d | bash -l`);
+        commandOutput = await withDeadline(conn.exec(`echo ${base64Script} | base64 -d | bash -l`), INSTALL_DEADLINE_MS, 'server install');
     }
 
     // Redacted too: the script echoes `connectionToken==<uuid>==` on stdout,
@@ -256,9 +263,7 @@ export async function installCodeServer(
         throw new ServerInstallError(`Couldn't install vscode server on remote server, install script returned non-zero exit status`);
     }
 
-    const listeningOn = resultMap.listeningOn.match(/^\d+$/)
-        ? parseInt(resultMap.listeningOn, 10)
-        : resultMap.listeningOn;
+    const listeningOn = parseListeningOn(resultMap.listeningOn);
 
     const remoteEnvVars = Object.fromEntries(Object.entries(resultMap).filter(([key,]) => envVariables.includes(key)));
 
@@ -273,6 +278,43 @@ export async function installCodeServer(
         tmpDir: resultMap.tmpDir,
         ...remoteEnvVars
     };
+}
+
+/**
+ * The install result's `listeningOn`: a port, or a socket path. Missing used to crash on
+ * `undefined.match` — a TypeError the resolver classes as retryable, so VS Code retried
+ * the same broken install forever; a ServerInstallError is not retried.
+ */
+export function parseListeningOn(value: string | undefined): number | string {
+    if (!value) {
+        throw new ServerInstallError(`Install script output has no listeningOn value`);
+    }
+    return value.match(/^\d+$/) ? parseInt(value, 10) : value;
+}
+
+/** Install-script digests already logged in full this session — see {@link logInstallScript}. */
+const loggedInstallScripts = new Set<string>();
+
+// Per-connect values: the script id, and the UUIDs (token, socket path) it carries.
+const UUID_PATTERN = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+
+/**
+ * Log the (redacted) install script in full the first time this session, and only a
+ * digest line after that — it was dumped on every connect, burying everything else.
+ * The digest ignores per-connect values, so an unchanged script is recognised.
+ */
+export function logInstallScript(logger: Log, script: string, scriptId: string, seen: Set<string> = loggedInstallScripts): void {
+    const redacted = redactConnectionToken(script);
+    const digest = crypto.createHash('sha256')
+        .update(redacted.split(scriptId).join('<id>').replace(UUID_PATTERN, '<uuid>'))
+        .digest('hex')
+        .slice(0, 12);
+    if (seen.has(digest)) {
+        logger.trace(`Server install command: unchanged since logged earlier this session (sha256:${digest})`);
+        return;
+    }
+    seen.add(digest);
+    logger.trace(`Server install command (sha256:${digest}):`, redacted);
 }
 
 // Each result line is emitted by the scripts as `key==value==` (see
@@ -354,8 +396,8 @@ export function escapePowerShellInstallPath(customInstallPath: string): string {
 }
 
 // The connection token authenticates every client of the freshly started
-// remote server. `Log.trace` is *not* level-gated (src/common/logger.ts) — it
-// always appends to the "Remote - SSH" output channel — and both the compiled
+// remote server. `Log.trace` is not level-gated on VS Code hosts before 1.74
+// (src/common/logger.ts) — there it always appends to the "Remote - SSH" output channel — and both the compiled
 // install script (`SERVER_CONNECTION_TOKEN="<uuid>"`) and its stdout
 // (`connectionToken==<uuid>==`) carry it, so a user pasting that channel into a
 // bug report published the token. Redact the value, keep the surrounding
