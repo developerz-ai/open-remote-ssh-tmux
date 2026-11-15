@@ -126,12 +126,12 @@ breaking downgrade per the audit report); until then every PR's CI fails
 at the lint:all step exactly as it already does today for any PR — not
 caused by this change, but made load-bearing by it
 
-<!-- dz-task:tsk_d3e146084aebcde88545a0a6ef3f8c73 -->
+<!-- dz-task:tsk_00000000000000000000000000000001 -->
 
 ---
 
 🤖 Opened by **developerz.ai** for task
-\`tsk_d3e146084aebcde88545a0a6ef3f8c73\` on
+\`tsk_00000000000000000000000000000001\` on
 developerz-ai/open-remote-ssh-tmux.
 
 Raised automatically by the \`raw_task_triage\` lane.
@@ -141,14 +141,14 @@ Raised automatically by the \`raw_task_triage\` lane.
 slice of a stacked plan.
 > Dispatched automatically by the \`raw_task_triage\` lane
 > Model \`glm-5.3-flash\` on \`api.z.ai\` via \`native\`, funded by
-\`account_key\`
-> Ran on box \`hv-dedicated-ci-0\`
+\`example_key\`
+> Ran on box \`example-runner-00\`
 > Cost ~$0.10 for 767.2k in / 81.7k out (estimate: list price x reported
 tokens, cached input at its cached rate)
 > Run timeline
-[\`run_437caece17bd41fe914c5980bcf72334\`](https://app.developerz.ai/fleet/runs/run_437caece17bd41fe914c5980bcf72334)
+[\`run_00000000000000000000000000000002\`](https://app.example.local/fleet/runs/run_00000000000000000000000000000002)
 > Part 1/1 of plan
-[\`rtk_e7c1d463c5e34a97820724d3df0f9c61\`](https://app.developerz.ai/fleet/plans/rtk_e7c1d463c5e34a97820724d3df0f9c61)
+[\`rtk_00000000000000000000000000000003\`](https://app.example.local/fleet/plans/rtk_00000000000000000000000000000003)
 <!-- dz-stack:end -->
 
 Co-authored-by: developerz-ai[bot] <286432749+developerz-ai[bot]@users.noreply.github.com>`;
@@ -167,7 +167,7 @@ const AUTOMATED_LAND_MESSAGE = `chore(babysit): land commitlint.config.js (+1 mo
 
 Follow-up intent: Address review findings on developerz-ai/open-remote-ssh-tmux#43
 
-Dz-Task-Id: tsk_582df6d71f80ef4ff6fc04293f28839f`;
+Dz-Task-Id: tsk_00000000000000000000000000000004`;
 
 // The same land commit written with a type outside the allowed list. It has to
 // be rejected: the land shape gets no waiver, so its type is judged by
@@ -176,7 +176,7 @@ const AUTOMATED_LAND_MESSAGE_WITH_DISALLOWED_TYPE = `wip(babysit): land commitli
 
 Follow-up intent: Address review findings on developerz-ai/open-remote-ssh-tmux#43
 
-Dz-Task-Id: tsk_582df6d71f80ef4ff6fc04293f28839f`;
+Dz-Task-Id: tsk_00000000000000000000000000000004`;
 
 // The same land commit with one body line over the limit. No rule is waived for
 // the land shape, so the body-length limit applies to it as well.
