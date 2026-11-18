@@ -60,8 +60,9 @@ schedules:
   - name: health
     days: [mon]
     hours_utc: [7]
-    brief_file: .dz/briefs/health.md
+    brief_file: .dz/schedules/health.md
   - name: improve
     days: [mon]
+    weeks_of_month: [1] # the first Monday of the month
     hours_utc: [8]
-    brief_file: .dz/briefs/improve.md
+    brief_file: .dz/schedules/improve.md
