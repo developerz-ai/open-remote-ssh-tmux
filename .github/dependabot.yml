@@ -6,7 +6,7 @@ updates:
     schedule:
       interval: weekly
     cooldown:
-      default-days: 7
+      default-days: 14
 
   # Maintain dependencies for npm
   - package-ecosystem: npm
@@ -14,4 +14,16 @@ updates:
     schedule:
       interval: weekly
     cooldown:
-      default-days: 7
+      default-days: 14
+
+  # Maintain the base image of the real-tmux test rig (test/rig/Dockerfile and
+  # test/rig/edh/remote.Dockerfile pin debian by digest). The pin sits in an ARG
+  # default; if Dependabot opens nothing for it, bump the digest by hand.
+  - package-ecosystem: docker
+    directories:
+      - /test/rig
+      - /test/rig/edh
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14

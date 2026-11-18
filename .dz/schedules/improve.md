@@ -1,7 +1,6 @@
 # Brief: monthly improvement
 
-Fired every Monday by `schedules: improve`. **Act only on the first Monday of the month:**
-`[ "$(date -u +%-d)" -le 7 ]`. On any other Monday stop here, file nothing, open nothing.
+Fired on the first Monday of the month by `schedules: improve` (`weeks_of_month: [1]`).
 
 Once a month, leave open-remote-ssh-tmux measurably better. `CLAUDE.md` binds every change, and `non_goals` in the
 policy file are off limits. A red `main` and a stuck Dependabot PR belong to `health`.

@@ -22,6 +22,11 @@ Titles are stable: nothing that changes run to run (sha, run URL) goes in one; t
 with the command and its output. Unreadable evidence is no verdict: re-run it, never file it as a defect.
 A red `main` comes first.
 
+## Rows
+
+- `main-green`: the last push run of `ci-main.yml` on `main` concluded `success` on the `origin/main` tip (a markdown-only tip starts no run: no verdict, never a red).
+- `dependabot-stuck`: no open Dependabot PR has failed checks and more than 7 days since its `updatedAt`.
+
 ## Checks that exist on main
 
 Declared rows, not an enforced gate: nothing parses this file — the schedule hands it to
