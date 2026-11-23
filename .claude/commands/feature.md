@@ -15,7 +15,7 @@ $ARGUMENTS
 
 **The prompt is the context — read the intent.** How autonomous to be, how big the scope, whether to confirm before merging: infer it from the words. "Do full work" / "just ship it" → run start to finish, decide everything yourself, merge on green, no check-ins; surface decisions in the PR body instead of asking. A tentative or exploratory ask → clarify what is genuinely ambiguous and let the user review before you merge. Don't make the user configure you. The flow is a map, not a checklist — but always stop for a true blocker: weakening host-key verification, logging a secret, shell injection in a tmux command line sent to the remote, regressing the base open-remote-ssh experience, or a design that leaks tmux to the user or risks orphaned sessions.
 
-**Pick the PR mode before you brief anyone.** **Slice-per-PR** (default) — one concern per PR; it also keeps the fork diff legible. **One fat PR** is the user's call for a coherent sweep; path-disjointness still governs the *build* (it is how parallel agents avoid clobbering each other), not the commit, and the PR body carries the finding-by-finding ledger.
+**Pick the PR mode before you brief anyone.** **One PR for the whole plan** (default) — path-disjointness governs the *build* (it is how parallel agents avoid clobbering each other), not the PR, and the PR body carries the finding-by-finding ledger. Only the genuine-dependency and independent-landing exceptions below justify another PR. See `docs/standards/pr-batching.md`.
 
 **Cap a PR at ~40 files here.** `src/` is about 9k lines of TypeScript, so the usual ~110–120 ceiling never binds — but its reasons do at this scale, and one extra reason binds harder: **fork hygiene**. A sprawling diff that reaches into upstream files is the thing that makes the next merge from `jeanp413/open-remote-ssh` painful, and that cost is permanent. Beyond that: an oversized diff gets the least review; one red job holds every other fix hostage; and bisecting a later zombie-session report should land on a slice, not on one enormous commit. Past the cap, split even if the user asked for one PR — and say why.
 
@@ -97,13 +97,15 @@ An agent owns *its own files and its own tests*; whole-repo green is the coordin
    git fetch origin                      # did main move? if so, see below
    git add <the paths for this slice>    # never -A
    git status --short                    # then READ it
-   git commit && git push -u origin HEAD
+   git commit -m <type>: <what this change does>
+   # repeat the add/commit steps for the remaining disjoint slices here
+   git push -u origin HEAD               # push once, after all slices
    ```
-   Commit messages are **Conventional Commits enforced by commitlint + husky** — allowed types `build chore ci docs enhance feat fix perf refactor remodel revert style test vcs`, body lines ≤200 chars, scope = the module. For slice-per-PR, one slice at a time: add, commit, push, PR, merge, `git fetch`, repeat on the new `origin/main`. Naming paths is all the selectivity you need — **never `git stash`** (one global stack shared with every concurrent agent).
+   Commit messages are **Conventional Commits enforced by commitlint + husky** — allowed types `build chore ci docs enhance feat fix perf refactor remodel revert style test vcs`, body lines ≤200 chars, scope = the module. **Batch the whole run into one PR:** commit each logical change separately, push once, then open one PR for the entire plan and merge once. Slices are execution units, not PR units. Do not open a PR for a one-line change, and do not merge between slices. Only a genuine dependency (a change that must land before the rest can build) or a change that must land independently justifies a second PR; say which slice needs it and why. Naming paths is all the selectivity you need — **never `git stash`** (one global stack shared with every concurrent agent). The rate the platform watches is owner PRs per day; one PR per plan keeps it near target instead of one per slice.
 
    **Main moves under you.** `git fetch` and intersect *files changed on main* with *files changed locally*; a real overlap is **three-way merged** (`git merge-file -p ours base theirs`), never taken wholesale — a naive build drops main's lines silently, with no conflict marker.
 
-   Then `gh pr create` (Summary + Test plan: typecheck/lint/test/bundle results plus the persistence-connect outcome; reference the upstream issue if there is one), wait for **CI — Pull Request** (build · `npm test` · `lint:package` · `lint` · commitlint · package + vsix contents · the tmux rig per version), and `gh pr merge --squash` when green. One PR in flight at a time. Gotcha: **0 registered checks reads as "pass"** — wait until the count is plausible *and* nothing is pending, or you will merge red right after a rebase. Never `--force`, never `--no-verify`, never skip hooks without permission.
+   Then `gh pr create` once for the whole run (Summary + Test plan: typecheck/lint/test/bundle results plus the persistence-connect outcome; reference the upstream issue if there is one), wait for **CI — Pull Request** (build · `npm test` · `lint:package` · `lint` · commitlint · package + vsix contents · the tmux rig per version), and `gh pr merge --squash` when green. One PR covers every slice in the plan; do not merge slice by slice. Gotcha: **0 registered checks reads as "pass"** — wait until the count is plausible *and* nothing is pending, or you will merge red right after a rebase. Never `--force`, never `--no-verify`, never skip hooks without permission.
 
 9. **Release.** Nothing publishes from `main`. Cut it with **`npm run release`** (release-it: commit `v${version}`, annotated tag `v${version}`, no npm publish) — the `v*` tag triggers **`publish.yml`**, which refuses a tag that differs from the `package.json` version, re-runs build/test/lint, packages the `.vsix` and creates the GitHub Release (Open VSX only where `PUBLISH_OPENVSX` is `yes`; no Marketplace publish). Confirm the workflow completed and the release carries the `.vsix`; a merged PR that never got tagged is installable by nobody. Update `CHANGELOG.md` as part of the release, not after it.
 
@@ -120,7 +122,7 @@ Report what shipped, and be equally explicit about what didn't — a sweep that 
 ```
 Root cause:  <the one-line mechanism, for a bug>
 Concern:     <module(s) touched>  →  SRP: <src/tmux/* | contributes | common>
-Fixed:       <n> findings across <m> PRs → #…
+Fixed:       <n> findings in <m> commits, one PR → #…
 Deferred:    <n> — <what, and why not now>                [never omit this line]
 Falsified:   <doc / acceptance-row claims corrected>
 Invariants:  invisible <✓/✗>  no-zombies <✓/✗>  terminals-only <✓/✗>  windows-safe <✓/✗>

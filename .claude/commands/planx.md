@@ -40,7 +40,11 @@ $ARGUMENTS
    per separable area (e.g. `01-session-model.md`, `02-terminal-profile.md`,
    `03-reaping-lifecycle.md`, `04-session-manager-ui.md`, `05-package-contributes.md`,
    `06-verify.md`). Split by area so each file is independently executable and
-   stays short. Terse fragments, `file:line` refs, tables.
+   stays short. Terse fragments, `file:line` refs, tables. These slices are
+   execution units of ONE plan, not PR units: the executor delivers all of them
+   in one PR. Never open a PR for each slice, and never turn a one-line change
+   into its own PR. Only a genuine dependency (a slice that must land before the rest
+   can build) or a change that must land independently justifies a second PR.
 
    **`overview.md`** — the map. Sections:
 
@@ -138,7 +142,8 @@ last_updated: <YYYY-MM-DD>
   `hostTreeView.ts` but for tmux sessions ...").
 - No checkboxes (`[ ]`). Plain bullets. The plan is a reference map, not a tracker.
 - Multiple files always: `overview.md` + `<NN>-<aspect>.md` slices. Never a single
-  `plan.md`.
+  `plan.md`. One PR for the whole plan, not a PR for each slice; do not open a
+  PR for a one-line change. See `docs/standards/pr-batching.md`.
 - Self-contained: executor reads only `overview.md`, the slice it's on, and the
   files those cite.
 - Respect `CLAUDE.md` + `docs/idea/`: **scope = terminals only** (don't touch the
