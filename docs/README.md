@@ -8,6 +8,7 @@ Where each kind of document lives. Read [`idea/`](idea/README.md) before designi
 | [`troubleshooting.md`](troubleshooting.md) | reading the Remote - SSH log and fixing terminals that do not survive a disconnect |
 | [`upstream-sync.md`](upstream-sync.md) | the fork point, which upstream files carry `Fork:` hunks, and how to merge upstream |
 | [`plans/`](plans/) | dated execution plans, `plans/<YYYY>/<MM>/<DD>/<NNN>-<slug>/` |
+| [`standards/`](standards/) | fleet-read rules, including one PR per plan (`pr-batching.md`) |
 | [`images/`](images/) | images the README embeds |
 
 Rules that bind every change are in [`../CLAUDE.md`](../CLAUDE.md); the maintainer bot's
