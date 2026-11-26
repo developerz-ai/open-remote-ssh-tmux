@@ -8,6 +8,15 @@ do not repeat them here.
 
 `CLAUDE.md` binds every change; `triage.non_goals` in `.dz/maintainer/maintainer.yml` are off limits.
 
+## Rows
+
+One per task below; the PR body (or the no-PR reason) gives each row's verdict.
+
+- `gate`: `bin/check` passes on fresh `main`
+- `tmux-release`: the newest tmux release is in the rig matrix
+- `tool-pins`: zizmor and the EDH VSCodium pin are current
+- `docs-truth`: `CLAUDE.md`, `README.md`, `docs/upstream-sync.md` and `.dz/` match the files
+
 ## Start
 
 ```sh
