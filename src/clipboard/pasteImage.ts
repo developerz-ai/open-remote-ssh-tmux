@@ -15,6 +15,7 @@ import {
     remoteImagePath,
     type CaptureCandidate,
 } from './clipboardImage';
+import { withDeadline } from '../common/deadline';
 import { MAX_IMAGE_BYTES, readClipboardImageViaWebview } from './clipboardWebview';
 
 // Orchestration for "paste a local screenshot into a remote terminal".
@@ -74,6 +75,29 @@ export interface CaptureResult {
  * sub-second; showing a spinner for that is noise. Only a genuinely slow upload surfaces. */
 const PROGRESS_DELAY_MS = 300;
 
+/** Upper bound for writing one image to the remote. The write has no deadline of its own, so
+ * a stalled link would hang the paste command forever and the text-paste fallback would
+ * never run. 60 s lets the largest accepted image (20 MB) finish at about 340 KB/s, which
+ * is a slow but working link; anything slower is treated as dead. */
+export const UPLOAD_DEADLINE_MS = 60_000;
+
+/** Thrown by a native reader whose output exceeded {@link MAX_IMAGE_BYTES}. Unlike every other
+ * reader failure it is not "no image": the image exists, so the fallback chain stops and the
+ * user is told why nothing was pasted. */
+export class ImageTooLargeError extends Error {
+    constructor(readonly bytes?: number) {
+        super(bytes === undefined
+            ? `clipboard image exceeds ${MAX_IMAGE_BYTES} bytes`
+            : `clipboard image is ${bytes} bytes, over the ${MAX_IMAGE_BYTES} byte limit`);
+        this.name = 'ImageTooLargeError';
+    }
+}
+
+/** Run `write` but give up after `ms`, reporting which step hung. */
+export function uploadWithDeadline(write: () => PromiseLike<void>, ms: number): Promise<void> {
+    return withDeadline(Promise.resolve(write()), ms, 'uploading the image');
+}
+
 /** Images older than this are swept on connect. */
 export const IMAGE_MAX_AGE_HOURS = 48;
 
@@ -92,7 +116,10 @@ export async function decideCapturePlan(attempts: readonly CaptureAttempt[]): Pr
         let bytes: Uint8Array | undefined;
         try {
             bytes = await attempt.run();
-        } catch {
+        } catch (err) {
+            if (err instanceof ImageTooLargeError) {
+                throw err; // the image exists: do not fall through to a reader that may miss it
+            }
             continue; // no such tool / it blew up — indistinguishable from "no image"
         }
         if (bytes && bytes.byteLength > 0) {
@@ -154,7 +181,7 @@ export async function pasteClipboardImage(deps: PasteImageDeps): Promise<boolean
             // window between write and any later chmod. Screenshots routinely carry tokens.
             // Verified rather than assumed — `exec` reports no exit code.
             await ensureRemoteImageDir(deps.exec, dir);
-            await vscode.workspace.fs.writeFile(remoteUri(deps.authority, target), capture.bytes!);
+            await uploadWithDeadline(() => vscode.workspace.fs.writeFile(remoteUri(deps.authority, target), capture.bytes!), UPLOAD_DEADLINE_MS);
         });
 
         // Bracketed paste, not sendText: a TUI like Claude Code treats typed and pasted
@@ -163,6 +190,11 @@ export async function pasteClipboardImage(deps: PasteImageDeps): Promise<boolean
         deps.log.info(`clipboard image uploaded via ${capture.source} (${capture.bytes.byteLength} bytes) -> ${target}`);
         return true;
     } catch (err) {
+        if (err instanceof ImageTooLargeError) {
+            deps.log.info(`clipboard image paste skipped: ${err.message}`);
+            void vscode.window.showErrorMessage(`Clipboard image is too large to upload (limit ${MAX_IMAGE_BYTES / 1048576} MB).`);
+            return true;
+        }
         // An image was found but could not be delivered. Unlike "no image", this is a real
         // failure with nothing sensible to fall back to, so say it out loud rather than
         // performing a text paste the user did not ask for.
@@ -220,7 +252,7 @@ export function captureAttempts(
 }
 
 /** Run one native reader and collect its bytes from wherever it puts them. */
-function runCaptureCandidate(candidate: CaptureCandidate, outPath: string): Promise<Uint8Array | undefined> {
+export function runCaptureCandidate(candidate: CaptureCandidate, outPath: string): Promise<Uint8Array | undefined> {
     const [command, ...args] = candidate.argv;
     return new Promise<Uint8Array | undefined>((resolve, reject) => {
         // `encoding: 'buffer'` because the stdout readers stream raw PNG bytes; decoding
@@ -231,6 +263,12 @@ function runCaptureCandidate(candidate: CaptureCandidate, outPath: string): Prom
             args,
             { timeout: 15_000, windowsHide: true, encoding: 'buffer', maxBuffer: MAX_IMAGE_BYTES },
             (error, stdout) => {
+                if ((error as NodeJS.ErrnoException | null)?.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
+                    // The image outgrew maxBuffer and node killed the reader: it is too
+                    // large, which is different from there being no image at all.
+                    reject(new ImageTooLargeError());
+                    return;
+                }
                 if (error) {
                     // Non-zero exit is the documented "no image" signal for all of these
                     // tools, and also what a missing binary produces. Both are "found

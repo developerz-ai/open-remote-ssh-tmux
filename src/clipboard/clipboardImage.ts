@@ -89,27 +89,38 @@ export function buildLocalCaptureCandidates(platform: string, outPath: string): 
                     output: 'file',
                     label: 'powershell (WPF clipboard)',
                     argv: [...POWERSHELL_FLAGS, encodePowerShellCommand(
-                        'Add-Type -Assembly PresentationCore; '
+                        // `Stop` makes a failed method call terminating: by default it is not, the
+                        // script runs on to `exit 0`, and a truncated PNG reads as a good image.
+                        // The catch turns it into the non-zero exit the caller reads as "no
+                        // image"; the finally releases the file handle either way.
+                        PS_STOP_ON_ERROR
+                        + 'Add-Type -Assembly PresentationCore; '
                         + '$img = [Windows.Clipboard]::GetImage(); '
                         + 'if ($img -eq $null) { exit 1 }; '
+                        + '$stream = $null; '
+                        + 'try { '
                         + `$stream = [IO.File]::Open('${psQuote(outPath)}', 'Create'); `
                         + '$encoder = New-Object Windows.Media.Imaging.PngBitmapEncoder; '
                         + '$encoder.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($img)) | Out-Null; '
-                        + '$encoder.Save($stream) | Out-Null; '
-                        + '$stream.Dispose(); exit 0'
+                        + '$encoder.Save($stream) | Out-Null '
+                        + '} catch { exit 1 } finally { if ($stream) { $stream.Dispose() } }; '
+                        + 'exit 0'
                     )],
                 },
                 {
                     output: 'file',
                     label: 'powershell (WinForms clipboard)',
                     argv: [...POWERSHELL_FLAGS, encodePowerShellCommand(
-                        'Add-Type -AssemblyName System.Windows.Forms,System.Drawing; '
+                        PS_STOP_ON_ERROR
+                        + 'Add-Type -AssemblyName System.Windows.Forms,System.Drawing; '
                         + '$img = [System.Windows.Forms.Clipboard]::GetImage(); '
                         + 'if ($img -eq $null) { exit 1 }; '
                         // The PNG encoder is named explicitly — the default `Save(path)`
                         // overload picks a format from nothing and can emit a non-PNG payload
                         // under a .png name, which anything sniffing by extension mis-reads.
-                        + `$img.Save('${psQuote(outPath)}', [System.Drawing.Imaging.ImageFormat]::Png); exit 0`
+                        + 'try { '
+                        + `$img.Save('${psQuote(outPath)}', [System.Drawing.Imaging.ImageFormat]::Png) `
+                        + '} catch { exit 1 } finally { $img.Dispose() }; exit 0'
                     )],
                 },
             ];
@@ -143,6 +154,9 @@ export function buildLocalCaptureCandidates(platform: string, outPath: string): 
  * OLE API); `-NoProfile` keeps a user's profile from printing into our output or slowing the
  * spawn; `-NonInteractive` guarantees it can never sit waiting on a prompt. */
 const POWERSHELL_FLAGS = ['powershell.exe', '-NoProfile', '-NonInteractive', '-STA', '-EncodedCommand'];
+
+/** Prefix of every Windows reader script; see the WPF candidate for why. */
+const PS_STOP_ON_ERROR = '$ErrorActionPreference = \'Stop\'; ';
 
 /** Encode a script for `powershell.exe -EncodedCommand`: base64 of UTF-16LE, which is the
  * one form PowerShell accepts. See the win32 branch above for why the scripts are passed
@@ -273,10 +287,17 @@ export function buildRemoteHomeCommand(): string {
     return inPosixShell('printf %s "$HOME"');
 }
 
+function hasControlChar(value: string): boolean {
+    return [...value].some(ch => ch.charCodeAt(0) < 0x20 || ch.charCodeAt(0) === 0x7f);
+}
+
 /** A plain absolute POSIX path: rooted, no `..` segment, and free of the characters that
  * have no meaning in a path but plenty in a shell command or a URI. */
 function isAbsolutePosixPath(value: string): boolean {
-    if (!value.startsWith('/') || /[\0\n\r]/.test(value)) {
+    // Any control character (NUL, newline, ESC, DEL, tab…): the path becomes a shell word, a
+    // URI and bracketed-paste payload, where ESC `[201~` would end the paste early. Spaces
+    // stay legal — they are an ordinary part of a home directory name.
+    if (!value.startsWith('/') || hasControlChar(value)) {
         return false;
     }
     return !value.split('/').includes('..');

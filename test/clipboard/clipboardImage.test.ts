@@ -35,6 +35,19 @@ describe('buildLocalCaptureCandidates: read the LOCAL clipboard (extension runs 
         return Buffer.from(encoded, 'base64').toString('utf16le');
     };
 
+    // A failed method call in a PowerShell script is a non-terminating error: the script
+    // carries on and reaches `exit 0`, leaving a truncated PNG that reads as a good image
+    // (and an undisposed stream that keeps the file locked).
+    it('makes PowerShell errors terminating and always disposes the stream', () => {
+        const [wpf, winforms] = buildLocalCaptureCandidates('win32', 'C:\\tmp\\shot.png');
+        for (const candidate of [wpf, winforms]) {
+            const script = decodePowerShell(candidate);
+            expect(script).toContain('$ErrorActionPreference = \'Stop\'');
+            expect(script).toContain('try {');
+        }
+        expect(decodePowerShell(wpf)).toMatch(/finally \{[^}]*\$stream\.Dispose\(\)/);
+    });
+
     it('offers a PowerShell reader on win32 that writes a PNG to the given path', () => {
         const [first] = buildLocalCaptureCandidates('win32', 'C:\\tmp\\shot.png');
         expect(first.argv[0]).toBe('powershell.exe');
@@ -209,6 +222,14 @@ describe('remoteImageDir / remoteImagePath: under the user\'s own home, never wo
         expect(() => remoteImageDir('')).toThrow();
         expect(() => remoteImageDir('/home/../etc')).toThrow();
         expect(() => remoteImageDir('/home/alice/..')).toThrow();
+    });
+
+    // A control character (ESC, DEL, a tab) has no place in a home path, and the path is typed
+    // into a terminal as a bracketed paste: an ESC[201~ inside it would end the paste early.
+    it('rejects a home path carrying any control character', () => {
+        expect(() => remoteImageDir('/home/a\x1b[201~b')).toThrow();
+        expect(() => remoteImageDir('/home/a\tb')).toThrow();
+        expect(() => remoteImageDir('/home/a\x7fb')).toThrow();
     });
 
     it('rejects a home path carrying a NUL or a newline', () => {
