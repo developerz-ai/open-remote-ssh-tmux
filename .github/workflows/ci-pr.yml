@@ -4,14 +4,18 @@ on:
   pull_request:
     branches:
       - main
-    paths-ignore:
-      - "**/*.md"
 
 permissions: {}
+
+# A new push makes the running checks moot: cancel them rather than queue behind them.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -23,7 +27,7 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .nvmrc
-          package-manager-cache: false
+          cache: npm
 
       - name: Install dependencies
         run: |
@@ -104,7 +108,7 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .nvmrc
-          package-manager-cache: false
+          cache: npm
 
       # No git hooks on a CI runner; `prepare` (husky) is POSIX-shell shaped anyway.
       - name: Install dependencies
@@ -118,10 +122,9 @@ jobs:
           npm test
 
   package:
-    # Release packaging runs vsce on Node 22 (its locked toolchain needs >= 22.13, see
-    # check-packaging-node.js), not the repo's Node 20, so packaging breakage used to
-    # surface only at release. Package here on the release runtime, and hold the vsix to
-    # the .vscodeignore whitelist. Packaging builds first (vscode:prepublish).
+    # Package exactly as a release does, so packaging breakage surfaces here and not at
+    # release: the engine guard, `vsce package`, and the vsix held to the .vscodeignore
+    # whitelist. Packaging builds first (vscode:prepublish).
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -133,8 +136,8 @@ jobs:
       - name: Setup Node.js environment
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '22'
-          package-manager-cache: false
+          node-version-file: .nvmrc
+          cache: npm
 
       - name: Install dependencies
         run: |
@@ -171,7 +174,7 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .nvmrc
-          package-manager-cache: false
+          cache: npm
 
       - name: Install dependencies
         run: |
