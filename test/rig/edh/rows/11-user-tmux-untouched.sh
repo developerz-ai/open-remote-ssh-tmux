@@ -17,7 +17,7 @@ rsh 'tmux new-session -d -s dev "sleep 99999" && tmux new-session -d -s edh-user
 user_options() {
   rsh "tmux show-options -gv history-limit; tmux show-options -gv @edh_user_marker; \
     tmux show-options -gv status-style; tmux show-options -gv prefix; tmux show-options -sv escape-time; \
-    tmux list-keys -T root F12 2>/dev/null"
+    tmux list-keys -T root 2>/dev/null | grep -F F12"
 }
 user_sessions() {
   rsh "tmux ls -F '#{session_name} #{session_created}' | grep -v '^code-' | sort"
