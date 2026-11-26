@@ -36,6 +36,8 @@ export class TerminalProfileRegistration implements vscode.Disposable {
     private readonly register: RegisterProfileProvider;
     /** The live registration, or `undefined` when the id is currently unowned. */
     private current: vscode.Disposable | undefined;
+    /** The provider behind {@link current} — what {@link release} checks ownership against. */
+    private owner: vscode.TerminalProfileProvider | undefined;
 
     /**
      * @param id contributed profile id to own (must match `contributes.terminal.profiles`).
@@ -56,14 +58,30 @@ export class TerminalProfileRegistration implements vscode.Disposable {
     use(provider: vscode.TerminalProfileProvider): void {
         const previous = this.current;
         this.current = undefined;
+        this.owner = undefined;
         previous?.dispose();
         this.current = this.register(this.id, provider);
+        this.owner = provider;
+    }
+
+    /**
+     * Hand the id to `replacement`, but only while `provider` still owns it. A tmux layer
+     * going away releases through this, never through {@link use}: a layer superseded while
+     * it was still wiring lands AFTER the layer that replaced it registered, and an
+     * unconditional swap would unregister the live one — "Persistent Shell" then opened plain
+     * shells while the new layer looked wired.
+     */
+    release(provider: vscode.TerminalProfileProvider, replacement: vscode.TerminalProfileProvider): void {
+        if (this.owner === provider) {
+            this.use(replacement);
+        }
     }
 
     /** Release the id. Idempotent — safe as a `context.subscriptions` entry. */
     dispose(): void {
         const previous = this.current;
         this.current = undefined;
+        this.owner = undefined;
         previous?.dispose();
     }
 }

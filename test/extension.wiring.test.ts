@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { backgroundTerminalsMessage, canonicalTmuxIdentity, CLIPBOARD_PASTE_DEADLINE_MS, CLIPBOARD_SWEEP_DEADLINE_MS, clipboardExec, CLOSE_BACKGROUND_TERMINALS, deactivate, decideDefaultProfile, DEFAULT_PROFILE_WRITE_DEADLINE_MS, HAND_OFF_NOT_NOW, HAND_OFF_OFFER_MESSAGE, HAND_OFF_TAKE_OVER, KEEP_BACKGROUND_TERMINALS, LIFETIME_DOCS_URL, LIFETIME_LEARN_MORE, LIFETIME_WARNING_MESSAGE, maybeWarnTerminalLifetime, offerBackgroundCleanup, offerHandOff, decideTmuxWiring, defaultProfileSettingKey, deriveTmuxSessionContext, lazyExec, onceOnly, readTmuxSettings, reconcileDefaultTerminalProfile, resolveSshTarget, TMUX_EXEC_DEADLINE_MS, TMUX_PROFILE_TITLE, TmuxLayerController, tmuxExec, watchTmuxLayerInputs, type TmuxSettings, type TmuxTerminalLayer } from '../src/extension';
+import { backgroundTerminalsMessage, canonicalTmuxIdentity, CLIPBOARD_PASTE_DEADLINE_MS, CLIPBOARD_SWEEP_DEADLINE_MS, clipboardExec, CLOSE_BACKGROUND_TERMINALS, deactivate, decideDefaultProfile, DEFAULT_PROFILE_WRITE_DEADLINE_MS, HAND_OFF_NOT_NOW, HAND_OFF_OFFER_MESSAGE, HAND_OFF_TAKE_OVER, KEEP_BACKGROUND_TERMINALS, LIFETIME_DOCS_URL, LIFETIME_LEARN_MORE, LIFETIME_WARNING_MESSAGE, maybeWarnTerminalLifetime, offerBackgroundCleanup, offerHandOff, oncePerKey, decideTmuxWiring, defaultProfileSettingKey, deriveTmuxSessionContext, lazyExec, onceOnly, readTmuxSettings, reconcileDefaultTerminalProfile, resolveSshTarget, TMUX_EXEC_DEADLINE_MS, TMUX_PROFILE_TITLE, TmuxLayerController, tmuxExec, watchTmuxLayerInputs, type TmuxSettings, type TmuxTerminalLayer } from '../src/extension';
 import SSHDestination from '../src/ssh/sshDestination';
 import type { TmuxSessionContext } from '../src/tmux/terminalProvider';
 import { DeadlineError } from '../src/common/deadline';
@@ -101,6 +101,11 @@ function fakeLayer(identity: TmuxSessionContext = { hostKey: 'dev@h:22', workspa
     } satisfies TmuxTerminalLayer;
 }
 
+/** Settings as a live change hands them to the controller. */
+const LIVE_SETTINGS: TmuxSettings = {
+    enabled: 'auto', historyLimit: 50000, reapOnConnect: true, handOff: 'auto', setDefaultProfile: true, orphanMaxAgeDays: 14,
+};
+
 describe('TmuxLayerController: wire once, refresh on reconnect, rewire/unwire at runtime', () => {
     it('wires on the first resolve, then only refreshes on every later resolve', async () => {
         const layer = fakeLayer();
@@ -198,6 +203,71 @@ describe('TmuxLayerController: wire once, refresh on reconnect, rewire/unwire at
         expect(await controller.resolved()).toBeUndefined();
         expect(await controller.resolved()).toBe(layer);
     });
+
+    it('tells a wiring when it has been superseded, so it can stop before its side effects', async () => {
+        const checks: Array<() => boolean> = [];
+        const controller = new TmuxLayerController(stillCurrent => {
+            checks.push(stillCurrent);
+            return new Promise(() => { /* still wiring */ });
+        });
+        void controller.resolved();
+        await Promise.resolve();
+        expect(checks[0]()).toBe(true);
+
+        void controller.rewire();
+        await Promise.resolve();
+
+        expect(checks[0]()).toBe(false); // the first attempt is stale
+        expect(checks[1]()).toBe(true);
+    });
+
+    it('a setting handed over while wiring is in flight reaches the layer when it lands', async () => {
+        const layer = fakeLayer();
+        let land!: (value: TmuxTerminalLayer) => void;
+        const controller = new TmuxLayerController(() => new Promise<TmuxTerminalLayer>(resolve => {
+            land = resolve;
+        }));
+        const wiring = controller.resolved();
+        await Promise.resolve();
+
+        controller.reconfigure({ ...LIVE_SETTINGS, handOff: 'never' });
+        land(layer);
+        await wiring;
+
+        expect(layer.reconfigure).toHaveBeenCalledTimes(1);
+        expect(layer.reconfigure).toHaveBeenCalledWith(expect.objectContaining({ handOff: 'never' }));
+    });
+
+    it('a setting handed over before an unwire is not applied to a later layer', async () => {
+        const layer = fakeLayer();
+        const controller = new TmuxLayerController(async () => layer);
+        void controller.resolved();
+        controller.reconfigure({ ...LIVE_SETTINGS, handOff: 'never' });
+        controller.unwire();
+
+        await controller.resolved();
+
+        expect(layer.reconfigure).not.toHaveBeenCalled();
+    });
+
+    it('idle() waits for a superseded wiring to land (it may still be writing settings)', async () => {
+        let land!: (value: TmuxTerminalLayer | undefined) => void;
+        const controller = new TmuxLayerController(() => new Promise<TmuxTerminalLayer | undefined>(resolve => {
+            land = resolve;
+        }));
+        void controller.resolved();
+        await Promise.resolve();
+        controller.unwire();
+        let idle = false;
+        void controller.idle().then(() => { idle = true; });
+
+        await new Promise(resolve => setTimeout(resolve, 0));
+        expect(idle).toBe(false);
+
+        land(undefined);
+        await new Promise(resolve => setTimeout(resolve, 0));
+        expect(idle).toBe(true);
+    });
 });
 
 describe('watchTmuxLayerInputs (05 b/h: settings and folder changes without a reload)', () => {
@@ -205,13 +275,13 @@ describe('watchTmuxLayerInputs (05 b/h: settings and folder changes without a re
         enabled: 'auto', historyLimit: 50000, reapOnConnect: true, handOff: 'auto', setDefaultProfile: true, orphanMaxAgeDays: 14,
     };
 
-    function harness(over: { identity?: TmuxSessionContext | undefined; connected?: boolean } = {}) {
+    function harness(over: { identity?: TmuxSessionContext | undefined; connected?: boolean; wire?: () => Promise<TmuxTerminalLayer | undefined> } = {}) {
         let configListener: ((e: { affectsConfiguration(section: string): boolean }) => void) | undefined;
         let foldersListener: (() => void) | undefined;
         const configSub = { dispose: vi.fn() };
         const foldersSub = { dispose: vi.fn() };
         const layer = fakeLayer();
-        const controller = new TmuxLayerController(async () => layer);
+        const controller = new TmuxLayerController(over.wire ?? (async () => layer));
         let settings = SETTINGS;
         const reactions = {
             controller,
@@ -263,10 +333,69 @@ describe('watchTmuxLayerInputs (05 b/h: settings and folder changes without a re
         await controller.resolved();
 
         change({ enabled: 'off' });
+        await settle();
 
         expect(layer.dispose).toHaveBeenCalledTimes(1);
         expect(reactions.clearDefaultProfile).toHaveBeenCalledTimes(1);
         expect(reactions.offerCleanup).toHaveBeenCalledWith(layer.identity);
+    });
+
+    it('turning them off while wiring is in flight clears our default only once that wiring has landed', async () => {
+        let land!: (value: TmuxTerminalLayer) => void;
+        const { controller, change, reactions } = harness({ wire: () => new Promise<TmuxTerminalLayer>(resolve => {
+            land = resolve;
+        }) });
+        void controller.resolved();
+        await Promise.resolve();
+
+        change({ enabled: 'off' });
+        await settle();
+        // The in-flight attempt may still be writing the default profile: clearing now would
+        // see nothing to clear, and its write would land afterwards and stay.
+        expect(reactions.clearDefaultProfile).not.toHaveBeenCalled();
+
+        land(fakeLayer());
+        await settle();
+
+        expect(reactions.clearDefaultProfile).toHaveBeenCalledTimes(1);
+        // No layer landed to name the sessions, so the offer is made for the current folder's.
+        expect(reactions.currentIdentity).toHaveBeenCalled();
+        expect(reactions.offerCleanup).toHaveBeenCalledTimes(1);
+    });
+
+    it('turned back on before the in-flight wiring landed: no clear and no offer (the new layer owns both)', async () => {
+        const lands: Array<(value: TmuxTerminalLayer) => void> = [];
+        const { controller, change, reactions } = harness({ wire: () => new Promise<TmuxTerminalLayer>(resolve => {
+            lands.push(resolve);
+        }) });
+        void controller.resolved();
+        await Promise.resolve();
+
+        change({ enabled: 'off' });
+        change({ enabled: 'auto' });
+        await settle();
+        lands.forEach(land => land(fakeLayer()));
+        await settle();
+
+        expect(reactions.clearDefaultProfile).not.toHaveBeenCalled();
+        expect(reactions.offerCleanup).not.toHaveBeenCalled();
+        expect(controller.wired).toBe(true);
+    });
+
+    it('a live setting changed while wiring is in flight is applied when the layer lands', async () => {
+        const layer = fakeLayer();
+        let land!: (value: TmuxTerminalLayer) => void;
+        const { controller, change } = harness({ wire: () => new Promise<TmuxTerminalLayer>(resolve => {
+            land = resolve;
+        }) });
+        const wiring = controller.resolved();
+        await Promise.resolve();
+
+        change({ handOff: 'never' });
+        land(layer);
+        await wiring;
+
+        expect(layer.reconfigure).toHaveBeenCalledWith(expect.objectContaining({ handOff: 'never' }));
     });
 
     it('turning them back on without a reload wires again', async () => {
@@ -496,6 +625,20 @@ describe('onceOnly: connect-time housekeeping that must not repeat on reconnect'
         expect(() => once()).toThrow('sweep exploded');
         expect(() => once()).not.toThrow();
         expect(action).toHaveBeenCalledTimes(1);
+    });
+});
+
+// The "tmux required but missing" error: one per host per window, not one per reconnect.
+describe('oncePerKey: a notification that must not repeat for the same key', () => {
+    it('runs once per key, and again for a different key', () => {
+        const action = vi.fn();
+        const once = oncePerKey(action);
+
+        once('ssh-remote+a');
+        once('ssh-remote+a');
+        once('ssh-remote+b');
+
+        expect(action.mock.calls).toEqual([['ssh-remote+a'], ['ssh-remote+b']]);
     });
 });
 

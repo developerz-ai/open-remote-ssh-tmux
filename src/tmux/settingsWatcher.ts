@@ -21,8 +21,10 @@ export interface WatchedTmuxSettings {
  * What to do about a settings change:
  *  - `rewire` — (re)build the layer from scratch: persistent terminals were turned (back) on,
  *    or `on` ↔ `auto` changed while unwired (`on` must say now that tmux is missing);
- *  - `refresh` — the wired layer takes the new values as they are: new terminals get the new
- *    scrollback, the next reconcile the new hand-off policy, the default profile is reconciled;
+ *  - `refresh` — the wired layer (or, while it is still wiring, the layer once it lands) takes
+ *    the new values as they are: new terminals get the new scrollback, the next reconcile the
+ *    new hand-off policy, and the default profile is written if none is set yet (turning
+ *    `setDefaultProfile` off does not remove an earlier write — see the README);
  *  - `offer-cleanup` — turned off while wired: unwire, and offer to close this workspace's
  *    sessions that are still running (they would otherwise run unseen);
  *  - `none` — nothing to do now. `reapOnConnect` and `orphanMaxAgeDays` are read by every
