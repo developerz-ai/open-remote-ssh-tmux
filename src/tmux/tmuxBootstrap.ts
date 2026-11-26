@@ -165,8 +165,10 @@ export interface LifetimeFacts {
  * manager running but does NOT exempt the session scope, so it does not change the verdict.
  * `loginctl show-session` with no id prints the manager's properties. Each call is bounded
  * by `timeout` where it exists (a wedged D-Bus must not hold the channel) and silenced; no
- * loginctl at all (non-systemd, macOS) answers nothing, which reads as "unknown". One line:
- * it runs under the remote login shell, and csh rejects a newline inside quotes.
+ * loginctl at all (non-systemd, macOS) answers nothing, which reads as "unknown". It is POSIX
+ * sh and must be run as such: the caller's runner (`tmuxExec`, `remoteExec.ts`) wraps it in
+ * `sh -c '…'`, so a csh or fish login shell never parses it. One line because that wrapper
+ * is a single-quoted argument, and csh rejects a newline inside quotes.
  */
 export const LIFETIME_PROBE_COMMAND = 'if command -v loginctl >/dev/null 2>&1; then '
     + 't=; command -v timeout >/dev/null 2>&1 && t="timeout 3"; '

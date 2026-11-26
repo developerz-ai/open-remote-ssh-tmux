@@ -1,9 +1,10 @@
 import { afterAll, beforeAll, beforeEach, expect, it } from 'vitest';
-import { buildListSessions, isOurSession, parseListSessions, sessionName } from '../../src/tmux/tmuxSession';
+import { buildListSessions, isOurSession, parseListSessions, parseListSessionsClock, sessionName } from '../../src/tmux/tmuxSession';
 import { describeRig, RigSession, SHELL_USERS } from './rig';
 
 // `parseListSessions` over what a real server prints for `buildListSessions()` — sent
-// through the production exec under every login shell (the `-F` format is full of `#{…}`,
+// through the production exec (`tmuxExec`: `sh -c '…'` behind the login shell) under every
+// login shell (the `-F` format is full of `#{…}`, and the remote-clock prefix of `$(…)`,
 // which each shell must pass through untouched). The user's own sessions sit next to ours
 // and must never be classed as ours: `isOurSession` is the reaper's kill permit.
 
@@ -46,7 +47,12 @@ describeRig('list-sessions parsing (real tmux, every login shell)', target => {
             await rig.waitUntil('the corpse pane to die', async () =>
                 (await rig.tmux('display-message', '-p', '-t', CORPSE, '#{pane_dead}')).stdout.trim() === '1');
 
-            const parsed = parseListSessions((await rig.rawExec(buildListSessions())).stdout);
+            const { stdout, code } = await rig.exec(buildListSessions());
+            const parsed = parseListSessions(stdout);
+
+            // The exit status is list-sessions's, and the remote's clock rides along.
+            expect(code).toBe(0);
+            expect(parseListSessionsClock(stdout)).toBeGreaterThan(1_700_000_000);
 
             const byName = new Map(parsed.map(row => [row.name, row]));
             expect([...byName.keys()].sort()).toEqual([...FOREIGN, OURS, CORPSE].sort());
@@ -63,8 +69,10 @@ describeRig('list-sessions parsing (real tmux, every login shell)', target => {
     it('no server running parses as zero sessions', async () => {
         const rig = sessions.get('u-bash')!;
 
-        const { stdout } = await rig.rawExec(buildListSessions());
+        const { stdout, code } = await rig.exec(buildListSessions());
 
+        expect(code).not.toBe(0);
         expect(parseListSessions(stdout)).toEqual([]);
+        expect(parseListSessionsClock(stdout)).toBeGreaterThan(1_700_000_000);
     });
 });

@@ -96,7 +96,7 @@ export interface CloseWatchDeps<C extends object> {
  * current connection unless that connection already carries one. Create it once per window,
  * so a layer rebuilt on the same connection (a settings or folder change) does not start a
  * second. Never throws — a watch that cannot start costs only the fallback (the other machine
- * waits out the idle threshold), never the connect.
+ * waits out the idle threshold) until the next call retries it, never the connect.
  */
 export function createCloseWatch<C extends object>(deps: CloseWatchDeps<C>): (command: string) => void {
     const watched = new WeakSet<C>();
@@ -106,8 +106,17 @@ export function createCloseWatch<C extends object>(deps: CloseWatchDeps<C>): (co
             return;
         }
         watched.add(connection);
-        const failed = (err: unknown): void =>
+        // A watch that could not start (a channel refused just then) must not leave the
+        // connection marked for its whole life: forget it, so the next `ensure` — the next
+        // resolve or layer rebuild, never a loop — tries again. Only while the window is
+        // still on that connection; a watch that failed because its connection died has
+        // nothing left to watch.
+        const failed = (err: unknown): void => {
+            if (deps.current() === connection) {
+                watched.delete(connection);
+            }
             deps.log.trace(`Persistent terminals: close watch failed: ${err instanceof Error ? err.message : String(err)}`);
+        };
         try {
             deps.run(connection, command).catch(failed);
         } catch (err) {

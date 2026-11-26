@@ -83,22 +83,59 @@ export interface TmuxFeatures {
      * 3.8 yes). There a session-scoped value reaches our pane — and, conversely, touching
      * the GLOBAL would resize every pane on the user's server. */
     readonly liveHistoryLimit: boolean;
+    /** The client's `-T` feature list (tmux ≥ 3.2; `hyperlinks` from 3.4), or `undefined`
+     * where the flag does not exist — or the version is unknown, since an unknown FLAG is a
+     * usage error and no terminal at all. See {@link CLIENT_FEATURES}. */
+    readonly clientFeatures?: string;
+    /** `new-session -e` exists (tmux ≥ 3.2), so the pane can be told `COLORTERM`. False for
+     * an unknown version, for the same reason as `clientFeatures`. */
+    readonly sessionEnvironment: boolean;
 }
+
+/** What VS Code's terminal (xterm.js) can do that tmux does not assume of a bare
+ * `xterm-256color`: 24-bit colour, and — where tmux knows the feature — synchronized output
+ * (its own repaints on attach and resize arrive as one frame) and OSC 8 hyperlinks. Without
+ * them tmux quantised every RGB colour to the 256 palette and dropped hyperlinks outright
+ * (both reproduced on 3.4). Passed with the client's `-T`, so it describes THIS client only:
+ * nothing is written to the server and the user's own clients are not re-described. */
+const CLIENT_FEATURES = 'RGB,sync';
+const CLIENT_FEATURES_WITH_HYPERLINKS = 'RGB,hyperlinks,sync';
+
+/** Below tmux 3.2 there is no `-T`; the only way to get 24-bit colour through is the `Tc`
+ * terminal override, and that is a SERVER option matched on the client's `TERM`. It is
+ * appended once (see {@link buildAttachOrCreateArgv}) and adds the one capability to
+ * `xterm*` clients — the user's own included. */
+const TRUECOLOR_OVERRIDE = 'xterm*:Tc';
+
+/** What the pane is told about colour where `new-session -e` exists. The pane's environment
+ * is the tmux server's, not VS Code's, so without it programs that look at `COLORTERM`
+ * (as VS Code's own terminals set it) fall back to 256 colours. */
+const PANE_COLORTERM = 'COLORTERM=truecolor';
 
 /**
  * Feature table for a probed tmux version token (`3.4`, `3.0a`, `next-3.7`). An
- * unparseable or missing version (an exotic `tmux master` build) is treated as modern:
- * the modern chain never touches the user's global, so on an old tmux the worst case is
- * our scrollback setting not applying — never a changed server.
+ * unparseable or missing version (an exotic `tmux master` build) is treated as modern for
+ * the history chain — it never touches the user's global, so on an old tmux the worst case
+ * is our scrollback setting not applying, never a changed server — and as OLD for every
+ * flag an old tmux would refuse (`-T`, `new-session -e`): a refused flag is no terminal.
  */
 export function tmuxFeatures(version: string | undefined): TmuxFeatures {
     const match = version === undefined ? null : /(\d+)\.(\d+)/.exec(version);
     if (!match) {
-        return { liveHistoryLimit: true };
+        return { liveHistoryLimit: true, sessionEnvironment: false };
     }
     const major = parseInt(match[1], 10);
     const minor = parseInt(match[2], 10);
-    return { liveHistoryLimit: major > 3 || (major === 3 && minor >= 7) };
+    const atLeast = (wantMajor: number, wantMinor: number): boolean =>
+        major > wantMajor || (major === wantMajor && minor >= wantMinor);
+    if (!atLeast(3, 2)) {
+        return { liveHistoryLimit: false, sessionEnvironment: false };
+    }
+    return {
+        liveHistoryLimit: atLeast(3, 7),
+        clientFeatures: atLeast(3, 4) ? CLIENT_FEATURES_WITH_HYPERLINKS : CLIENT_FEATURES,
+        sessionEnvironment: true,
+    };
 }
 
 /** Session name shape this extension produces and is allowed to reap:
@@ -117,20 +154,35 @@ const OWNED_SESSION_RE = new RegExp(`^${SESSION_PREFIX}[0-9a-f]{${HASH_LENGTH}}-
 /**
  * The `if-shell -F` predicate guarding the PageUp/PageDown bindings below: expands to
  * `1` when the pane's application must receive the key untouched, `0` when the pane is
- * a bare shell prompt — the one situation where the key can only mean "scroll".
+ * a bare shell prompt of one of OUR sessions — the one situation where the key can only
+ * mean "scroll".
  *
- * Two arms, and both are load-bearing (each verified against a real tmux 3.4 server):
+ * Every arm is load-bearing (each verified against a real tmux server, 2.6 … 3.8 on the rig):
+ *  - the session name — key tables are server-global, so without it the binding also acted
+ *    in the user's own sessions (`main`, attached from any terminal): PageUp at their
+ *    prompt entered copy mode. Anything that is not named like ours keeps its keys;
  *  - `alternate_on` — vim/htop/a pager draws on the alternate screen, which has no
  *    scrollback to page into. Note `seq 1 500 | less` reports
  *    `pane_current_command=bash` (tmux names the pipeline's leader), so this arm, not
  *    the command test, is what saves a piped pager;
+ *  - `ssh` — its name ends in `sh` but it is not a prompt: a normal-screen program on the
+ *    far side (Claude Code on a jump host) must get the key;
  *  - `#{m:*sh,#{pane_current_command}}` — a foreground command that is NOT a shell is a
  *    TUI on the NORMAL screen, which is exactly how Claude Code runs (`claude`, or
  *    `node` when installed through npm). Gating on `alternate_on` alone would steal
  *    PageUp from it. Nearly every shell name ends in `sh` (bash/zsh/fish/dash/ksh/tcsh),
  *    so the glob is the whole test; an exotic shell (`nu`, `xonsh`) simply keeps its keys.
+ *
+ * Only formats tmux 2.6 has: `?`, `==:` and `m:` (no `&&`/`||`, which came later).
  */
-const PASS_KEYS_THROUGH = '#{?alternate_on,1,#{?#{m:*sh,#{pane_current_command}},0,1}}';
+const PASS_KEYS_THROUGH = `#{?#{m:${SESSION_PREFIX}[0-9a-f]*-[0-9]*,#{session_name}},`
+    + '#{?alternate_on,1,#{?#{==:#{pane_current_command},ssh},1,#{?#{m:*sh,#{pane_current_command}},0,1}}}'
+    + ',1}';
+
+/** A substring of {@link PASS_KEYS_THROUGH} that `list-keys` prints back verbatim and no
+ * `#` in it (the shell job it is grepped in is format-expanded): how a binding of OURS is
+ * told from the user's, so an attach can replace the one an older version left behind. */
+const OUR_BINDING_MARK = 'alternate_on,1,';
 
 /** A parsed row from `tmux list-sessions` (see `buildListSessions` `-F`). */
 export interface TmuxSession {
@@ -148,9 +200,10 @@ export interface TmuxSession {
     readonly paneDead: boolean;
     /** `#{session_created}` — unix epoch seconds. */
     readonly createdEpoch: number;
-    /** `#{session_activity}` — unix epoch seconds of the session's last activity (client
-     * input, attach), the age evidence of the orphan rule in {@link reapVerdict}.
-     * `undefined` for a row that did not carry it — and then the session is never aged out. */
+    /** Unix epoch seconds of the session's last activity, the age evidence of the orphan rule
+     * in {@link reapVerdict}: the later of `#{session_activity}` (client input, attach) and
+     * `#{window_activity}` (pane output), so a detached task that is still printing is not
+     * idle. `undefined` for a row that carried neither — and then the session is never aged out. */
     readonly activityEpoch?: number;
     /** `#{@orst_owner}` — the client id of the window that last attached, or `undefined` for
      * a session that carries no tag (created before tags existed, or never attached by us). */
@@ -313,11 +366,20 @@ function jobTmux(tmuxPath: string): string {
     return escapeShellArg(tmuxPath).replace(/#/g, '##');
 }
 
-/** `if-shell` test that succeeds when the user's server already has `key` bound in the root
- * table — by them, or by an earlier attach of ours. `list-keys -T root <key>` does not exist
- * at 2.6, hence the grep; the line shape `… -T root <key> …` is the same on 2.6 … 3.8. */
+/** `if-shell` test that succeeds when the USER has `key` bound in the root table — a binding
+ * that is not ours ({@link OUR_BINDING_MARK}). Unbound, or bound by an earlier attach of ours
+ * (which may carry an older predicate), fails the test and the key is (re)bound.
+ * `list-keys -T root <key>` does not exist at 2.6, hence the grep; the line shape
+ * `… -T root <key> …` is the same on 2.6 … 3.8. */
 function rootKeyBound(tmux: string, key: string): string {
-    return `${tmux} list-keys -T root | grep -Eq -- '-T root +${key} '`;
+    return `${tmux} list-keys -T root | grep -E -- '-T root +${key} ' | grep -Fqv '${OUR_BINDING_MARK}'`;
+}
+
+/** `if-shell` test that succeeds when the server's `terminal-overrides` already carry
+ * {@link TRUECOLOR_OVERRIDE} — from the user's own config or an earlier attach of ours — so
+ * the append below happens once per server, never once per attach. */
+function truecolorOverridden(tmux: string): string {
+    return `${tmux} show-options -s terminal-overrides | grep -Fq '${TRUECOLOR_OVERRIDE}'`;
 }
 
 /**
@@ -332,6 +394,12 @@ function rootKeyBound(tmux: string, key: string): string {
  * the user's server still holds tmux's default, so a setting the user configured is never
  * overwritten. The one global we borrow, `history-limit` on tmux < 3.7, is put back to
  * the user's exact value before anything that can fail.
+ *
+ * It opens with the tmux CLIENT's own flags, before the first command: `-u` always, and
+ * `-T <features>` where it exists. `-u` because tmux decides per client, from
+ * `LC_ALL`/`LC_CTYPE`/`LANG`, whether the terminal is UTF-8, and under `LC_ALL=C` (common
+ * in container images) it replaced every non-ASCII glyph with `_` — in a terminal that
+ * renders UTF-8 whatever the locale says (reproduced on 3.4).
  */
 export function buildAttachOrCreateArgv(
     name: string,
@@ -344,7 +412,12 @@ export function buildAttachOrCreateArgv(
     // `-D` must sit with the other `new-session` flags, before `-s`: it is a flag of the
     // attach behaviour `-A` selects, not a standalone command.
     const mode = opts.detached ? ['-d'] : opts.takeOver ? ['-A', '-D'] : ['-A'];
+    const features = tmuxFeatures(opts.tmuxVersion);
     const create = ['new-session', ...mode, '-s', name, '-c', tmuxLiteralPath(cwd)];
+    if (features.sessionEnvironment) {
+        // Read only when the session is created; an attach to an existing one ignores it.
+        create.push('-e', PANE_COLORTERM);
+    }
     if (shell !== undefined) {
         create.push(shell);
     }
@@ -358,7 +431,7 @@ export function buildAttachOrCreateArgv(
     // `set-option -gu`, reset the global to tmux's built-in 2000 instead of the user's value.
     // `run-shell` blocks the chain until the job is done, and nothing between the save and
     // the restore yields, so a concurrent attach cannot observe our value.
-    const borrowGlobal = !tmuxFeatures(opts.tmuxVersion).liveHistoryLimit;
+    const borrowGlobal = !features.liveHistoryLimit;
     const head = borrowGlobal
         ? [
             'run-shell', `${tmux} set-option -g ${SAVED_HISTORY_OPTION} "$(${tmux} show-options -gv history-limit)"`,
@@ -377,7 +450,16 @@ export function buildAttachOrCreateArgv(
     // Right after the create, before anything later in the chain can fail: a session without
     // our tag reads as "owner unknown" to every other machine, i.e. never ours to reclaim.
     const tag = opts.owner === undefined ? [] : [';', 'set-option', '-t', session, OWNER_OPTION, checkedOwner(opts.owner)];
+    // 24-bit colour for this client. With `-T` it is the client's own property; without, the
+    // `Tc` override has to be on the server BEFORE `new-session` opens the client's terminal,
+    // so it leads the chain — appended only if no such override is there yet. `-as` in one
+    // string, never a bare `-s` element: `terminalProvider` finds the session name after the
+    // first `-s` of this array.
+    const client = features.clientFeatures === undefined
+        ? ['-u', 'if-shell', truecolorOverridden(tmux), '', `set-option -as terminal-overrides ",${TRUECOLOR_OVERRIDE}"`, ';']
+        : ['-u', '-T', features.clientFeatures];
     return [
+        ...client,
         ...head,
         ...tag,
         ';', 'set-window-option', '-t', `=${name}`, 'remain-on-exit', 'off',
@@ -424,10 +506,11 @@ export function buildAttachOrCreateArgv(
         // below the live screen.
         //
         // Key tables are SERVER-global (tmux has no per-session bindings), so each key is
-        // bound only when the root table has nothing on it yet: a user's own PageUp binding
-        // wins, and so does ours from an earlier attach. That test needs a shell job (no
-        // format can see bindings): one short `list-keys | grep` per key, per attach. The
-        // then-branch is empty — "already bound, leave it".
+        // bound only when the user has nothing of their own on it: their PageUp binding
+        // wins; ours from an earlier attach is replaced (it may predate the session-name
+        // guard). That test needs a shell job (no format can see bindings): one short
+        // `list-keys | grep` per key, per attach. The then-branch is empty — "the user
+        // bound it, leave it". The predicate confines the binding to our own sessions.
         ';', 'if-shell', rootKeyBound(tmux, 'PPage'), '',
         `bind-key -n PPage if-shell -F '${PASS_KEYS_THROUGH}' 'send-keys PPage' 'copy-mode -eu'`,
         ';', 'if-shell', rootKeyBound(tmux, 'NPage'), '',
@@ -472,17 +555,39 @@ export function isDuplicateSession(stderr: string): boolean {
  * current window's active pane); for our single-window sessions that is the corpse
  * signal `shouldReap` needs — `#{session_windows}` can never fall to 0 on a live
  * session (tmux destroys it with its last window). It expands to `0`/`1`, so it is
- * always a token and safe as the right-anchored final field.
+ * always a token: the last of the four numeric fields, which `parseListSessions` reads
+ * from the right once the tagged fields behind it (`a:` `w:` `o:` `c:`) are taken off.
+ *
+ * The rows are preceded by the remote's clock (`__now <epoch>`, as in
+ * {@link buildListClientsCommand}; read with {@link parseListSessionsClock}): the reaper
+ * ages sessions against it, never against the local clock — two machines' clocks differ,
+ * and a local clock running days ahead aged a fresh session into an orphan. The exit
+ * status is still `list-sessions`'s.
  */
 export function buildListSessions(tmuxPath = TMUX_BIN): string {
-    return `${escapeShellArg(tmuxPath)} list-sessions -F `
+    return `printf '${NOW_TAG} %s\\n' "$(date +%s)"; ${escapeShellArg(tmuxPath)} list-sessions -F `
         + escapeShellArg(`#{session_name} #{session_attached} #{session_windows} #{session_created} #{pane_dead} `
-            + `${ACTIVITY_FIELD}#{session_activity} ${OWNER_FIELD}#{${OWNER_OPTION}} ${CLOSED_FIELD}#{${CLOSED_OPTION}}`);
+            + `${ACTIVITY_FIELD}#{session_activity} ${OUTPUT_FIELD}#{window_activity} `
+            + `${OWNER_FIELD}#{${OWNER_OPTION}} ${CLOSED_FIELD}#{${CLOSED_OPTION}}`);
+}
+
+/** The remote's own clock (epoch seconds) from a {@link buildListSessions} run, or `undefined`
+ * when its line did not come back. Every epoch in a row is the remote's, so this — never the
+ * local clock — is what an age may be measured against. */
+export function parseListSessionsClock(stdout: string): number | undefined {
+    const match = new RegExp(`^${NOW_TAG} (\\d+)\\s*$`, 'm').exec(stdout);
+    return match ? parseInt(match[1], 10) : undefined;
 }
 
 /** Prefix of the activity field in a {@link buildListSessions} row — tagged like the owner
  * field, so a row from before it existed (or a fixture) still parses unambiguously. */
 const ACTIVITY_FIELD = 'a:';
+
+/** Prefix of the `#{window_activity}` field: the last time the session's window had OUTPUT.
+ * `#{session_activity}` moves only on client input and attach (verified on 3.4: a detached
+ * pane printing every second left it unchanged), so on its own it aged a detached long task
+ * that prints but is never typed into — the very thing this fork exists to keep alive. */
+const OUTPUT_FIELD = 'w:';
 
 /** Prefix of the owner field in a {@link buildListSessions} row. An untagged session prints
  * just the prefix, so the field is always exactly one token and the numeric fields stay
@@ -700,9 +805,9 @@ export function classifyTmuxFailure(stderr: string, code: number | undefined): T
 /**
  * Parse `buildListSessions` output into typed rows. Tolerant by design: empty
  * output, whitespace-only, and the `no server running …` message all mean "zero
- * sessions" (not an error); malformed lines are skipped. The four trailing fields
- * are numeric, so fields are read from the right — a foreign session name containing
- * spaces still parses.
+ * sessions" (not an error); malformed lines — the remote-clock line among them — are
+ * skipped. The four fields after the name are numeric, so fields are read from the right —
+ * a foreign session name containing spaces still parses.
  */
 export function parseListSessions(stdout: string): TmuxSession[] {
     const sessions: TmuxSession[] = [];
@@ -714,9 +819,12 @@ export function parseListSessions(stdout: string): TmuxSession[] {
         const tokens = line.split(/\s+/);
         // The tagged fields are optional on read: rows from before they existed (and test
         // fixtures) carry five fields. They are popped right to left, in the order written.
-        const closedToken = tokens[tokens.length - 1].startsWith(CLOSED_FIELD) ? tokens.pop()! : undefined;
-        const ownerToken = tokens[tokens.length - 1].startsWith(OWNER_FIELD) ? tokens.pop()! : undefined;
-        const activityToken = tokens[tokens.length - 1].startsWith(ACTIVITY_FIELD) ? tokens.pop()! : undefined;
+        // A noise line of one or two such tokens (a banner reading `c:`) runs out of tokens
+        // here: `popTagged` then finds nothing, and the length check below skips the line.
+        const closedToken = popTagged(tokens, CLOSED_FIELD);
+        const ownerToken = popTagged(tokens, OWNER_FIELD);
+        const outputToken = popTagged(tokens, OUTPUT_FIELD);
+        const activityToken = popTagged(tokens, ACTIVITY_FIELD);
         if (tokens.length < 5) {
             continue;
         }
@@ -734,7 +842,10 @@ export function parseListSessions(stdout: string): TmuxSession[] {
             windows,
             paneDead: paneDeadFlag > 0,
             createdEpoch,
-            activityEpoch: activityToken === undefined ? undefined : toNonNegativeInt(activityToken.slice(ACTIVITY_FIELD.length)),
+            activityEpoch: latestEpoch(
+                activityToken === undefined ? undefined : toNonNegativeInt(activityToken.slice(ACTIVITY_FIELD.length)),
+                outputToken === undefined ? undefined : toNonNegativeInt(outputToken.slice(OUTPUT_FIELD.length)),
+            ),
             owner: ownerToken === undefined || ownerToken === OWNER_FIELD ? undefined : ownerToken.slice(OWNER_FIELD.length),
             closed: closedToken === undefined ? undefined : parseClosedMarker(closedToken.slice(CLOSED_FIELD.length)),
         });
@@ -801,6 +912,20 @@ export function reapVerdict(session: TmuxSession, now: number, opts: ReapOptions
 export function shouldReap(session: TmuxSession, now: number, opts: ReapOptions = {}): boolean {
     const verdict = reapVerdict(session, now, opts);
     return verdict === 'reap-corpse' || verdict === 'reap-orphan';
+}
+
+/** Take the last token off `tokens` iff it carries `prefix`; `undefined` otherwise, an empty
+ * list included. */
+function popTagged(tokens: string[], prefix: string): string | undefined {
+    return tokens.length > 0 && tokens[tokens.length - 1].startsWith(prefix) ? tokens.pop() : undefined;
+}
+
+/** The later of two optional epochs; `undefined` only when neither was reported. */
+function latestEpoch(a: number | undefined, b: number | undefined): number | undefined {
+    if (a === undefined || b === undefined) {
+        return a ?? b;
+    }
+    return Math.max(a, b);
 }
 
 /** A close marker's value, or `undefined` for anything that is not one (unset, withdrawn). */

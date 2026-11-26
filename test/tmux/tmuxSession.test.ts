@@ -20,6 +20,7 @@ import {
     parseHasSessions,
     parseListClients,
     parseListSessions,
+    parseListSessionsClock,
     readListSessionsResult,
     reapVerdict,
     sessionName,
@@ -111,15 +112,28 @@ describe('buildListSessions', () => {
         // gates on: a session whose process exited but lingers under `remain-on-exit`.
         // `#{session_windows}` alone can never be 0 for a live session, so it is not it.
         expect(buildListSessions()).toBe(
-            `'tmux' list-sessions -F `
-            + `'#{session_name} #{session_attached} #{session_windows} #{session_created} #{pane_dead} a:#{session_activity} o:#{@orst_owner} c:#{@orst_closed}'`,
+            `printf '__now %s\\n' "$(date +%s)"; 'tmux' list-sessions -F `
+            + `'#{session_name} #{session_attached} #{session_windows} #{session_created} #{pane_dead} `
+            + `a:#{session_activity} w:#{window_activity} o:#{@orst_owner} c:#{@orst_closed}'`,
         );
+    });
+
+    // Every epoch in a row is the REMOTE's; the reaper must age against the remote's clock
+    // too, so the same command reports it first (exit status stays list-sessions's — last).
+    it('reports the remote clock ahead of the rows', () => {
+        expect(buildListSessions()).toMatch(/^printf '__now %s\\n' "\$\(date \+%s\)"; /);
+        expect(parseListSessionsClock('__now 1700000123\ncode-x-0 0 1 1700000000 0 a:1 w:2 o: c:\n')).toBe(1700000123);
+        expect(parseListSessionsClock('banner\n__now 5 \n')).toBe(5);
+        expect(parseListSessionsClock('code-x-0 0 1 1700000000 0\n')).toBeUndefined();
+        expect(parseListSessionsClock('__now soon\n')).toBeUndefined();
+        // ...and the clock line is not a session.
+        expect(parseListSessions('__now 1700000123\n')).toEqual([]);
     });
 
     // The pty launches the probe's absolute path; exec-side commands must address the SAME
     // binary, or a bare `tmux` on a different PATH can talk to a different server.
     it('runs the given tmux binary, quoted', () => {
-        expect(buildListSessions(`/home/a b/tmux`)).toMatch(/^'\/home\/a b\/tmux' list-sessions -F /);
+        expect(buildListSessions(`/home/a b/tmux`)).toContain(`; '/home/a b/tmux' list-sessions -F `);
     });
 });
 
@@ -255,6 +269,26 @@ describe('tmuxFeatures', () => {
     ] as const)('%s -> liveHistoryLimit %s', (version, live) => {
         expect(tmuxFeatures(version).liveHistoryLimit).toBe(live);
     });
+
+    // `-T` (client terminal features) and `new-session -e` both arrived in 3.2 (tmux.c /
+    // cmd-new-session.c of 3.1c vs 3.2); the `hyperlinks` feature in 3.4. An UNKNOWN version
+    // gets neither flag: an old tmux refuses an unknown flag outright — no terminal at all.
+    it.each([
+        ['2.6', undefined, false],
+        ['3.0a', undefined, false],
+        ['3.1c', undefined, false],
+        ['3.2', 'RGB,sync', true],
+        ['3.3a', 'RGB,sync', true],
+        ['3.4', 'RGB,hyperlinks,sync', true],
+        ['3.5a', 'RGB,hyperlinks,sync', true],
+        ['3.8', 'RGB,hyperlinks,sync', true],
+        ['10.0', 'RGB,hyperlinks,sync', true],
+        ['master', undefined, false],
+        [undefined, undefined, false],
+    ] as const)('%s -> clientFeatures %s, sessionEnvironment %s', (version, clientFeatures, sessionEnvironment) => {
+        expect(tmuxFeatures(version).clientFeatures).toBe(clientFeatures);
+        expect(tmuxFeatures(version).sessionEnvironment).toBe(sessionEnvironment);
+    });
 });
 
 describe('buildAttachOrCreateArgv', () => {
@@ -269,7 +303,15 @@ describe('buildAttachOrCreateArgv', () => {
     // The `if-shell -F` predicate guarding the PageUp/PageDown bindings: 1 = the pane's
     // application keeps the key, 0 = it means "scroll" and is ours. Pinned as a literal so
     // a change to the builder's format string has to be made deliberately in both places.
-    const PASS_THROUGH = '#{?alternate_on,1,#{?#{m:*sh,#{pane_current_command}},0,1}}';
+    const PASS_THROUGH = '#{?#{m:code-[0-9a-f]*-[0-9]*,#{session_name}},'
+        + '#{?alternate_on,1,#{?#{==:#{pane_current_command},ssh},1,#{?#{m:*sh,#{pane_current_command}},0,1}}}'
+        + ',1}';
+    /** The `if-shell` job that succeeds when the USER has `key` bound (a binding not ours). */
+    const userBound = (tmux: string, key: string): string =>
+        `${tmux} list-keys -T root | grep -E -- '-T root +${key} ' | grep -Fqv 'alternate_on,1,'`;
+    /** The client flags and the create's `-e` on tmux >= 3.4. */
+    const CLIENT = ['-u', '-T', 'RGB,hyperlinks,sync'];
+    const PANE_ENV = ['-e', 'COLORTERM=truecolor'];
 
     const SESSION_TAIL = [
         ';', 'set-window-option', '-t', `=${NAME}`, 'remain-on-exit', 'off',
@@ -280,15 +322,16 @@ describe('buildAttachOrCreateArgv', () => {
         ';', 'set-option', '-t', `=${NAME}:`, 'prefix2', 'None',
         ';', 'if-shell', '-F', '#{==:#{escape-time},500}', 'set-option -s escape-time 10',
         ';', 'if-shell', '-F', '#{==:#{set-clipboard},external}', 'set-option -s set-clipboard on',
-        ';', 'if-shell', `${Q} list-keys -T root | grep -Eq -- '-T root +PPage '`, '',
+        ';', 'if-shell', userBound(Q, 'PPage'), '',
         `bind-key -n PPage if-shell -F '${PASS_THROUGH}' 'send-keys PPage' 'copy-mode -eu'`,
-        ';', 'if-shell', `${Q} list-keys -T root | grep -Eq -- '-T root +NPage '`, '',
+        ';', 'if-shell', userBound(Q, 'NPage'), '',
         `bind-key -n NPage if-shell -F '${PASS_THROUGH}' 'send-keys NPage'`,
     ];
 
     it('tmux >= 3.7: sets history-limit on the session only — the global is never touched', () => {
         expect(buildAttachOrCreateArgv(NAME, '/home/user/proj', undefined, { tmuxPath: TMUX, tmuxVersion: '3.8' })).toEqual([
-            'new-session', '-A', '-s', NAME, '-c', '/home/user/proj',
+            ...CLIENT,
+            'new-session', '-A', '-s', NAME, '-c', '/home/user/proj', ...PANE_ENV,
             ...SESSION_TAIL,
         ]);
     });
@@ -302,12 +345,100 @@ describe('buildAttachOrCreateArgv', () => {
     // "restored" as the global (verified on the rig).
     it('tmux < 3.7: saves the user\'s global, sets ours for the new pane, restores theirs', () => {
         expect(buildAttachOrCreateArgv(NAME, '/home/user/proj', undefined, { tmuxPath: TMUX, tmuxVersion: '3.4' })).toEqual([
+            ...CLIENT,
             'run-shell', `${Q} set-option -g @orst_saved_hl "$(${Q} show-options -gv history-limit)"`,
             ';', 'set-option', '-g', 'history-limit', '50000',
-            ';', 'new-session', '-A', '-s', NAME, '-c', '/home/user/proj',
+            ';', 'new-session', '-A', '-s', NAME, '-c', '/home/user/proj', ...PANE_ENV,
             ';', 'set-option', '-gF', 'history-limit', '#{@orst_saved_hl}',
             ...SESSION_TAIL,
         ]);
+    });
+
+    // tmux decides PER CLIENT, from LC_ALL/LC_CTYPE/LANG, whether the terminal is UTF-8. With
+    // `LC_ALL=C` in the pty's environment every non-ASCII glyph came out as `_` (reproduced
+    // on 3.4) in a terminal that renders UTF-8 regardless. `-u` is a flag of the tmux CLIENT,
+    // so it precedes the first command — on every version.
+    it.each(['2.6', '3.0a', '3.4', '3.8', undefined])('tmux %s: opens with the client flag -u', tmuxVersion => {
+        expect(buildAttachOrCreateArgv(NAME, '/p', undefined, { tmuxVersion })[0]).toBe('-u');
+        expect(buildClaimSessionCommand(NAME, '/p', { tmuxVersion })).toMatch(/^'tmux' '-u' /);
+    });
+
+    // xterm.js does 24-bit colour, OSC 8 hyperlinks and synchronized output, none of which
+    // tmux assumes of `xterm-256color`: RGB was quantised to the 256 palette and hyperlinks
+    // dropped (reproduced on 3.4). `-T` describes THIS client only — no server write.
+    it('tmux >= 3.2: declares the client\'s features with -T, hyperlinks from 3.4', () => {
+        expect(buildAttachOrCreateArgv(NAME, '/p', undefined, { tmuxVersion: '3.2a' }).slice(0, 4))
+            .toEqual(['-u', '-T', 'RGB,sync', 'run-shell']);
+        expect(buildAttachOrCreateArgv(NAME, '/p', undefined, { tmuxVersion: '3.8' }).slice(0, 4))
+            .toEqual(['-u', '-T', 'RGB,hyperlinks,sync', 'new-session']);
+        for (const tmuxVersion of ['3.2', '3.4', '3.8']) {
+            expect(buildAttachOrCreateArgv(NAME, '/p', undefined, { tmuxVersion }).join(' ')).not.toContain('terminal-overrides');
+        }
+    });
+
+    // Below 3.2 (and for a version we could not read, where an unknown flag would mean no
+    // terminal at all) the only lever is the `Tc` terminal override — a SERVER option. It
+    // must be in place before `new-session` opens the client's terminal, and it is appended
+    // only when the server does not carry it yet: once per server, never once per attach.
+    it.each(['2.6', '3.0a', '3.1c', undefined])('tmux %s: appends the Tc override once, before new-session, and no -T', tmuxVersion => {
+        const argv = buildAttachOrCreateArgv(NAME, '/p', undefined, { tmuxPath: TMUX, tmuxVersion });
+        expect(argv.slice(0, 6)).toEqual([
+            '-u',
+            'if-shell', `${Q} show-options -s terminal-overrides | grep -Fq 'xterm*:Tc'`, '',
+            'set-option -as terminal-overrides ",xterm*:Tc"',
+            ';',
+        ]);
+        expect(argv).not.toContain('-T');
+        expect(argv.indexOf('if-shell')).toBeLessThan(argv.indexOf('new-session'));
+    });
+
+    // The pane's environment is the tmux SERVER's, not VS Code's terminal's, so COLORTERM
+    // (which VS Code sets in its own terminals) has to be handed to the session. `-e` only
+    // exists from 3.2, and an unknown flag fails the create.
+    it('tmux >= 3.2: tells the pane COLORTERM=truecolor at create; never below or for an unknown version', () => {
+        for (const tmuxVersion of ['3.2', '3.4', '3.8']) {
+            const argv = buildAttachOrCreateArgv(NAME, '/p', undefined, { tmuxVersion });
+            expect(argv.slice(argv.indexOf('-c') + 2, argv.indexOf('-c') + 4)).toEqual(PANE_ENV);
+        }
+        for (const tmuxVersion of ['2.6', '3.0a', '3.1c', undefined]) {
+            expect(buildAttachOrCreateArgv(NAME, '/p', undefined, { tmuxVersion })).not.toContain('-e');
+        }
+    });
+
+    // `terminalProvider` reads a terminal's slot back out of its `shellArgs` as the element
+    // after the FIRST `-s`. Nothing ahead of `new-session` may be a bare `-s` (so the
+    // override is appended with `-as`, in one string).
+    it.each(['2.6', '3.4', '3.8', undefined])('tmux %s: the first -s is still new-session\'s, followed by the name', tmuxVersion => {
+        for (const takeOver of [false, true]) {
+            const argv = buildAttachOrCreateArgv(NAME, '/p', undefined, { tmuxVersion, takeOver, owner: '1a2b3c4d-0011aabb' });
+            expect(argv[argv.indexOf('-s') + 1]).toBe(NAME);
+        }
+    });
+
+    // Key tables are server-global, so the PageUp/PageDown bindings exist in the user's own
+    // sessions too. The predicate hands the key straight through unless the session is
+    // named like ours, and `ssh` (ends in `sh`, is not a prompt) keeps its keys as well.
+    it('binds PageUp/PageDown so they act only in our own sessions, and never under ssh', () => {
+        const argv = buildAttachOrCreateArgv(NAME, '/p', undefined, { tmuxVersion: '3.8' });
+        const binding = argv.find(arg => arg.startsWith('bind-key -n PPage '));
+        expect(binding).toBe(`bind-key -n PPage if-shell -F '${PASS_THROUGH}' 'send-keys PPage' 'copy-mode -eu'`);
+        expect(PASS_THROUGH.startsWith('#{?#{m:code-[0-9a-f]*-[0-9]*,#{session_name}},')).toBe(true);
+        expect(PASS_THROUGH.endsWith(',1}')).toBe(true);
+        expect(PASS_THROUGH).toContain('#{?#{==:#{pane_current_command},ssh},1,');
+        // tmux 2.6 has `?`, `==:` and `m:` but no `&&` / `||`.
+        expect(PASS_THROUGH).not.toMatch(/#\{(&&|\|\|):/);
+    });
+
+    // An earlier version's binding (no session guard) is still on a long-lived server. The
+    // test that guards the bind is "the USER bound it": a line for the key that is not ours.
+    it('replaces its own earlier binding, keeps the user\'s', () => {
+        const argv = buildAttachOrCreateArgv(NAME, '/p', undefined, { tmuxPath: TMUX });
+        expect(argv).toContain(userBound(Q, 'PPage'));
+        expect(argv).toContain(userBound(Q, 'NPage'));
+        // The mark is part of the predicate (so `list-keys` prints it) and carries no `#`:
+        // the job string is format-expanded by tmux before the shell sees it.
+        expect(PASS_THROUGH).toContain('alternate_on,1,');
+        expect(userBound(Q, 'PPage')).not.toContain('#');
     });
 
     it('never resets the global history-limit to the built-in default (-gu)', () => {
@@ -324,8 +455,8 @@ describe('buildAttachOrCreateArgv', () => {
 
     it('defaults to the modern chain and a bare tmux when version/path are unknown', () => {
         const argv = buildAttachOrCreateArgv(NAME, '/p');
-        expect(argv[0]).toBe('new-session');
-        expect(argv).toContain(`'tmux' list-keys -T root | grep -Eq -- '-T root +PPage '`);
+        expect(argv).not.toContain('run-shell');
+        expect(argv).toContain(userBound(`'tmux'`, 'PPage'));
     });
 
     // tmux's prefix (C-b) is a tmux UI the user never asked for, and it eats a key Claude
@@ -355,7 +486,7 @@ describe('buildAttachOrCreateArgv', () => {
     it('keeps the user\'s PageUp/PageDown when they bound one (if-shell then-branch is empty)', () => {
         const argv = buildAttachOrCreateArgv(NAME, '/p', undefined, { tmuxPath: TMUX });
         for (const key of ['PPage', 'NPage']) {
-            const at = argv.indexOf(`${Q} list-keys -T root | grep -Eq -- '-T root +${key} '`);
+            const at = argv.indexOf(userBound(Q, key));
             expect(argv[at - 1]).toBe('if-shell');
             expect(argv[at + 1]).toBe('');
             expect(argv[at + 2]).toMatch(new RegExp(`^bind-key -n ${key} if-shell -F `));
@@ -365,8 +496,11 @@ describe('buildAttachOrCreateArgv', () => {
     it('quotes the tmux path for the shell jobs and escapes # for tmux formats', () => {
         const argv = buildAttachOrCreateArgv(NAME, '/p', undefined, { tmuxPath: `/opt/it's #1/tmux`, tmuxVersion: '3.4' });
         const quoted = `'/opt/it'\\''s ##1/tmux'`;
-        expect(argv[1]).toBe(`${quoted} set-option -g @orst_saved_hl "$(${quoted} show-options -gv history-limit)"`);
-        expect(argv).toContain(`${quoted} list-keys -T root | grep -Eq -- '-T root +PPage '`);
+        expect(argv[argv.indexOf('run-shell') + 1])
+            .toBe(`${quoted} set-option -g @orst_saved_hl "$(${quoted} show-options -gv history-limit)"`);
+        expect(argv).toContain(userBound(quoted, 'PPage'));
+        const old = buildAttachOrCreateArgv(NAME, '/p', undefined, { tmuxPath: `/opt/it's #1/tmux`, tmuxVersion: '2.6' });
+        expect(old[2]).toBe(`${quoted} show-options -s terminal-overrides | grep -Fq 'xterm*:Tc'`);
     });
 
     // SECURITY: tmux format-expands `new-session -c`, so a directory named
@@ -427,8 +561,8 @@ describe('buildAttachOrCreateArgv', () => {
         expect(at(buildAttachOrCreateArgv(NAME, '/p', undefined, { historyLimit: 100000 }))).toBe('100000');
         expect(at(buildAttachOrCreateArgv(NAME, '/p', undefined, { historyLimit: -1 }))).toBe('50000');
         expect(at(buildAttachOrCreateArgv(NAME, '/p', undefined, { historyLimit: 1.5, tmuxVersion: '3.4' }))).toBe('50000');
-        expect(buildAttachOrCreateArgv(NAME, '/p', undefined, { historyLimit: 1e10, tmuxVersion: '3.4' }).slice(3, 7))
-            .toEqual(['set-option', '-g', 'history-limit', '1000000']);
+        const borrowed = buildAttachOrCreateArgv(NAME, '/p', undefined, { historyLimit: 1e10, tmuxVersion: '3.4' });
+        expect(borrowed.slice(borrowed.indexOf('-g'), borrowed.indexOf('-g') + 3)).toEqual(['-g', 'history-limit', '1000000']);
     });
 });
 
@@ -514,6 +648,14 @@ describe('parseListSessions', () => {
         // it fails the numeric guard rather than the field-count one.
         const out = 'garbage-without-numbers\nfoo bar baz qux quux\ncode-x-0 1 1 1700000000 0';
         expect(parseListSessions(out)).toEqual([
+            { name: 'code-x-0', attached: true, windows: 1, paneDead: false, createdEpoch: 1700000000 },
+        ]);
+    });
+
+    // A login-shell banner line of one or two tagged-looking tokens ran the parser out of
+    // tokens: `tokens[tokens.length - 1]` was undefined and the whole list read threw.
+    it.each(['c:', 'o:x c:', 'c:\\>', 'a:1 o: c:', 'a:1 w:2 o: c:', 'w:'])('skips the noise line %j instead of throwing', noise => {
+        expect(parseListSessions(`${noise}\ncode-x-0 1 1 1700000000 0\n${noise}`)).toEqual([
             { name: 'code-x-0', attached: true, windows: 1, paneDead: false, createdEpoch: 1700000000 },
         ]);
     });
@@ -791,6 +933,19 @@ describe('parseListSessions with the activity field (05: orphan aging)', () => {
         });
     });
 
+    // `#{session_activity}` moves on client input and attach only (verified on 3.4 and the
+    // rig): a DETACHED pane that prints for weeks never moves it. `#{window_activity}` is
+    // the output side; the later of the two is when the session was last alive.
+    it('takes the later of session activity (a:) and window output (w:)', () => {
+        expect(parseListSessions('code-x-0 0 1 1700000000 0 a:1700000500 w:1700009000 o: c:')[0].activityEpoch).toBe(1700009000);
+        expect(parseListSessions('code-x-0 0 1 1700000000 0 a:1700009000 w:1700000500 o: c:')[0].activityEpoch).toBe(1700009000);
+        expect(parseListSessions('code-x-0 0 1 1700000000 0 w:1700000700 o: c:')[0].activityEpoch).toBe(1700000700);
+        expect(parseListSessions('code-x-0 0 1 1700000000 0 a:1700000500 w: o: c:')[0].activityEpoch).toBe(1700000500);
+        expect(parseListSessions('my s 0 1 1700000000 0 a:1 w:2 o:1a2b3c4d-0011aabb c:')[0]).toMatchObject({
+            name: 'my s', activityEpoch: 2, owner: '1a2b3c4d-0011aabb',
+        });
+    });
+
     it('reads activity alongside an owner tag, and a name with spaces', () => {
         expect(parseListSessions('my s 0 1 1700000000 0 a:1700000001 o:1a2b3c4d-0011aabb')[0]).toMatchObject({
             name: 'my s', activityEpoch: 1700000001, owner: '1a2b3c4d-0011aabb',
@@ -920,7 +1075,8 @@ describe('buildClaimSessionCommand (05 l: a new slot is claimed on the remote be
 
     it('is the attach chain with a detached create (-d, no -A), every word shell-quoted', () => {
         const argv = buildAttachOrCreateArgv(NAME, '/srv/p', undefined, { tmuxVersion: '3.8', owner: OWNER, detached: true });
-        expect(argv.slice(0, 6)).toEqual(['new-session', '-d', '-s', NAME, '-c', '/srv/p']);
+        const create = argv.indexOf('new-session');
+        expect(argv.slice(create, create + 6)).toEqual(['new-session', '-d', '-s', NAME, '-c', '/srv/p']);
         expect(argv).not.toContain('-A');
         expect(buildClaimSessionCommand(NAME, '/srv/p', { tmuxVersion: '3.8', owner: OWNER }))
             .toBe(`'tmux' ${argv.map(escapeShellArg).join(' ')}`);

@@ -72,6 +72,58 @@ describe('createCloseWatch', () => {
         expect(log.trace).toHaveBeenCalledWith(expect.stringContaining('channel open failure'));
     });
 
+    // The connection is marked as watched before the start is known to have worked. A
+    // start that failed (a channel that could not be opened just then) used to leave the
+    // connection marked for good: no watch, and no second attempt, for as long as it lived.
+    it('tries again on the same connection after a start that failed', async () => {
+        const connection = {};
+        const run = vi.fn<Run>()
+            .mockRejectedValueOnce(new Error('channel open failure'))
+            .mockImplementation(() => new Promise<unknown>(() => { /* open */ }));
+        const { ensure } = setup(() => connection, run);
+
+        ensure();
+        await new Promise(res => setTimeout(res, 0));
+        ensure();
+        ensure();
+
+        expect(run).toHaveBeenCalledTimes(2);
+    });
+
+    it('tries again after a start that threw synchronously', () => {
+        const connection = {};
+        const run = vi.fn<Run>()
+            .mockImplementationOnce(() => {
+                throw new Error('not connected');
+            })
+            .mockImplementation(() => new Promise<unknown>(() => { /* open */ }));
+        const { ensure } = setup(() => connection, run);
+
+        ensure();
+        ensure();
+
+        expect(run).toHaveBeenCalledTimes(2);
+    });
+
+    // A watch that fails because its connection died is not retried there: the window is on
+    // another connection (or none) by then, and that one gets its own watch.
+    it('does not retry on a connection the window has left', async () => {
+        const first = {};
+        let connection: object | undefined = first;
+        let fail: (err: Error) => void = () => undefined;
+        const run = vi.fn<Run>(() => new Promise<unknown>((_res, rej) => { fail = rej; }));
+        const { ensure } = setup(() => connection, run);
+
+        ensure();
+        connection = undefined;
+        fail(new Error('connection lost'));
+        await new Promise(res => setTimeout(res, 0));
+        connection = first;
+        ensure();
+
+        expect(run).toHaveBeenCalledTimes(1);
+    });
+
     it('never throws when starting it throws synchronously', () => {
         const run = vi.fn((): Promise<unknown> => {
             throw new Error('not connected');

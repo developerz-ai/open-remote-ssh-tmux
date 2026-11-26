@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, expect, it } from 'vitest';
 import { escapeShellArg } from '../../src/common/shellQuote';
 import { probeTmux } from '../../src/tmux/tmuxBootstrap';
-import { AttachOrCreateOptions, buildAttachOrCreateArgv, sessionName } from '../../src/tmux/tmuxSession';
+import { AttachOrCreateOptions, buildAttachOrCreateArgv, buildClaimSessionCommand, sessionName } from '../../src/tmux/tmuxSession';
 import { describeRig, PtyClient, RIG_TMUX, RigSession, RigTarget, versionAtLeast, WORKERS } from './rig';
 
 // What the attach-or-create chain does to the user's tmux server and to the bytes typed
@@ -121,8 +121,192 @@ describeRig('argv chain hardening (real tmux)', target => {
         }
     });
 
+    // ---- what the client is told about VS Code's terminal (xterm.js) ----
+
+    /** `show-options -s <option>` reduced to its values, sorted — one string to compare. */
+    async function serverOption(name: string): Promise<string> {
+        return (await rig.tmux('show-options', '-s', name)).stdout.split('\n').map(line => line.trim()).filter(Boolean).sort().join('\n');
+    }
+
+    // Below 3.2 the only lever for 24-bit colour is the `Tc` terminal override, a SERVER
+    // option: it is appended once per server, never once per attach. From 3.2 the client's
+    // own `-T` carries it and nothing at all is written to the server.
+    it('repeated attaches and claims never grow the user\'s terminal-overrides / terminal-features', async () => {
+        expect((await rig.tmux('new-session', '-d', '-s', 'main')).code).toBe(0);
+        const before = { overrides: await serverOption('terminal-overrides'), features: await serverOption('terminal-features') };
+
+        for (const slot of [0, 1, 2]) {
+            await launch(sessionName(HOST, home, slot), home);
+        }
+        expect((await rig.exec(buildClaimSessionCommand(sessionName(HOST, home, 3), home, probed))).code).toBe(0);
+        await launch(sessionName(HOST, home, 0), home); // a second client on an existing session
+
+        const overrides = await serverOption('terminal-overrides');
+        expect(await serverOption('terminal-features')).toBe(before.features);
+        if (versionAtLeast(target.version, '3.2')) {
+            expect(overrides).toBe(before.overrides);
+        } else {
+            expect(overrides.match(/xterm\*:Tc/g)).toHaveLength(1);
+            expect(overrides.replace(/^.*xterm\*:Tc.*$/m, '').trim()).toBe(before.overrides);
+        }
+    });
+
+    it('a user who already has the Tc override keeps exactly their own', async () => {
+        expect((await rig.tmux('new-session', '-d', '-s', 'main')).code).toBe(0);
+        expect((await rig.tmux('set-option', '-as', 'terminal-overrides', ',xterm*:Tc:smcup@')).code).toBe(0);
+        const before = await serverOption('terminal-overrides');
+
+        await launch(sessionName(HOST, home, 0), home);
+
+        expect(await serverOption('terminal-overrides')).toBe(before);
+    });
+
+    describeClient(target, () => home);
     describeKeys(target, () => rig, () => home);
+    describePaging(target, () => rig, () => home);
 });
+
+/** What reaches the terminal (the tmux client's pty) and the pane (its environment) when the
+ * attach argv is run the way VS Code's pty host runs it: `TERM=xterm-256color`, and here a
+ * `C` locale on purpose — the terminal renders UTF-8 whatever the locale claims. */
+function describeClient(target: RigTarget, home: () => string): void {
+    const INNER = [
+        `printf 'CT=[%s]\\n' "$COLORTERM"`,
+        `printf '\\033[38;2;10;200;30mRGB\\033[0m \\342\\234\\273 \\033]8;;https://example.com/x\\033\\\\LINK\\033]8;;\\033\\\\\\n'`,
+        'exec sleep 600',
+    ].join('; ');
+
+    const ESC = '\x1b';
+
+    async function openTerminal(slot: number): Promise<PtyClient> {
+        const name = sessionName(HOST, `${home()}/client`, slot);
+        const client = await PtyClient.open(target, WORKERS.hardening, 'env', [
+            'LC_ALL=C', RIG_TMUX,
+            ...buildAttachOrCreateArgv(name, home(), INNER, { tmuxPath: RIG_TMUX, tmuxVersion: target.version }),
+        ]);
+        await client.waitFor(/RGB/, 5000);
+        return client;
+    }
+
+    it('24-bit colour reaches the terminal as 24-bit colour (not the 256 palette)', async () => {
+        const terminal = await openTerminal(0);
+        try {
+            await terminal.waitFor(new RegExp(`${ESC}\\[38;2;10;200;30m`), 3000);
+            expect(terminal.text).not.toMatch(new RegExp(`${ESC}\\[38;5;\\d+m`));
+        } finally {
+            terminal.close();
+        }
+    });
+
+    it('non-ASCII output survives a non-UTF-8 client locale (-u)', async () => {
+        const terminal = await openTerminal(1);
+        try {
+            await terminal.waitFor(/\u273b/, 3000);
+        } finally {
+            terminal.close();
+        }
+    });
+
+    it.runIf(versionAtLeast(target.version, '3.2'))('tmux >= 3.2: the pane is told COLORTERM=truecolor', async () => {
+        const terminal = await openTerminal(2);
+        try {
+            await terminal.waitFor(/CT=\[truecolor\]/, 3000);
+        } finally {
+            terminal.close();
+        }
+    });
+
+    it.runIf(versionAtLeast(target.version, '3.4'))('tmux >= 3.4: OSC 8 hyperlinks reach the terminal', async () => {
+        const terminal = await openTerminal(3);
+        try {
+            await terminal.waitFor(new RegExp(`${ESC}\\]8;[^;]*;https://example\\.com/x`), 3000);
+        } finally {
+            terminal.close();
+        }
+    });
+}
+
+/** PageUp is bound in the root key table, which is SERVER-global: it must scroll only at a
+ * shell prompt of one of our sessions and reach the program everywhere else — the user's
+ * own sessions above all. The pane runs `cat -v` under a name of our choosing, since the
+ * binding decides on `#{pane_current_command}`; a key that reached it shows as `^[[5~`. */
+function describePaging(target: RigTarget, rig: () => RigSession, home: () => string): void {
+    const PAGE_UP = '\x1b[5~';
+    const OLD_BINDING = `if-shell -F '#{?alternate_on,1,#{?#{m:*sh,#{pane_current_command}},0,1}}' 'send-keys PPage' 'copy-mode -eu'`;
+    const ours = (): string => sessionName(HOST, `${home()}/paging`, 0);
+
+    /** `stty raw; exec <a copy of cat named programName> -v` — a pane whose current command
+     * is `programName`. Copied once: a running copy cannot be overwritten (ETXTBSY). */
+    const inner = (programName: string): string =>
+        `mkdir -p "$HOME/pg" && { [ -x "$HOME/pg/${programName}" ] || cp "$(command -v cat)" "$HOME/pg/${programName}"; }`
+        + ` && stty raw -echo && exec "$HOME/pg/${programName}" -v`;
+
+    async function paneRuns(session: string, programName: string): Promise<void> {
+        await rig().waitUntil(`${session} to run ${programName}`, async () =>
+            (await rig().tmux('display-message', '-p', '-t', `=${session}:`, '#{pane_current_command}')).stdout.trim() === programName);
+    }
+
+    const inCopyMode = async (session: string): Promise<boolean> =>
+        (await rig().tmux('display-message', '-p', '-t', `=${session}:`, '#{pane_in_mode}')).stdout.trim() === '1';
+
+    async function openOurs(programName: string): Promise<PtyClient> {
+        const client = await PtyClient.open(target, WORKERS.hardening, RIG_TMUX,
+            buildAttachOrCreateArgv(ours(), home(), inner(programName), { tmuxPath: RIG_TMUX, tmuxVersion: target.version }));
+        await paneRuns(ours(), programName);
+        return client;
+    }
+
+    it('PageUp at a shell prompt of OUR session scrolls (copy mode)', async () => {
+        const terminal = await openOurs('fakesh');
+        try {
+            terminal.write(PAGE_UP);
+
+            await rig().waitUntil('copy mode', () => inCopyMode(ours()));
+        } finally {
+            terminal.close();
+        }
+    });
+
+    it('PageUp under ssh in our session reaches the program', async () => {
+        const terminal = await openOurs('ssh');
+        try {
+            terminal.write(PAGE_UP);
+
+            await terminal.waitFor(/\^\[\[5~/, 3000);
+            expect(await inCopyMode(ours())).toBe(false);
+        } finally {
+            terminal.close();
+        }
+    });
+
+    it('PageUp at a shell prompt of the USER\'s own session reaches their shell — never our copy mode', async () => {
+        (await openOurs('fakesh')).close(); // our attach has bound the keys on the shared server
+        expect((await rig().tmux('new-session', '-d', '-s', 'main', inner('fakesh'))).code).toBe(0);
+        await paneRuns('main', 'fakesh');
+        const theirs = await PtyClient.open(target, WORKERS.hardening, RIG_TMUX, ['attach-session', '-t', '=main']);
+        try {
+            await rig().waitUntil('their client', async () => (await rig().clientCount('main')) === 1);
+            theirs.write(PAGE_UP);
+
+            await theirs.waitFor(/\^\[\[5~/, 3000);
+            expect(await inCopyMode('main')).toBe(false);
+        } finally {
+            theirs.close();
+        }
+    });
+
+    // A long-lived server still carries the binding an earlier version made, which has no
+    // session guard. It is ours to replace; a binding the user made is not (04c, above).
+    it('an attach replaces the unguarded binding an earlier version left on the server', async () => {
+        expect((await rig().tmux('new-session', '-d', '-s', 'main', inner('fakesh'))).code).toBe(0);
+        expect((await rig().run(`${RIG_TMUX} bind-key -n PPage ${OLD_BINDING}`)).code).toBe(0);
+        expect((await rig().tmux('list-keys', '-T', 'root')).stdout).not.toMatch(/PPage.*session_name/);
+
+        (await openOurs('fakesh')).close();
+
+        expect((await rig().tmux('list-keys', '-T', 'root')).stdout).toMatch(/PPage.*session_name/);
+    });
+}
 
 /** Bytes typed into the terminal must reach the program inside unmodified and promptly:
  * the inner program is `cat -v` on a raw tty, so a byte shows up as its caret form. */
