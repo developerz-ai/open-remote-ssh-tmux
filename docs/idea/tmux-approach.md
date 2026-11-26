@@ -163,9 +163,10 @@ strategy:
   sessions of ours whose pane is dead, and detached sessions of ours with no
   activity for `remote.SSH.tmux.orphanMaxAgeDays` (default 14; `0` = never) — the
   ones a renamed or abandoned folder leaves behind. "Activity" is input **or
-  output**: the later of `#{session_activity}` (typing, attaching) and
-  `#{window_activity}` (the pane printing), so a detached task that is still
-  producing output is never aged out. The age is measured on the remote's own
+  output**: the later of `#{session_activity}` (typing, attaching) and the newest
+  `#{window_activity}` (a pane printing) of **any** of the session's windows — a
+  program can open a second window and print there — so a detached task that is
+  still producing output is never aged out. The age is measured on the remote's own
   clock, reported by the same list command — never the local machine's. Never an attached session,
   never a name we did not mint, never this window's own mapped sessions. One Info
   line reports the count: `tmux housekeeping: K killed, O old sessions kept`. The
@@ -253,8 +254,8 @@ Server-scoped, and when:
 | server user option `@orst_saved_hl` | tmux < 3.7: holds the user's value during that swap; left set afterwards (inert) | unsetting a global user option crashes the tmux 2.6 server |
 | `escape-time` → 10 ms | only while it is still 500, the pre-3.5 default | a lone Esc otherwise lags half a second in every TUI |
 | `set-clipboard` → `on` | only while it is still `external`, the default | drag-select in tmux reaches the local clipboard over OSC 52 |
-| `terminal-overrides` += `,xterm*:Tc` | tmux < 3.2 only (no `-T` there), or a tmux whose version could not be read; appended once per server, and not at all if an `xterm*:Tc` override is already there | the only way to get 24-bit colour through before 3.2. It adds that one capability for every client whose `TERM` matches `xterm*` — the user's own clients on this server included: a terminal that calls itself `xterm*` but cannot do 24-bit colour would show wrong colours for programs that emit it. Nothing else about their sessions changes |
-| root-table `PageUp` / `PageDown` bindings | only if the user has no binding of their own on the key (ours from an earlier attach is replaced) | key tables are server-global, so the binding exists in the user's own sessions too — but its predicate passes the key straight through unless the session is one of ours (`code-<hash>-<slot>`). In ours it acts only at a bare shell prompt: the alternate screen, `ssh`, and non-shell programs such as Claude Code keep the keys |
+| `terminal-overrides` += `,xterm*:Tc` | tmux < 3.2 only (no `-T` there), or a tmux whose version could not be read; appended once per server, and not at all if an `xterm*:Tc` override is already there (two first attaches racing on a fresh server can each append it; the duplicate entry is identical and inert) | the only way to get 24-bit colour through before 3.2. It adds that one capability for every client whose `TERM` matches `xterm*` — the user's own clients on this server included: a terminal that calls itself `xterm*` but cannot do 24-bit colour would show wrong colours for programs that emit it. Nothing else about their sessions changes |
+| root-table `PageUp` / `PageDown` bindings | only if the user has no binding of their own on the key (ours from an earlier attach is replaced) | key tables are server-global, so the binding exists in the user's own sessions too — but its predicate passes the key straight through unless the session name has exactly our shape (`code-<12 hex>-<slot>`; a user's own `code-a-0` keeps its keys). A binding counts as ours, and is replaced, only if it carries one of our complete predicates — a user's binding that merely resembles it is left alone. In ours it acts only at a bare shell prompt: the alternate screen, `ssh`, and non-shell programs such as Claude Code keep the keys |
 
 ## Deferred (not in this release)
 

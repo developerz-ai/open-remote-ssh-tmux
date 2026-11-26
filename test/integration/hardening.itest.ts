@@ -279,20 +279,60 @@ function describePaging(target: RigTarget, rig: () => RigSession, home: () => st
         }
     });
 
-    it('PageUp at a shell prompt of the USER\'s own session reaches their shell — never our copy mode', async () => {
+    // `main`, and the near misses of our own naming: a short hash, a non-numeric slot, a
+    // trailing letter, a leading zero. A loose `code-*` glob took the keys in these too.
+    const theirNames = (): string[] =>
+        ['main', 'code-a-0', ours().replace(/-0$/, '-x'), ours().replace(/-0$/, '-0x'), ours().replace(/-0$/, '-007')];
+
+    it.each([0, 1, 2, 3, 4])('PageUp at a shell prompt of the USER\'s own session reaches their shell — never our copy mode (name %i)', async index => {
+        const theirName = theirNames()[index];
         (await openOurs('fakesh')).close(); // our attach has bound the keys on the shared server
-        expect((await rig().tmux('new-session', '-d', '-s', 'main', inner('fakesh'))).code).toBe(0);
-        await paneRuns('main', 'fakesh');
-        const theirs = await PtyClient.open(target, WORKERS.hardening, RIG_TMUX, ['attach-session', '-t', '=main']);
+        expect((await rig().tmux('new-session', '-d', '-s', theirName, inner('fakesh'))).code).toBe(0);
+        await paneRuns(theirName, 'fakesh');
+        const theirs = await PtyClient.open(target, WORKERS.hardening, RIG_TMUX, ['attach-session', '-t', `=${theirName}`]);
         try {
-            await rig().waitUntil('their client', async () => (await rig().clientCount('main')) === 1);
+            await rig().waitUntil('their client', async () => (await rig().clientCount(theirName)) === 1);
             theirs.write(PAGE_UP);
 
             await theirs.waitFor(/\^\[\[5~/, 3000);
-            expect(await inCopyMode('main')).toBe(false);
+            expect(await inCopyMode(theirName)).toBe(false);
         } finally {
             theirs.close();
         }
+    });
+
+    /** The chain's own "has the USER bound this key?" test, as the shell runs it: the
+     * `if-shell` job of the argv with tmux's `##` escapes undone. Exit 0 = the user has. */
+    async function userHasBound(key: string): Promise<boolean> {
+        const argv = buildAttachOrCreateArgv(ours(), home(), undefined, { tmuxPath: RIG_TMUX, tmuxVersion: target.version });
+        const job = argv.find(arg => arg.includes(`-T root +${key} `) && arg.includes('list-keys'))!;
+        return (await rig().run(job.replace(/##/g, '#'))).code === 0;
+    }
+
+    // Our own binding is told from the user's by its COMPLETE predicate as `list-keys`
+    // prints it back on this tmux version — which is only true if tmux prints it verbatim.
+    it('recognises its own current binding as ours, on this version\'s list-keys output', async () => {
+        (await openOurs('fakesh')).close();
+
+        expect(await userHasBound('PPage')).toBe(false);
+        expect(await userHasBound('NPage')).toBe(false);
+    });
+
+    // A user's own binding built the same way ours starts — test `alternate_on`, pass the key
+    // or scroll — carried the substring an earlier check looked for, and was overwritten.
+    it('a user\'s own binding that also tests alternate_on is left exactly as they made it', async () => {
+        expect((await rig().tmux('new-session', '-d', '-s', 'main')).code).toBe(0);
+        const theirs = `if-shell -F '#{?alternate_on,1,0}' 'send-keys PPage' 'copy-mode -eu'`;
+        expect((await rig().run(`${RIG_TMUX} bind-key -n PPage ${theirs}`)).code).toBe(0);
+        expect((await rig().run(`${RIG_TMUX} bind-key -n NPage if-shell -F '#{?alternate_on,1,0}' 'send-keys NPage'`)).code).toBe(0);
+        const before = (await rig().tmux('list-keys', '-T', 'root')).stdout.split('\n').filter(line => /Page/.test(line)).sort();
+        expect(await userHasBound('PPage')).toBe(true);
+
+        (await openOurs('fakesh')).close();
+
+        const after = (await rig().tmux('list-keys', '-T', 'root')).stdout.split('\n').filter(line => /Page/.test(line)).sort();
+        expect(after).toEqual(before);
+        expect(after.join('\n')).not.toContain('session_name');
     });
 
     // A long-lived server still carries the binding an earlier version made, which has no

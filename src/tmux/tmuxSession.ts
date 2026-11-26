@@ -160,7 +160,11 @@ const OWNED_SESSION_RE = new RegExp(`^${SESSION_PREFIX}[0-9a-f]{${HASH_LENGTH}}-
  * Every arm is load-bearing (each verified against a real tmux server, 2.6 … 3.8 on the rig):
  *  - the session name — key tables are server-global, so without it the binding also acted
  *    in the user's own sessions (`main`, attached from any terminal): PageUp at their
- *    prompt entered copy mode. Anything that is not named like ours keeps its keys;
+ *    prompt entered copy mode. Anything not named EXACTLY like ours keeps its keys — the
+ *    same `code-<12 hex>-<slot>` shape as {@link OWNED_SESSION_RE}, spelled as three globs
+ *    because 2.6 has no regex match: the hash and a digit are there; nothing but digits
+ *    follows the hash; no leading zero. A looser `code-[0-9a-f]*-[0-9]*` also took the keys
+ *    in a user's own `code-a-0` (verified 2.6, 3.0a, 3.4);
  *  - `alternate_on` — vim/htop/a pager draws on the alternate screen, which has no
  *    scrollback to page into. Note `seq 1 500 | less` reports
  *    `pane_current_command=bash` (tmux names the pipeline's leader), so this arm, not
@@ -175,14 +179,22 @@ const OWNED_SESSION_RE = new RegExp(`^${SESSION_PREFIX}[0-9a-f]{${HASH_LENGTH}}-
  *
  * Only formats tmux 2.6 has: `?`, `==:` and `m:` (no `&&`/`||`, which came later).
  */
-const PASS_KEYS_THROUGH = `#{?#{m:${SESSION_PREFIX}[0-9a-f]*-[0-9]*,#{session_name}},`
+const OWNED_NAME_GLOB = `${SESSION_PREFIX}${'[0-9a-f]'.repeat(HASH_LENGTH)}-`;
+const PASS_KEYS_THROUGH = `#{?#{m:${OWNED_NAME_GLOB}[0-9]*,#{session_name}},`
+    + `#{?#{m:${OWNED_NAME_GLOB}*[!0-9]*,#{session_name}},1,`
+    + `#{?#{m:${OWNED_NAME_GLOB}0?*,#{session_name}},1,`
     + '#{?alternate_on,1,#{?#{==:#{pane_current_command},ssh},1,#{?#{m:*sh,#{pane_current_command}},0,1}}}'
-    + ',1}';
+    + '}},1}';
 
-/** A substring of {@link PASS_KEYS_THROUGH} that `list-keys` prints back verbatim and no
- * `#` in it (the shell job it is grepped in is format-expanded): how a binding of OURS is
- * told from the user's, so an attach can replace the one an older version left behind. */
-const OUR_BINDING_MARK = 'alternate_on,1,';
+/** The predicate of the bindings releases up to 1.4.x made — no session guard, so it is
+ * still acting in the user's own sessions on any server that has not restarted since. */
+const PASS_KEYS_THROUGH_V1 = '#{?alternate_on,1,#{?#{m:*sh,#{pane_current_command}},0,1}}';
+
+/** Every predicate a binding of OURS can carry: today's and each released one. `list-keys`
+ * prints a binding's predicate back verbatim (2.6 … 3.8), so a root-table line containing
+ * one of these in full is ours to replace. Nothing shorter may stand in: a user's own
+ * binding that merely begins `#{?alternate_on,1,…` was taken for ours and overwritten. */
+const OUR_BINDING_PREDICATES = [PASS_KEYS_THROUGH, PASS_KEYS_THROUGH_V1];
 
 /** A parsed row from `tmux list-sessions` (see `buildListSessions` `-F`). */
 export interface TmuxSession {
@@ -202,8 +214,8 @@ export interface TmuxSession {
     readonly createdEpoch: number;
     /** Unix epoch seconds of the session's last activity, the age evidence of the orphan rule
      * in {@link reapVerdict}: the later of `#{session_activity}` (client input, attach) and
-     * `#{window_activity}` (pane output), so a detached task that is still printing is not
-     * idle. `undefined` for a row that carried neither — and then the session is never aged out. */
+     * the newest `#{window_activity}` (pane output) of ANY of its windows, so a detached
+     * task that is still printing — in whichever window — is not idle. `undefined` for a row that carried neither — and then the session is never aged out. */
     readonly activityEpoch?: number;
     /** `#{@orst_owner}` — the client id of the window that last attached, or `undefined` for
      * a session that carries no tag (created before tags existed, or never attached by us). */
@@ -367,17 +379,27 @@ function jobTmux(tmuxPath: string): string {
 }
 
 /** `if-shell` test that succeeds when the USER has `key` bound in the root table — a binding
- * that is not ours ({@link OUR_BINDING_MARK}). Unbound, or bound by an earlier attach of ours
- * (which may carry an older predicate), fails the test and the key is (re)bound.
+ * that carries none of {@link OUR_BINDING_PREDICATES}. Unbound, or bound by an earlier attach
+ * of ours (which may carry an older predicate), fails the test and the key is (re)bound.
  * `list-keys -T root <key>` does not exist at 2.6, hence the grep; the line shape
- * `… -T root <key> …` is the same on 2.6 … 3.8. */
+ * `… -T root <key> …` is the same on 2.6 … 3.8. Each predicate is a fixed string (`-F`) in
+ * single quotes (it contains none), with `#` doubled: tmux format-expands the job first. */
 function rootKeyBound(tmux: string, key: string): string {
-    return `${tmux} list-keys -T root | grep -E -- '-T root +${key} ' | grep -Fqv '${OUR_BINDING_MARK}'`;
+    const notOurs = OUR_BINDING_PREDICATES.map((predicate, index) =>
+        `grep -F${index === OUR_BINDING_PREDICATES.length - 1 ? 'q' : ''}v -e '${predicate.replace(/#/g, '##')}'`);
+    return `${tmux} list-keys -T root | grep -E -- '-T root +${key} ' | ${notOurs.join(' | ')}`;
 }
 
 /** `if-shell` test that succeeds when the server's `terminal-overrides` already carry
  * {@link TRUECOLOR_OVERRIDE} — from the user's own config or an earlier attach of ours — so
- * the append below happens once per server, never once per attach. */
+ * the append below happens once per server, never once per attach.
+ *
+ * Check and append are two steps with a shell job between them, so two FIRST attaches racing
+ * on a fresh server can both append. That is left as it is: the entry is identical, tmux
+ * applies overrides in order and the second sets the same capability again, and the race
+ * closes for good once either lands. A check inside the server is not available — an array
+ * option expands to nothing in a format (`#{terminal-overrides}` is empty on 2.6, 3.0a and
+ * 3.4), and a marker option would stop recognising an override the user already has. */
 function truecolorOverridden(tmux: string): string {
     return `${tmux} show-options -s terminal-overrides | grep -Fq '${TRUECOLOR_OVERRIDE}'`;
 }
@@ -561,11 +583,20 @@ export function isDuplicateSession(stderr: string): boolean {
  * The rows are preceded by the remote's clock (`__now <epoch>`, as in
  * {@link buildListClientsCommand}; read with {@link parseListSessionsClock}): the reaper
  * ages sessions against it, never against the local clock — two machines' clocks differ,
- * and a local clock running days ahead aged a fresh session into an orphan. The exit
- * status is still `list-sessions`'s.
+ * and a local clock running days ahead aged a fresh session into an orphan.
+ *
+ * Between the two, `list-windows -a` reports every window's `#{window_activity}`
+ * (`__win <epoch> <session>`): the one in a session row is its CURRENT window's only, and a
+ * program in the pane can open another (`tmux new-window`) and print there while the
+ * current one sits idle (verified 2.6, 3.0a, 3.4). `parseListSessions` merges them. Its
+ * errors are discarded and `list-sessions` runs last, so the exit status and stderr callers
+ * classify are still `list-sessions`'s.
  */
 export function buildListSessions(tmuxPath = TMUX_BIN): string {
-    return `printf '${NOW_TAG} %s\\n' "$(date +%s)"; ${escapeShellArg(tmuxPath)} list-sessions -F `
+    const tmux = escapeShellArg(tmuxPath);
+    return `printf '${NOW_TAG} %s\\n' "$(date +%s)"; `
+        + `${tmux} list-windows -a -F ${escapeShellArg(`${WINDOW_TAG} #{window_activity} #{session_name}`)} 2>/dev/null; `
+        + `${tmux} list-sessions -F `
         + escapeShellArg(`#{session_name} #{session_attached} #{session_windows} #{session_created} #{pane_dead} `
             + `${ACTIVITY_FIELD}#{session_activity} ${OUTPUT_FIELD}#{window_activity} `
             + `${OWNER_FIELD}#{${OWNER_OPTION}} ${CLOSED_FIELD}#{${CLOSED_OPTION}}`);
@@ -583,11 +614,16 @@ export function parseListSessionsClock(stdout: string): number | undefined {
  * field, so a row from before it existed (or a fixture) still parses unambiguously. */
 const ACTIVITY_FIELD = 'a:';
 
-/** Prefix of the `#{window_activity}` field: the last time the session's window had OUTPUT.
+/** Prefix of the `#{window_activity}` field: the last time the session's CURRENT window had
+ * OUTPUT (the other windows' come on {@link WINDOW_TAG} lines).
  * `#{session_activity}` moves only on client input and attach (verified on 3.4: a detached
  * pane printing every second left it unchanged), so on its own it aged a detached long task
  * that prints but is never typed into — the very thing this fork exists to keep alive. */
 const OUTPUT_FIELD = 'w:';
+
+/** Tag on each per-window line of {@link buildListSessions}: `__win <window_activity> <session
+ * name>` — the name last, so one with spaces survives. */
+const WINDOW_TAG = '__win';
 
 /** Prefix of the owner field in a {@link buildListSessions} row. An untagged session prints
  * just the prefix, so the field is always exactly one token and the numeric fields stay
@@ -811,9 +847,10 @@ export function classifyTmuxFailure(stderr: string, code: number | undefined): T
  */
 export function parseListSessions(stdout: string): TmuxSession[] {
     const sessions: TmuxSession[] = [];
-    for (const rawLine of stdout.split('\n')) {
-        const line = rawLine.trim();
-        if (line === '' || line.startsWith('no server running')) {
+    const lines = stdout.split('\n').map(line => line.trim());
+    const windowActivity = newestWindowActivity(lines);
+    for (const line of lines) {
+        if (line === '' || line.startsWith('no server running') || line.startsWith(`${WINDOW_TAG} `) || line === WINDOW_TAG) {
             continue;
         }
         const tokens = line.split(/\s+/);
@@ -836,15 +873,19 @@ export function parseListSessions(stdout: string): TmuxSession[] {
             || windows === undefined || attachedCount === undefined) {
             continue;
         }
+        const name = tokens.slice(0, tokens.length - 4).join(' ');
         sessions.push({
-            name: tokens.slice(0, tokens.length - 4).join(' '),
+            name,
             attached: attachedCount > 0,
             windows,
             paneDead: paneDeadFlag > 0,
             createdEpoch,
             activityEpoch: latestEpoch(
-                activityToken === undefined ? undefined : toNonNegativeInt(activityToken.slice(ACTIVITY_FIELD.length)),
-                outputToken === undefined ? undefined : toNonNegativeInt(outputToken.slice(OUTPUT_FIELD.length)),
+                latestEpoch(
+                    activityToken === undefined ? undefined : toNonNegativeInt(activityToken.slice(ACTIVITY_FIELD.length)),
+                    outputToken === undefined ? undefined : toNonNegativeInt(outputToken.slice(OUTPUT_FIELD.length)),
+                ),
+                windowActivity.get(name),
             ),
             owner: ownerToken === undefined || ownerToken === OWNER_FIELD ? undefined : ownerToken.slice(OWNER_FIELD.length),
             closed: closedToken === undefined ? undefined : parseClosedMarker(closedToken.slice(CLOSED_FIELD.length)),
@@ -918,6 +959,23 @@ export function shouldReap(session: TmuxSession, now: number, opts: ReapOptions 
  * list included. */
 function popTagged(tokens: string[], prefix: string): string | undefined {
     return tokens.length > 0 && tokens[tokens.length - 1].startsWith(prefix) ? tokens.pop() : undefined;
+}
+
+/** Newest `#{window_activity}` per session name, from the {@link WINDOW_TAG} lines of a
+ * {@link buildListSessions} run. Names are joined the way `parseListSessions` joins a row's,
+ * so the two agree; a line without an epoch and a name is skipped. */
+function newestWindowActivity(lines: readonly string[]): Map<string, number> {
+    const newest = new Map<string, number>();
+    for (const line of lines) {
+        const tokens = line.split(/\s+/);
+        const epoch = tokens.length >= 3 && tokens[0] === WINDOW_TAG ? toNonNegativeInt(tokens[1]) : undefined;
+        if (epoch === undefined) {
+            continue;
+        }
+        const name = tokens.slice(2).join(' ');
+        newest.set(name, Math.max(epoch, newest.get(name) ?? 0));
+    }
+    return newest;
 }
 
 /** The later of two optional epochs; `undefined` only when neither was reported. */

@@ -112,7 +112,9 @@ describe('buildListSessions', () => {
         // gates on: a session whose process exited but lingers under `remain-on-exit`.
         // `#{session_windows}` alone can never be 0 for a live session, so it is not it.
         expect(buildListSessions()).toBe(
-            `printf '__now %s\\n' "$(date +%s)"; 'tmux' list-sessions -F `
+            `printf '__now %s\\n' "$(date +%s)"; `
+            + `'tmux' list-windows -a -F '__win #{window_activity} #{session_name}' 2>/dev/null; `
+            + `'tmux' list-sessions -F `
             + `'#{session_name} #{session_attached} #{session_windows} #{session_created} #{pane_dead} `
             + `a:#{session_activity} w:#{window_activity} o:#{@orst_owner} c:#{@orst_closed}'`,
         );
@@ -130,10 +132,23 @@ describe('buildListSessions', () => {
         expect(parseListSessions('__now 1700000123\n')).toEqual([]);
     });
 
+    // `#{window_activity}` in a list-sessions row is the session's CURRENT window only. A
+    // program in the pane can open a second window (`tmux new-window`) and print there for
+    // weeks while the current one sits idle — so every window's activity is listed too, and
+    // list-sessions stays LAST: the exit status callers classify is still its own.
+    it('lists every window\'s activity ahead of the sessions, and list-sessions runs last', () => {
+        const command = buildListSessions('/opt/tmux');
+        const windows = command.indexOf(`'/opt/tmux' list-windows -a -F '__win #{window_activity} #{session_name}' 2>/dev/null; `);
+        expect(windows).toBeGreaterThan(0);
+        expect(command.indexOf(`'/opt/tmux' list-sessions -F `)).toBeGreaterThan(windows);
+        expect(command).toMatch(/c:#\{@orst_closed\}'$/);
+    });
+
     // The pty launches the probe's absolute path; exec-side commands must address the SAME
     // binary, or a bare `tmux` on a different PATH can talk to a different server.
     it('runs the given tmux binary, quoted', () => {
         expect(buildListSessions(`/home/a b/tmux`)).toContain(`; '/home/a b/tmux' list-sessions -F `);
+        expect(buildListSessions(`/home/a b/tmux`)).toContain(`; '/home/a b/tmux' list-windows -a -F `);
     });
 });
 
@@ -303,12 +318,23 @@ describe('buildAttachOrCreateArgv', () => {
     // The `if-shell -F` predicate guarding the PageUp/PageDown bindings: 1 = the pane's
     // application keeps the key, 0 = it means "scroll" and is ours. Pinned as a literal so
     // a change to the builder's format string has to be made deliberately in both places.
-    const PASS_THROUGH = '#{?#{m:code-[0-9a-f]*-[0-9]*,#{session_name}},'
-        + '#{?alternate_on,1,#{?#{==:#{pane_current_command},ssh},1,#{?#{m:*sh,#{pane_current_command}},0,1}}}'
+    // The session-name test is the exact `code-<12 hex>-<slot>` shape `sessionName` mints,
+    // spelled with globs (2.6 has no regex match): 12 hex digits and a digit, then no
+    // non-digit anywhere after the hash, and no leading zero.
+    const HEX12 = '[0-9a-f]'.repeat(12);
+    const INNER = '#{?alternate_on,1,#{?#{==:#{pane_current_command},ssh},1,#{?#{m:*sh,#{pane_current_command}},0,1}}}';
+    const PASS_THROUGH = `#{?#{m:code-${HEX12}-[0-9]*,#{session_name}},`
+        + `#{?#{m:code-${HEX12}-*[!0-9]*,#{session_name}},1,`
+        + `#{?#{m:code-${HEX12}-0?*,#{session_name}},1,${INNER}}}`
         + ',1}';
+    /** The predicate of the binding releases up to 1.4.x made (no session guard). */
+    const PASS_THROUGH_V1 = '#{?alternate_on,1,#{?#{m:*sh,#{pane_current_command}},0,1}}';
+    /** As it must be written inside a tmux shell job, which is format-expanded first. */
+    const inJob = (text: string): string => text.replace(/#/g, '##');
     /** The `if-shell` job that succeeds when the USER has `key` bound (a binding not ours). */
     const userBound = (tmux: string, key: string): string =>
-        `${tmux} list-keys -T root | grep -E -- '-T root +${key} ' | grep -Fqv 'alternate_on,1,'`;
+        `${tmux} list-keys -T root | grep -E -- '-T root +${key} '`
+        + ` | grep -Fv -e '${inJob(PASS_THROUGH)}' | grep -Fqv -e '${inJob(PASS_THROUGH_V1)}'`;
     /** The client flags and the create's `-e` on tmux >= 3.4. */
     const CLIENT = ['-u', '-T', 'RGB,hyperlinks,sync'];
     const PANE_ENV = ['-e', 'COLORTERM=truecolor'];
@@ -422,7 +448,6 @@ describe('buildAttachOrCreateArgv', () => {
         const argv = buildAttachOrCreateArgv(NAME, '/p', undefined, { tmuxVersion: '3.8' });
         const binding = argv.find(arg => arg.startsWith('bind-key -n PPage '));
         expect(binding).toBe(`bind-key -n PPage if-shell -F '${PASS_THROUGH}' 'send-keys PPage' 'copy-mode -eu'`);
-        expect(PASS_THROUGH.startsWith('#{?#{m:code-[0-9a-f]*-[0-9]*,#{session_name}},')).toBe(true);
         expect(PASS_THROUGH.endsWith(',1}')).toBe(true);
         expect(PASS_THROUGH).toContain('#{?#{==:#{pane_current_command},ssh},1,');
         // tmux 2.6 has `?`, `==:` and `m:` but no `&&` / `||`.
@@ -435,10 +460,30 @@ describe('buildAttachOrCreateArgv', () => {
         const argv = buildAttachOrCreateArgv(NAME, '/p', undefined, { tmuxPath: TMUX });
         expect(argv).toContain(userBound(Q, 'PPage'));
         expect(argv).toContain(userBound(Q, 'NPage'));
-        // The mark is part of the predicate (so `list-keys` prints it) and carries no `#`:
-        // the job string is format-expanded by tmux before the shell sees it.
-        expect(PASS_THROUGH).toContain('alternate_on,1,');
-        expect(userBound(Q, 'PPage')).not.toContain('#');
+    });
+
+    // A binding is OURS only if it carries one of our complete predicates — today's, or the
+    // one earlier releases bound. A user's own binding that merely starts the same way
+    // (`#{?alternate_on,1,…`) carries neither and must survive (see the rig for the proof).
+    it('tells its own bindings by their complete predicate, never by a shared prefix', () => {
+        const job = userBound(Q, 'PPage');
+        expect(job).toContain(`grep -Fv -e '${inJob(PASS_THROUGH)}'`);
+        expect(job).toContain(`grep -Fqv -e '${inJob(PASS_THROUGH_V1)}'`);
+        // tmux format-expands the job before the shell runs it: every `#` is written `##`,
+        // so no format is left to expand and the shell greps for the literal text.
+        expect(job.replace(/##/g, '')).not.toContain('#');
+        // Neither predicate contains the other, nor a single quote (they sit in '…').
+        expect(PASS_THROUGH).not.toContain(PASS_THROUGH_V1);
+        expect(PASS_THROUGH + PASS_THROUGH_V1).not.toContain('\'');
+    });
+
+    // The glob in the released predicate matched a user's own `code-a-0`. The shape test is
+    // three globs: has the 12-hex hash and a digit; no non-digit after it; no leading zero.
+    it('guards on the exact owned-session shape, not a loose code-* glob', () => {
+        expect(PASS_THROUGH).not.toContain('code-[0-9a-f]*-');
+        expect(PASS_THROUGH.split(HEX12)).toHaveLength(4);
+        expect(PASS_THROUGH).toContain(`#{?#{m:code-${HEX12}-*[!0-9]*,#{session_name}},1,`);
+        expect(PASS_THROUGH).toContain(`#{?#{m:code-${HEX12}-0?*,#{session_name}},1,`);
     });
 
     it('never resets the global history-limit to the built-in default (-gu)', () => {
@@ -944,6 +989,35 @@ describe('parseListSessions with the activity field (05: orphan aging)', () => {
         expect(parseListSessions('my s 0 1 1700000000 0 a:1 w:2 o:1a2b3c4d-0011aabb c:')[0]).toMatchObject({
             name: 'my s', activityEpoch: 2, owner: '1a2b3c4d-0011aabb',
         });
+    });
+
+    // The row's `w:` is the CURRENT window only; `__win <epoch> <session>` lines (one per
+    // window, any order, ahead of or after the rows) carry the rest.
+    it('takes the newest activity across ALL of the session\'s windows', () => {
+        const out = [
+            '__now 1700099999',
+            '__win 1700000600 code-x-0',
+            '__win 1700050000 code-x-0',   // a background window, still printing
+            '__win 1700070000 code-x-1',   // another session's window
+            '__win 1700090000 my s',
+            'code-x-0 0 2 1700000000 0 a:1700000500 w:1700000600 o: c:',
+            'code-x-1 0 1 1700000000 0 a:1700000500 w:1700000600 o: c:',
+            'my s 0 1 1700000000 0 a:1 w:2 o: c:',
+            'code-x-2 0 1 1700000000 0 a:1700000500 w:1700000600 o: c:',
+        ].join('\n');
+        expect(parseListSessions(out).map(session => [session.name, session.activityEpoch])).toEqual([
+            ['code-x-0', 1700050000],
+            ['code-x-1', 1700070000],
+            ['my s', 1700090000],
+            ['code-x-2', 1700000600],
+        ]);
+    });
+
+    it('window lines are never sessions, and malformed ones are ignored', () => {
+        // The last one would read as a session row if it were not recognised by its tag.
+        const out = '__win 5 a 1 2 3 4\n__win soon code-x-0\n__win\n__win 9\ncode-x-0 0 1 1700000000 0 a:7 w:8 o: c:';
+        expect(parseListSessions(out)).toMatchObject([{ name: 'code-x-0', activityEpoch: 8 }]);
+        expect(parseListSessions(out)).toHaveLength(1);
     });
 
     it('reads activity alongside an owner tag, and a name with spaces', () => {

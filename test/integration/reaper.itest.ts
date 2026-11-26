@@ -151,9 +151,22 @@ describeRig('SessionReaper orphan aging (real tmux, 05)', target => {
     // only moves on client input and attach, so a task that prints for weeks and is never
     // typed into looked idle since the day it was started — and was reaped. The age is taken
     // from the later of that and `#{window_activity}`, which output does move.
-    it('a detached session that is still printing is not idle, however long ago it was last typed into', async () => {
+    //
+    // In WHICHEVER window: a row's own `#{window_activity}` is the session's current window
+    // only, and a program in the pane can open a second one (`tmux new-window -d`) and print
+    // there while the current window sits idle.
+    it.each(['current', 'background'] as const)('a detached session still printing in its %s window is not idle, however long ago it was last typed into', async where => {
         const busy = sessionName(HOST, WS, 5);
-        expect((await rig.tmux('new-session', '-d', '-s', busy, 'while :; do date; sleep 0.2; done')).code).toBe(0);
+        const printer = 'while :; do date; sleep 0.2; done';
+        if (where === 'current') {
+            expect((await rig.tmux('new-session', '-d', '-s', busy, printer)).code).toBe(0);
+        } else {
+            expect((await rig.tmux('new-session', '-d', '-s', busy)).code).toBe(0);
+            expect((await rig.tmux('new-window', '-d', '-t', `=${busy}:`, printer)).code).toBe(0);
+            // The idle shell's window is still the current one.
+            expect((await rig.tmux('display-message', '-p', '-t', `=${busy}:`, '#{window_index} #{pane_current_command}')).stdout.trim())
+                .toMatch(/^0 \S*sh$/);
+        }
         const row = async (): Promise<{ input: number; latest: number }> => {
             const { stdout } = await rig.exec(buildListSessions(RIG_TMUX));
             const input = Number(new RegExp(`^${busy} .* a:(\\d+) `, 'm').exec(stdout)?.[1]);
