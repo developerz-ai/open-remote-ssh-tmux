@@ -222,6 +222,18 @@ was deliberately left out — see
   Everything typed and printed works as usual, and your shell's own prompt and
   history are unchanged. If you rely on shell-integration features, pick a plain
   shell profile for that terminal.
+- **Persistent terminals do not get VS Code's terminal environment.** The shell
+  in a persistent terminal is started by the tmux server on the remote, not by
+  VS Code, so it has the environment of your SSH login rather than the one VS
+  Code gives its own terminals. Inside it the remote `code` command is not on
+  `PATH` (and `VSCODE_IPC_HOOK_CLI` is unset), `GIT_ASKPASS` and the Git
+  extension's credential helper are missing (Git asks on the terminal instead),
+  `TERM_PROGRAM` is `tmux`, and variables that extensions or
+  `terminal.integrated.env.*` add are absent. These are not forwarded on
+  purpose: they name one window's connection, and the terminal outlives that
+  window — after a reconnect or a hand-off to another machine they would point
+  at a window that is gone. `COLORTERM=truecolor` is set for you on tmux 3.2 or
+  newer. If you need the rest, pick a plain shell profile for that terminal.
 - **A remote reboot ends every terminal.** tmux keeps terminals alive across
   disconnects, not across a restart of the machine; there is no resurrection.
 - **Hosts that end your processes at logout.** With systemd-logind
@@ -264,9 +276,9 @@ open-remote-ssh-tmux is maintained by AI: by [developerz.ai](https://developerz.
 | a change that surfaces tmux to the user, rewrites the SSH transport, or persists more than terminals | declined with the non-goal quoted |
 | a release | not the agent's: a member tags `v*` and `publish.yml` gates it (tag = version, build + test + lint) before publishing |
 
-What keeps agent-written code honest is mechanical, not trust: unit TDD (~1300 tests), the real-tmux docker rig ([`test/rig/`](test/rig/), tmux 2.6, 3.0a, 3.4, 3.5a, 3.8 on every pull request), the real-VSCodium end-to-end driver ([`test/rig/edh/`](test/rig/edh/), the full acceptance matrix with no manual steps), zero-warning typed lint, a coverage ratchet and Windows/macOS unit jobs. The *why* lives in [`docs/idea/`](docs/idea/README.md); each body of work is a plan with results under [`docs/plans/`](docs/plans/).
+What keeps agent-written code honest is mechanical, not trust: unit TDD (~1500 tests), the real-tmux docker rig ([`test/rig/`](test/rig/), tmux 2.6, 3.0a, 3.4, 3.5a, 3.8 on every pull request), the real-VSCodium end-to-end driver ([`test/rig/edh/`](test/rig/edh/), the full acceptance matrix with no manual steps), zero-warning typed lint, a coverage ratchet and Windows/macOS unit jobs. The *why* lives in [`docs/idea/`](docs/idea/README.md); each body of work is a plan with results under [`docs/plans/`](docs/plans/).
 
-Scheduled checkups, briefs in [`.dz/schedules/`](.dz/schedules/): weekly `health` catches the failures nothing announces, and monthly `improve` (first Monday) lands small, evidenced improvements.
+Scheduled checkups, briefs in [`.dz/schedules/`](.dz/schedules/), every Monday: `health` catches the failures nothing announces and judges the weekly release; `maintain` lands the week's upkeep (tmux rig, tool pins, docs truth) in one pull request.
 
 ## Security
 
@@ -285,8 +297,22 @@ Scheduled checkups, briefs in [`.dz/schedules/`](.dz/schedules/): weekly `health
 - **Remote commands are quoted.** Workspace folder names, host names and settings
   never reach a remote shell or tmux unescaped; a folder name cannot run commands.
 - **Host keys** are checked against `known_hosts` (including `UserKnownHostsFile`,
-  `GlobalKnownHostsFile`, `HostKeyAlias` and `@revoked` entries). `@cert-authority`
+  `GlobalKnownHostsFile`, `HostKeyAlias` and `@revoked` entries). Host fields are
+  matched as OpenSSH does: hashed entries, `[host]:port`, `*`/`?` patterns, `!`
+  negation, case-insensitively — so `@revoked * <key>` revokes that key everywhere.
+  The key types already on file for a host are asked for first, so a host recorded
+  with only its RSA or ECDSA key is not refused as changed. `@cert-authority`
   lines and `%`-tokens in those options are not supported.
+- **ProxyCommand** is run without a shell: the line is split into arguments (double
+  quotes, and on Linux/macOS single quotes and backslash escapes) and `%h`, `%n`,
+  `%p`, `%r`, `%%` are expanded — no pipes, redirects or `$VAR` unless the command is
+  itself `sh -c '…'`. A host or user name OpenSSH would refuse on its command line (a
+  leading `-`, quotes, `;`, `|`, `&`, `$`, backticks, brackets, whitespace in a host)
+  is refused before the command starts. Between `ProxyJump` and `ProxyCommand`, the
+  one that comes first in the SSH config wins, and `none` cancels both.
+- **`user@host:port` beats the SSH config.** A user or port written in the destination
+  (or in a `ProxyJump` entry) is used even when the config sets `User`/`Port` for that
+  host, as with `ssh`.
 
 Report vulnerabilities privately — see [SECURITY.md](SECURITY.md).
 

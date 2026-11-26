@@ -46,19 +46,19 @@ git diff a00e61a --stat -- src ':!src/tmux' ':!src/clipboard'
 
 | File | +/- vs. fork point | Our hunks (search for `Fork:` comments) |
 |---|---|---|
-| `src/authResolver.ts` | 940 changed | tmux capability probe after connect; terminal env written through `common/envCollection.ts` (diffed); re-resolve teardown of the previous connection, proxy child and tunnels; ProxyCommand stderr drained, `none` honoured, Windows backslashes kept, `.bat`/`.cmd` metacharacter refusal, argument redaction; keepalive from `ServerAliveInterval`/`ServerAliveCountMax`; ProxyJump `forwardOut` bounded by `connectTimeout`; SOCKS and forwarding servers on `127.0.0.1`; host verifier with known-hosts options and `@revoked`; token redaction; explicit `void` on fire-and-forget thenables and two wrapped async callbacks (typed lint) |
+| `src/authResolver.ts` | 940 changed | tmux capability probe after connect; terminal env written through `common/envCollection.ts` (diffed); re-resolve teardown of the previous connection, proxy child and tunnels; ProxyCommand stderr drained, `none` honoured, Windows backslashes kept, `.bat`/`.cmd` metacharacter refusal, argument redaction; keepalive from `ServerAliveInterval`/`ServerAliveCountMax`; ProxyJump `forwardOut` bounded by `connectTimeout`; SOCKS and forwarding servers on `127.0.0.1`; host verifier with known-hosts options and `@revoked`; token redaction; explicit `void` on fire-and-forget thenables and two wrapped async callbacks (typed lint); ProxyJump/ProxyCommand chosen by first-specified (`chooseProxy`, `none` cancels both); destination user/port beat ssh_config `User`/`Port` for the target and each ProxyJump hop (`resolveUser`, `resolveHopPort` — reverses upstream precedence, matches OpenSSH); `HostName` `%h` expansion for hops (`resolveHostName`); `%h`/`%n`/`%r`/`%p` vetted on every platform before a ProxyCommand is spawned (OpenSSH `valid_hostname`/`valid_ruser`); POSIX single-quote grouping in `splitProxyCommand`; host-key algorithms reordered to the key types on file (`hostKeyAlgorithms`, `algorithms.serverHostKey`); passphrase prompt for every encrypted key format (`isPassphraseRequired`); `NextAuth` callback type (`false`/`null` that @types/ssh2 1.x omits) with one cast at the `authHandler` boundary; verifier typed `ssh2.HostVerifier` |
 | `src/extension.ts` | 1110 changed | the whole tmux layer's wiring (`TmuxLayerController`, `watchTmuxLayerInputs`, the per-connection close watch, housekeeping, notifications, identity), clipboard command, env-collection prep. Upstream's activation body is a few lines; expect to re-apply its changes by hand |
 | `src/commands.ts` | 140 changed | kill-workspace-sessions command; explicit `void`s (typed lint) |
-| `src/serverSetup.ts` | 219 changed | settings shell/PowerShell-quoted into the install scripts; `uname` (30 s) and install (30 min) deadlines; install script logged once then as a sha256; `listeningOn` parse; launch flags as arrays |
+| `src/serverSetup.ts` | 219 changed | settings shell/PowerShell-quoted into the install scripts; `uname` (30 s) and install (30 min) deadlines; install script logged once then as a sha256; `listeningOn` parse; launch flags as arrays; a line break in the download URL template is refused |
 | `src/scripts/server-setup.sh` | 122 changed | quoted variables and launch-flag arrays; release resolution fixes |
 | `src/scripts/server-setup.ps1` | 216 changed | single-quoted (escaped) assignments; parity with the bash script |
 | `src/serverConfig.ts` | 22 changed | version/quality resolution fixes |
-| `src/fetchRelease.ts` | 50 changed | release lookup fixes |
-| `src/ssh/sshConnection.ts` | 116 changed | `exec` rejects on stream error; tunnel sockets tracked and destroyed; `close()` bounded to 2 s; listeners on `127.0.0.1`; `execPartial` stops buffering once answered |
-| `src/ssh/hostfile.ts` | 336 changed | marker lines (`@revoked`, `@cert-authority` ignored), trailing-newline-safe append, `UserKnownHostsFile` / `GlobalKnownHostsFile` file sets, `HostKeyAlias` lookup name |
-| `src/ssh/sshConfig.ts` | 123 changed | `Match` blocks, whitespace-separated `Include`, five more directive names normalised |
-| `src/ssh/identityFiles.ts` | 44 changed | agent lookup bounded to 10 s, then key files |
-| `src/ssh/sshDestination.ts` | 58 changed | bracketed IPv6 literals (`[::1]:2222`) and port parsing |
+| `src/fetchRelease.ts` | 50 changed | release lookup fixes; an unparseable URL template falls back to the local version |
+| `src/ssh/sshConnection.ts` | 116 changed | `exec` rejects on stream error; tunnel sockets tracked and destroyed; `close()` bounded to 2 s; listeners on `127.0.0.1`; `execPartial` stops buffering once answered; `execPartial` rejects on stream error like `exec`; both `addTunnel` channel-open error branches (`forwardOut`, `openssh_forwardOutStreamLocal`) destroy the accepted socket |
+| `src/ssh/hostfile.ts` | 336 changed | marker lines (`@revoked`, `@cert-authority` ignored), trailing-newline-safe append, `UserKnownHostsFile` / `GlobalKnownHostsFile` file sets, `HostKeyAlias` lookup name; host fields matched as OpenSSH pattern lists (`*`/`?`, `!` negation, case-insensitive; lookup and recorded name lower-cased, verbatim hash still matched for older records); `knownHostKeyTypes` / `serverHostKeyPreference` / `readKnownHostKeyTypes` for the host-key algorithm order |
+| `src/ssh/sshConfig.ts` | 123 changed | `Match` blocks, whitespace-separated `Include`, five more directive names normalised; `includePatterns`: `Include` pathname list read from ssh-config 5.3's multi-value shape (word list or single string); whitespace- and comma-separated pathnames, quoted pathnames kept whole |
+| `src/ssh/identityFiles.ts` | 44 changed | agent lookup bounded to 10 s, then key files; `isPassphraseRequired`: an encrypted legacy-PEM or PPK key with no `.pub` is kept (`isPrivate`) like an encrypted OpenSSH key, instead of being dropped as a parse error; agent identities narrowed to parsed keys for @types/ssh2 1.x |
+| `src/ssh/sshDestination.ts` | 58 changed | bracketed IPv6 literals (`[::1]:2222`) and port parsing; `validPort` / `INVALID_DESTINATION`: `parse` returns an empty-hostname destination for a port outside 1-65535, so callers' existing empty-hostname check rejects it |
 | `src/remoteLocationHistory.ts` | 170 changed | read-through `globalState`, empty-host guard, failures never reject activation |
 | `src/hostTreeView.ts` | 38 changed | root nodes include hosts known only from folder history |
 | `src/common/logger.ts` | 13 changed | Trace lines gated on VS Code's log level |
@@ -78,6 +78,8 @@ For these, keep ours and port upstream's intent by hand.
 ## Merging
 
 1. Branch: `git checkout -b vcs/upstream-sync-<date> main`.
+   This repository allows squash merges only; a member enables merge commits for
+   the sync PR (a squash drops upstream's ancestry and the merge base never moves).
 2. `git fetch upstream && git merge upstream/master` (a merge commit, never a
    rebase — the history of both sides must stay reachable).
 3. Resolve conflicts file by file against the table above: keep every `Fork:` hunk
@@ -96,9 +98,9 @@ For these, keep ours and port upstream's intent by hand.
    terminal layer without touching `src/tmux/*`.
 6. Regenerate the table above and update the fork point section in the same PR.
 
-**Cadence:** check upstream monthly (`git log` command under Setup), and
-immediately when upstream ships a security fix. Prefer several small merges to one
-large one.
+**Cadence:** checked weekly by the maintainer bot (`.dz/schedules/health.md`, row
+`upstream-drift`), and immediately when upstream ships a security fix. Prefer
+several small merges to one large one.
 
 ## Never use GitHub's "Sync fork" → "Discard commits"
 
