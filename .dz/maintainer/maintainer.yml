@@ -61,16 +61,19 @@ escalate:
   ask_before_acting: []
 
 schedules:
-  # Weekly (owner, 2026-11-06: routine maintenance weekly, CVE daily). Security has its own lanes.
+  # Weekly, Monday (owner, 2026-11-06 and 2026-11-26: routine maintenance weekly, CVE daily through
+  # Dependabot security groups, at most one release a week judged Monday). No overlap: `health`
+  # reads and files asks (incl. the release judgement), `maintain` fixes in one pull request.
   - name: health
     days: [mon]
     hours_utc: [7]
     brief_file: .dz/schedules/health.md
-  - name: improve
+  - name: maintain
     days: [mon]
-    weeks_of_month: [1] # the first Monday of the month
     hours_utc: [8]
-    brief_file: .dz/schedules/improve.md
+    brief_file: .dz/schedules/maintain.md
+    mode: devops
+    outcome: pr
 
 # Added by the developerz.ai maintainer agent: blocks from the current template this file did not have. Each states the value already in effect; edit it like any other key.
 

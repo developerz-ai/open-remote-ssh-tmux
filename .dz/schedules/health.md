@@ -1,64 +1,214 @@
-# Brief: is the project healthy?
+# Brief: weekly health and release judgement
 
-Weekly (Monday) checkup fired by `schedules: health`: the failures no issue or PR announces.
+Fired every Monday at 07:00 UTC by `schedules: health` (a read-only scout). It reads signals and
+**files asks**; it changes no file and opens no pull request. Fixes that fit a weekly pull request
+belong to `maintain` (`.dz/schedules/maintain.md`, 08:00 UTC), which reads none of the rows below.
 
-## Signals
+Work from a fresh clone of `main`. Set once:
 
-| Signal | Command | Healthy |
-|---|---|---|
-| `main` is green | `gh run list --workflow ci-main.yml --branch main --event push --limit 1 --json conclusion,headSha,url`, then `git rev-parse origin/main` | `success` on the `origin/main` tip; a null conclusion or another sha is no verdict |
-| Dependabot is not stuck | `gh pr list --app dependabot --state open --limit 100 --json number,updatedAt,statusCheckRollup` | no PR with failed checks and more than 7 days since `updatedAt` |
-
-A null run is not always a red: both workflows ignore markdown-only diffs
-(`.github/workflows/ci-pr.yml:7-8`, `.github/workflows/ci-main.yml:7-8`), so a
-docs-only push to `main` starts no run at all. Confirm what the tip touched before
-reading a missing run as a failure.
-
-## What to file
-
-For each unhealthy signal, one ask, unless an open issue already carries its exact title
-(`gh issue list --state open --search "<title> in:title" --json number,title`, then compare byte for byte).
-Titles are stable: nothing that changes run to run (sha, run URL) goes in one; that goes in the body,
-with the command and its output. Unreadable evidence is no verdict: re-run it, never file it as a defect.
-A red `main` comes first.
+```sh
+REPO=developerz-ai/open-remote-ssh-tmux
+TIP=$(git rev-parse origin/main)
+TAG=$(git tag --list 'v*' --sort=-v:refname | head -1)   # last release tag
+```
 
 ## Rows
 
-- `main-green`: the last push run of `ci-main.yml` on `main` concluded `success` on the `origin/main` tip (a markdown-only tip starts no run: no verdict, never a red).
-- `dependabot-stuck`: no open Dependabot PR has failed checks and more than 7 days since its `updatedAt`.
+Each row is a pass/fail verdict. A command that errors, times out or returns unreadable output is
+**no verdict**: run it once more, and if it still cannot be read, say so in the run's summary. Never
+file a defect from evidence you could not read.
+
+### `main-green`
+
+```sh
+gh run list --repo "$REPO" --workflow ci-main.yml --branch main --event push --limit 5 \
+  --json conclusion,status,headSha,url,createdAt
+```
+
+- **Pass:** the newest run whose `headSha` equals `$TIP` has `conclusion: success`.
+- **Fail:** that run concluded `failure`, `timed_out` or `startup_failure`. Name the failed job:
+  `gh run view <id> --repo "$REPO" --json jobs --jq '.jobs[] | select(.conclusion != "success") | .name'`.
+- **No verdict:** the run is still `in_progress`/`queued`, or no run carries `$TIP` yet. If
+  `.github/workflows/ci-main.yml` has a `paths-ignore` under `on.push`, a tip that touched only
+  ignored paths starts no run at all (`git show --stat --format= "$TIP"`): no verdict, never a red.
+  With no `paths-ignore` and no run for a tip older than 2 hours, file `main-green` as "no CI run
+  for the tip of main".
+
+A red `main` is filed first and blocks `release-due` below.
+
+### `flaky-jobs`
+
+```sh
+gh run list --repo "$REPO" --workflow ci-main.yml --limit 50 --json databaseId,attempt,conclusion,createdAt,url
+gh run list --repo "$REPO" --workflow ci-pr.yml   --limit 50 --json databaseId,attempt,conclusion,createdAt,url
+```
+
+- **Fail:** a run in the last 7 days has `attempt > 1` and `conclusion: success` (it went green only
+  on a re-run). For each such run, name the job that failed on the first attempt:
+  `gh api repos/$REPO/actions/runs/<id>/attempts/1/jobs --jq '.jobs[] | select(.conclusion == "failure") | .name'`.
+  One ask per job name (`check`, `unit tests (<os>)`, `package`, `tmux rig (<version>)`), asking
+  for the test to be made deterministic, never retried or skipped.
+- Skip a job that an open issue or pull request already names as flaky (the platform's `care`
+  lane files these too): `gh issue list --repo "$REPO" --state open --search "flaky <job> in:title"`.
+
+### `dependabot-stuck`
+
+```sh
+gh pr list --repo "$REPO" --app dependabot --state open --limit 100 \
+  --json number,title,headRefName,createdAt,updatedAt,statusCheckRollup
+```
+
+- **Fail (stuck):** an open Dependabot PR with a failed check (`statusCheckRollup[].conclusion` is
+  `FAILURE`) and more than 7 days since `updatedAt`. The ask names the failing check and the first
+  error line from its log; the fix is code, not a re-run.
+- **Fail (security waiting):** an open Dependabot PR from a `*-security` group (`headRefName`
+  contains `security`) with green checks, open more than 2 days. Dependency PRs wait for a member
+  (`pr.auto_merge_scope: own`), so this ask is addressed to a member.
+
+### `upstream-drift`
+
+The sync point is the merge base of our `main` and upstream `master` (before the first merge it is
+the fork point `a00e61a` recorded in `docs/upstream-sync.md` → "Fork point"):
+
+```sh
+git remote get-url upstream 2>/dev/null || git remote add upstream https://github.com/jeanp413/open-remote-ssh.git
+git fetch --quiet upstream master
+SYNC=$(git merge-base origin/main upstream/master)
+git log --oneline "$SYNC"..upstream/master          # what is new upstream
+```
+
+- **Pass:** the log is empty.
+- **Fail:** one tracking ask titled exactly `Upstream sync: merge new jeanp413/open-remote-ssh commits`,
+  addressed to a member. Body: `$SYNC`, the commit count, the log, and the files it touches
+  (`git diff --stat "$SYNC" upstream/master`) marked against the fork-hunk table in
+  `docs/upstream-sync.md` → "Upstream-owned files and our hunks". The merge itself follows
+  `docs/upstream-sync.md` → "Merging". It is a member's job, not the bot's: that procedure needs a
+  merge commit and this repository allows squash merges only (a squash drops upstream's ancestry and
+  the merge base never moves).
+- **Also fail, separately:** each new upstream commit that fixes a security issue (subject or body
+  names a CVE/GHSA, host-key verification, injection, credentials, or `ssh2`): one ask per commit
+  titled `Upstream security fix to port: <upstream subject>`. These are not batched behind the sync.
+- **Doc check:** if `$SYNC` is not the fork point / last merge recorded in `docs/upstream-sync.md`,
+  that section is stale; `maintain` corrects it, do not file it here.
+
+### `shipped-deps`
+
+What the `.vsix` ships is `package.json` `dependencies`, bundled into `lib/extension.js` by webpack
+(`.vscodeignore` whitelists the files; the CI `package` job checks them). `devDependencies` never ship.
+
+```sh
+npm audit --omit=dev --json | jq .metadata.vulnerabilities
+jq -r '.dependencies | to_entries[] | "\(.key) \(.value)"' package.json
+npm view <name> version                       # for each registry dependency
+gh api repos/jeanp413/simple-socks/commits/HEAD --jq .sha   # `simple-socks` is a git pin
+```
+
+- **Fail (advisory):** `npm audit --omit=dev` reports any vulnerability. One ask per package, unless
+  the daily audit's tracking issue (`Scheduled audit: npm audit / zizmor findings`, from
+  `.github/workflows/audit.yml`) or an open Dependabot `npm-security` PR already covers it. A high or
+  critical one in a shipped dependency is also the one case for an off-cycle release (see
+  `release.manager` comment in `.dz/maintainer/maintainer.yml`): say so in the ask.
+- **Fail (major behind):** a shipped dependency whose latest version is a new major, or a
+  `simple-socks` pin behind its upstream HEAD, with no open Dependabot PR for it. One ask per
+  package for a member; runtime dependency changes always get a member's review. An `ssh2` bump also
+  needs `scripts/patch-ssh2.js` refreshed (its header lists the steps).
+- Dev-only drift is not filed here: Dependabot opens it weekly, and `maintain` bumps the pins
+  Dependabot cannot see.
+
+### `acceptance-fresh`
+
+```sh
+NEWEST=$(find docs/plans -name 'results-*.md' | sort | tail -1)   # results-YYYY-MM-DD.md
+SINCE=$(basename "$NEWEST" .md | sed 's/^results-//')
+git log --oneline --since="$SINCE" origin/main -- src/tmux src/extension.ts src/authResolver.ts src/ssh src/serverSetup.ts
+```
+
+- **Pass:** no commit since that date touched the terminal layer or the connect path.
+- **Fail:** commits did, and a release tag (`$TAG`) already contains them
+  (`git merge-base --is-ancestor <commit> "$TAG"`). One ask titled
+  `Acceptance run due: terminal-layer changes since <SINCE>`, listing the commits and asking for the
+  EDH driver (`test/rig/edh/run.sh <vsix>`, needs docker; the zombie rows 06-09 at minimum) and a new
+  `results-<date>.md` beside the plan it verifies.
+
+### `release-due`
+
+Owner rule (`release:` comment in `.dz/maintainer/maintainer.yml`): at most one release a week,
+judged on a Monday; a merge, a fix or a fix count never cuts one. The bot never cuts a release
+(`release.manager: none`, `channels: []`): this row only recommends one to a member.
+
+```sh
+gh release list --repo "$REPO" --limit 1 --json tagName,publishedAt
+jq -r .version package.json
+git log --format='%h %s' "$TAG"..origin/main
+git diff --name-only "$TAG" origin/main -- src webpack.config.js .vscodeignore
+for ref in "$TAG" origin/main; do
+  git show "$ref:package-lock.json" | jq -S '[.packages | to_entries[]
+    | select(.key != "" and (.value.dev // false) == false) | {key: .key, value: .value.version}] | from_entries'
+done   # diff the two: a changed shipped (non-dev) package version
+for ref in "$TAG" origin/main; do git show "$ref:package.json" | jq -S '{dependencies, contributes, engines}'; done
+```
+
+A release is **due** only when every condition holds:
+
+1. `main-green` passed this run.
+2. The latest GitHub release was published more than 6 days ago.
+3. `package.json` `version` equals `$TAG` without the `v`. If it is higher, a bump is already
+   merged and waits for its tag: propose no other version; file `Release v<that version> is due`
+   with only the tagging step below, unless an open issue starting `Release v` exists.
+4. Something shipped changed since `$TAG`: a file under `src/`, `webpack.config.js` or
+   `.vscodeignore`; a shipped package version in the lockfile; or `dependencies`, `contributes` or
+   `engines` in `package.json`. Docs, tests, CI and dev-only dependency changes alone are not a release.
+
+Version: a `!` or `BREAKING CHANGE` in the commits since `$TAG` → major; any `feat`/`enhance` →
+minor; otherwise patch.
+
+When due, file one ask titled `Release v<X.Y.Z> is due`, addressed to a member, unless an open issue
+starting `Release v` exists (then nothing new is filed). Body: the conditions with their evidence,
+the commits since `$TAG`, and a draft `## X.Y.Z` section for `CHANGELOG.md` in the existing style
+(one line per change, `fix:` / `feat:` / `docs:` prefixes). How a member cuts it:
+
+1. A pull request `build(release): X.Y.Z`: `npm version X.Y.Z --no-git-tag-version` (sets
+   `package.json` and `package-lock.json`) and the `## X.Y.Z` section in `CHANGELOG.md`
+   (`.github/scripts/get-changelog.js` needs that exact heading, or `publish.yml` fails).
+2. After it merges, tag the merge commit: `git tag -a vX.Y.Z -m "Release version X.Y.Z" <sha>` and
+   `git push origin vX.Y.Z`. `publish.yml` refuses a tag that is not `v` + the `package.json`
+   version, re-runs build, test and lint, and creates the GitHub Release.
+   (`npm run release` runs `bin/check`, then bumps, commits, tags and pushes in one step, but its
+   push to `main` needs whatever the `main` ruleset requires of a direct push.)
+
+Not due: say which condition failed in the run's summary. File nothing.
+
+## Filing rules
+
+- One ask per failing row (per item where a row says so). A red `main` comes first.
+- Before filing, look for an open issue with the exact title:
+  `gh issue list --repo "$REPO" --state open --search "<title> in:title" --json number,title`,
+  then compare byte for byte. If one exists, file nothing new.
+- Titles are stable: nothing that changes run to run (sha, run URL, count) goes in a title. That goes
+  in the body, with the command and its output.
 
 ## Checks that exist on main
 
-Declared rows, not an enforced gate: nothing parses this file — the schedule hands it to
-an agent (`.dz/maintainer/maintainer.yml:59-62`, `.dz/README.md:8`). One row per check that
-exists here; each cell after the first names what it runs and the `path:line` that proves it.
+Reference for the rows above. Nothing parses this table; cells cite the file and job or step.
 
 | Check | What it runs | Where it lives |
 |---|---|---|
-| CI `check`, on a pull request to `main` | `npm ci` → `npm run build` → `npm test` → `npm run lint:package` + `git diff --exit-code -- package.json` → `npm run lint` → commitlint over the PR range | `.github/workflows/ci-pr.yml:13` — steps at `:30`, `:34`, `:38`, `:46-47`, `:51`, `:53-78` |
-| CI `check`, on a push to `main` | the same six steps, lockstep with `ci-pr.yml` | `.github/workflows/ci-main.yml:13` — steps at `:30`, `:34`, `:38`, `:46-47`, `:51`, `:53-87` |
-| CI `package`, on a pull request and a push to `main` | Node 22 → `npm ci` → packaging-Node guard → `npm run package` → vsix contents held to the `.vscodeignore` whitelist | `.github/workflows/ci-pr.yml:80`, `.github/workflows/ci-main.yml:89`; `.github/scripts/check-vsix-contents.js` |
-| Scheduled audit, daily | `npm audit` and zizmor 1.31.1 over the workflows; a finding opens or comments on one tracking issue, a clean run closes it | `.github/workflows/audit.yml:9-10`, steps at `:44`, `:46` |
-| `bin/check` | `npm run compile:src && npm run lint && npm test` — the local gate; the pre-commit hook runs the same minus `eslint` (`.husky/pre-commit:4`), so a green hook is weaker than this | `bin/check:4` |
-| `bin/setup` | `npm install` — dependencies, then the manifest's own hooks: `postinstall` patches `ssh2` and fetches the VS Code dts, and `prepare` runs `husky` and `lint:package` (`fixpack`, which rewrites `package.json` in place) | `bin/setup:4`, `package.json:34-35` |
-| `bin/dev` | `npm run watch:src` — `tsc-watch` plus a dev bundle | `bin/dev:4`, `package.json:46` |
-| `npm run compile:src` | `tsc -b` into `out/` (src only: `tsconfig.json` excludes `test` and `vitest.config.ts`, `tsconfig.json:46-51`), then `npm run compile:test` — the typecheck | `package.json:27` |
-| `npm run compile:test` | `tsc -p tsconfig.test.json` — `noEmit` typecheck of `test/`, `vitest.config.ts` and the vscode `.d.ts` files; reached from `build` via `compile:src` | `package.json:28`, `tsconfig.test.json` |
-| `npm run lint` | `eslint` | `package.json:29` |
-| `npm run lint:all` | `lint:package`, `npm audit`, `ci:lint`, `lint` — the full local gate; CI runs only `lint:package` and `lint`, the audits are scheduled | `package.json:30` |
-| `npm test` | `vitest run` | `package.json:37` |
-| `npm run build` | `clean` → `compile:src` → `bundle` (webpack production) | `package.json:21`, `package.json:22` |
-| `npm run ci:lint` | `pipx run zizmor .` over the workflows (latest zizmor; the scheduled audit pins its own) | `package.json:24` |
-| pre-commit hook | `npx lint-staged` — `fixpack` **rewriting** a staged `package.json`, `zizmor` over staged workflows, `eslint` over staged `*.ts` — then `npm run compile:src && npm test` | `.husky/pre-commit:3-4`; staged set `.lintstagedrc.yml:1-2` (`fixpack`), `:3` (`zizmor`), `:4` (`eslint`) |
-| commit-msg hook | `npx commitlint --edit "$1"` | `.husky/commit-msg:3` |
-| F5/EDH matrix | **manual, one-off**: 21 rows on a real Unix remote; last run 19/21 PASS | `docs/plans/2026/07/24/101-v1-tmux-release/09-verify.md:16-38`, results `results-2026-07-24.md:95` |
+| CI `check` (pull request and push to `main`) | `npm ci` → `npm run build` → `npm test` → `npm run lint:package` + `git diff --exit-code -- package.json` → `npm run lint` → commitlint over the range | `ci-pr.yml` and `ci-main.yml`, job `check` |
+| CI `unit tests (<os>)` | `npm test` on Windows and macOS | job `unit-os` |
+| CI `package` | Node 22 → `npm ci` → packaging-Node guard → `npm run package` → vsix contents held to `.vscodeignore` | job `package`; `.github/scripts/check-vsix-contents.js` |
+| CI `tmux rig (<version>)` | `npm run test:tmux -- <version>`, one job per version in `matrix.tmux` | job `tmux-rig`; versions pinned in `test/rig/compose.yml` |
+| Scheduled audit, daily | `npm audit` and pinned zizmor over the workflows; one tracking issue | `.github/workflows/audit.yml` |
+| Publish | on a `v*` tag only: tag must equal `v` + `package.json` version; build, test, lint, package, GitHub Release | `.github/workflows/publish.yml` |
+| `bin/check` | `npm run compile:src && npm run lint && npm test` (`--full` adds `npm run test:tmux`) — the local gate | `bin/check:9` |
+| pre-commit hook | `npx --no lint-staged`, then `npm run compile:src && npm test` (no full `eslint`: weaker than `bin/check`) | `.husky/pre-commit:5-6`; staged set `.lintstagedrc.yml` |
+| commit-msg hook | `npx --no commitlint --edit "$1"` | `.husky/commit-msg:4` |
+| EDH acceptance driver | real VSCodium in docker against the rig, the acceptance matrix rows by script; not run by CI | `test/rig/edh/run.sh`, `test/rig/edh/README.md` |
 
-`check` is the required merge check (`.dz/maintainer/maintainer.yml:34-35`).
+`check` is the CI job named in `pr.required_checks` (`.dz/maintainer/maintainer.yml`).
 
-## Gaps — claims that cannot fail or cannot run
+## Gaps: claims that cannot fail here
 
 | Gap | Why it is not a green row |
 |---|---|
-| the F5/EDH matrix | cannot run in an agent environment — no VS Code desktop binary or display (`docs/idea/ai-first.md:62-67`) — and its last run left rows open: row 13, no real Windows remote (`results-2026-07-24.md:85`), row 18, Claude Code TUI (`results-2026-07-24.md:90`) |
-| `bin/check` under CI | no workflow invokes it (repo-wide grep): CI runs `npm run build`, `npm test` and `npm run lint` as separate steps (`.github/workflows/ci-pr.yml:34`, `:38`, `:51`), so `bin/check` green is a local/pre-commit signal only |
-| a missing `check` run | `paths-ignore: **/*.md` (`.github/workflows/ci-pr.yml:7-8`, `.github/workflows/ci-main.yml:7-8`) means a markdown-only diff never starts the job: a skipped check, never a pass — do not file it and do not weaken the workflow |
+| EDH acceptance matrix | CI never runs it; it needs docker and a built `.vsix`. Rows 13 (real Windows remote) and 18 (Claude Code TUI) are not automated. `acceptance-fresh` only asks for a run. |
+| `bin/check` under CI | no workflow invokes it; CI runs the same steps separately, so a green `bin/check` is a local signal only. |
