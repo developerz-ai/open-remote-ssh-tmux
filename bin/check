@@ -6,7 +6,10 @@ cd "$(dirname "$0")/.."
 preflight_node
 preflight_deps
 
-npm run compile:src && npm run lint && npm test
+# One command per line: `set -e` ignores a failure anywhere but last in an `&&` list.
+npm run compile:src
+npm run lint
+npm test
 
 if [ "${1:-}" = "--full" ]; then
   npm run test:tmux

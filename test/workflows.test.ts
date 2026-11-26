@@ -1,5 +1,7 @@
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import { createRequire } from 'node:module';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
@@ -216,9 +218,24 @@ describe('pull-request and main CI', () => {
 
     // A new push to a PR makes the running checks moot; finishing them only delays the
     // ones that matter. Pushes to main are never cancelled: each commit keeps its verdict.
-    it('cancels superseded pull-request runs, and only those', () => {
+    it('cancels superseded pull-request runs', () => {
         expect(readWorkflow('ci-pr.yml')).toMatch(/^concurrency:\n\s+group: [^\n]*github\.event\.pull_request\.number[^\n]*\n\s+cancel-in-progress: true$/m);
-        expect(readWorkflow('ci-main.yml')).not.toContain('cancel-in-progress: true');
+    });
+
+    // Any concurrency group on main is unsafe, `cancel-in-progress: false` included: a
+    // group holds one running and one PENDING run, and a newer push replaces the pending
+    // one, so that commit never gets a verdict.
+    const declaresConcurrency = (contents: string): boolean => /^\s*concurrency:/m.test(contents);
+
+    it('recognises a concurrency group at any level, in any form', () => {
+        expect(declaresConcurrency('on: push\nconcurrency:\n  group: main\n  cancel-in-progress: false\njobs: {}\n')).toBe(true);
+        expect(declaresConcurrency('on: push\nconcurrency: main\njobs: {}\n')).toBe(true);
+        expect(declaresConcurrency('on: push\njobs:\n  check:\n    concurrency: main\n    runs-on: ubuntu-latest\n')).toBe(true);
+        expect(declaresConcurrency('on: push\njobs:\n  check:\n    runs-on: ubuntu-latest\n')).toBe(false);
+    });
+
+    it('never queues main pushes in a concurrency group, so none is replaced while pending', () => {
+        expect(declaresConcurrency(readWorkflow('ci-main.yml'))).toBe(false);
     });
 
     // npm ci from the npm cache instead of the registry on every job. Safe here: these
@@ -439,5 +456,41 @@ describe('get-changelog.js', () => {
         const real = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
 
         expect(changelogScript.changelogEntry(real, `v${readPackageJson().version}`)).toMatch(/\S/);
+    });
+});
+
+// bin/check is the local gate and release-it's `before:init`: a failed step must fail it.
+// `set -e` does not stop on a failure inside an `a && b && c` list (only on its last
+// command), so a stub npm on PATH proves each step's failure reaches the exit status.
+describe.runIf(process.platform !== 'win32')('bin/check', () => {
+    function runCheck(failing: string, args: string[] = []): { status: number | null; calls: string[] } {
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bin-check-'));
+        try {
+            const calls = path.join(directory, 'calls');
+            fs.writeFileSync(path.join(directory, 'npm'),
+                '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\n[ "$*" = "$FAILING" ] && exit 3\nexit 0\n', { mode: 0o755 });
+            const result = spawnSync('sh', [path.join(root, 'bin', 'check'), ...args], {
+                encoding: 'utf8',
+                env: { ...process.env, PATH: `${directory}${path.delimiter}${process.env.PATH}`, CALLS: calls, FAILING: failing },
+                timeout: 15000,
+            });
+            expect(result.error).toBeUndefined();
+            return { status: result.status, calls: fs.readFileSync(calls, 'utf8').trim().split('\n') };
+        } finally {
+            fs.rmSync(directory, { recursive: true, force: true });
+        }
+    }
+
+    it.each(['run compile:src', 'run lint', 'test'])('fails, and stops, when `npm %s` fails', (step) => {
+        const { status, calls } = runCheck(step, ['--full']);
+
+        expect(status).toBe(3);
+        expect(calls[calls.length - 1]).toBe(step);
+        expect(calls).not.toContain('run test:tmux');
+    });
+
+    it('runs compile, lint and the unit tests, then the rig with --full', () => {
+        expect(runCheck('none')).toEqual({ status: 0, calls: ['run compile:src', 'run lint', 'test'] });
+        expect(runCheck('none', ['--full']).calls).toEqual(['run compile:src', 'run lint', 'test', 'run test:tmux']);
     });
 });
