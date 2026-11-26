@@ -233,7 +233,26 @@ function scriptLine(script: string, prefix: string): string | undefined {
     return script.split('\n').find(l => l.startsWith(prefix));
 }
 
+// A placeholder inside a comment is substituted too, and a newline in the value then ends the
+// comment and runs the rest as shell. Every placeholder must sit at a real use site.
+describe.each(['server-setup.sh', 'server-setup.ps1'])('%s placeholders', (name) => {
+    it('puts no %%KEY%% placeholder on a comment line', () => {
+        const template = fs.readFileSync(path.join(extensionPath, 'src', 'scripts', name), 'utf8');
+        const inComments = template.split('\n').filter(l => /^\s*#/.test(l) && /%%[A-Z_]+%%/.test(l));
+        expect(inComments).toEqual([]);
+    });
+});
+
 describe('generateBashInstallScript', () => {
+    it('keeps a newline in the download URL template inside the quoted literal', () => {
+        const script = generateBashInstallScript(
+            baseOptions({ serverDownloadUrlTemplate: 'https://x/${os}\ntouch /tmp/PWNED_UNIT #' }),
+            extensionPath
+        );
+        // Once, at the real use site inside the quotes; a second copy would be the one in a comment.
+        expect(script.split('touch /tmp/PWNED_UNIT')).toHaveLength(2);
+    });
+
     it('leaves no unreplaced %%KEY%% placeholder in the output', () => {
         const script = generateBashInstallScript(baseOptions({ customInstallPath: '/opt/my dir' }), extensionPath);
         expect(script).not.toMatch(/%%[A-Z_]+%%/);
@@ -576,6 +595,13 @@ describe('installCodeServer deadlines', () => {
         await vi.advanceTimersByTimeAsync(PLATFORM_DETECT_DEADLINE_MS);
 
         await assertion;
+    });
+
+    it.each(['\n', '\r'])('rejects a download URL template containing a line break (%j) before any remote call', async (brk) => {
+        const exec = vi.fn();
+        const result = installCodeServer({ exec } as unknown as SSHConnection, `https://x/${brk}touch /tmp/PWNED_UNIT #`, 'match', [], [], 'linux', false, undefined, new Log('test'), extensionPath);
+        await expect(result).rejects.toBeInstanceOf(ServerInstallError);
+        expect(exec).not.toHaveBeenCalled();
     });
 
     it('lets a slow install run for minutes, then gives up at the ceiling', async () => {

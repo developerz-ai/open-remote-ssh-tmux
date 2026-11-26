@@ -50,6 +50,15 @@ describe('fetchRelease', () => {
         vi.unstubAllGlobals();
     });
 
+    it('falls back to the local version when the template is not an absolute URL', async () => {
+        const fetchMock = mockFetchOnce({ ok: true });
+
+        const result = await fetchRelease('/srv/mirror/${version}.tar.gz', '1.96.4', '25026', 'latest', logger);
+
+        expect(result).toEqual({ version: '1.96.4', build: '25026' });
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
     it('falls back to the local version when the response is not ok', async () => {
         mockFetchOnce({ ok: false, status: 403, statusText: 'rate limit exceeded' });
 
