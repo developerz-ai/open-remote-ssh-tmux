@@ -62,7 +62,7 @@ explicitly rather than shipping a leaky abstraction.
 
 ## Architecture — one responsibility per module (SRP)
 
-The codebase is roughly 9k lines of TypeScript (`src/`, plus ~0.6k lines of
+The codebase is roughly 10k lines of TypeScript (`src/`, plus ~0.6k lines of
 remote install scripts) and is organised by responsibility. Preserve that; each file below owns exactly one concern.
 
 | File | Single responsibility |
@@ -149,7 +149,11 @@ and [`../ai-task-master/`](../ai-task-master/CLAUDE.md).
   (`splitProxyCommand` in `authResolver.ts`, the template helpers in
   `serverSetup.ts`) explain *why* + link the upstream issue. Do that when the
   reasoning is non-obvious; don't narrate the obvious.
-- **Node:** v20 (`.nvmrc` `v20.20.2`). npm, not pnpm/yarn/bun.
+- **Node:** the toolchain (build, tests, lint, CI, packaging, release) runs Node 24 LTS
+  from `.nvmrc` (`v24.22.3`); every workflow reads it via `node-version-file`. The
+  extension *runtime* is VS Code's Electron Node — Node 20 at the `engines.vscode`
+  floor (1.90) — so `@types/node` stays on major 20 on purpose
+  (`test/publish-node-engines.test.ts` pins both). npm, not pnpm/yarn/bun.
 
 ## Build & verify
 
@@ -159,7 +163,7 @@ npm run compile:src    # tsc -b (src only → out/), then compile:test: type-che
                        # test/ + vitest.config.ts via tsconfig.test.json (noEmit)
 npm run watch:src      # tsc-watch + dev bundle
 npm run bundle         # webpack production → lib/extension.js
-npm run build          # clean + compile + bundle (what vsce:prepublish runs)
+npm run build          # clean + compile + bundle (what vscode:prepublish runs)
 npm run lint           # eslint
 npm test               # vitest `unit` project — pure logic, no docker, seconds
 npm run test:tmux      # vitest `integration` project against REAL tmux over real
@@ -169,15 +173,21 @@ npm run package        # produce the .vsix
 ```
 
 `npm run test:tmux` needs docker with the compose plugin; without it the run is
-skipped locally and **fails in CI**. `bin/check` runs compile + lint + unit tests
-(`bin/check --full` adds the rig).
+skipped locally and **fails in CI**. `bin/setup` installs the dependencies; `bin/check`
+runs compile + lint + unit tests (`bin/check --full` adds the rig). Every `bin/` script
+first checks the environment (`bin/lib/preflight.sh`): it fails fast with "run bin/setup
+first" when `node_modules` is missing, and warns when the Node major is not `.nvmrc`'s
+or the lockfile is newer than the install.
 
-**CI gates** (`.github/workflows/`): every PR and push to `main` runs build,
+**CI gates** (`.github/workflows/`): every PR and push to `main` — Markdown-only changes
+included, since the docs have drift tests — runs build,
 the unit tests under coverage thresholds (`npm run test:coverage`) plus the unit
 tests on Windows and macOS, `lint:package` (fixpack, must leave `package.json`
 unchanged), `npm run lint` (zero warnings, typed rules), commitlint, a `package` job that builds the `.vsix` and checks
 its contents against `.vscodeignore`, and the tmux rig as one job per tmux
-version. `publish.yml` runs on a `v*` tag only, refuses a tag that is not
+version. A new push to a PR cancels its superseded run; every job has a
+`timeout-minutes`; the PR/main jobs restore the npm cache, the release workflows never
+do. `publish.yml` runs on a `v*` tag only, refuses a tag that is not
 `v` + the `package.json` version, and re-runs build, test and lint before it
 packages and creates the GitHub Release (Open VSX only when the
 `PUBLISH_OPENVSX` variable is `yes`). `npm audit` and zizmor run daily in

@@ -1,7 +1,12 @@
 #!/bin/sh
 # Compile, lint, and test. `--full` also runs the real-tmux rig (needs docker; slow).
+set -e
+cd "$(dirname "$0")/.."
+. bin/lib/preflight.sh
+preflight_node
+preflight_deps
 
-npm run compile:src && npm run lint && npm test || exit 1
+npm run compile:src && npm run lint && npm test
 
 if [ "${1:-}" = "--full" ]; then
   npm run test:tmux

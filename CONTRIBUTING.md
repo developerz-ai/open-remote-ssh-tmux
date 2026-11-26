@@ -88,7 +88,7 @@ Merging upstream `jeanp413/open-remote-ssh` follows
 [`docs/upstream-sync.md`](docs/upstream-sync.md).
 
 ```sh
-npm install            # Node 20.20.2 (.nvmrc), npm only
+npm install            # Node 24.22.3 (.nvmrc), npm only
 npm run compile:src    # type-check src/ and test/
 npm run lint           # eslint
 npm test               # unit tests (vitest), seconds
@@ -114,7 +114,7 @@ npm run package          # produces open-remote-ssh-tmux-<version>.vsix
 
 ### Local checks
 
-On Linux or macOS, use Node **20.20.2** (`.nvmrc`) and npm, plus a
+On Linux or macOS, use Node **24.22.3** (`.nvmrc`) and npm, plus a
 supported Python 3 and **pipx** for workflow linting. These are local developer
 prerequisites, not requirements for using the extension. npm does **not**
 install Python or pipx. Install pipx with your OS package manager (for example,
@@ -127,14 +127,16 @@ pipx ensurepath
 python3 --version
 pipx --version
 npm install
-pipx run zizmor --version
+pipx run --spec zizmor==1.31.1 zizmor --version
 npm run ci:lint
 ```
 
 See [pipx installation](https://pipx.pypa.io/stable/installation/) for other
 Unix distributions. Ensure `pipx` is on the PATH inherited by your editor's
-Git hooks, not just an interactive shell. `pipx run zizmor` acquires zizmor in
-an isolated cached environment; no global `zizmor` executable is needed.
+Git hooks, not just an interactive shell. `pipx run --spec zizmor==1.31.1 zizmor`
+acquires zizmor in an isolated cached environment; no global `zizmor` executable
+is needed. The version is the one the scheduled audit (`audit.yml`) pins, so the
+hook and CI apply the same rules; bump both together.
 First use (and cache refresh) requires network access to the Python package
 index and writable pipx/cache directories. An offline empty cache cannot run
 this check; acquisition errors fail the hook rather than skipping it.
@@ -186,17 +188,17 @@ in force. Neither update target runs automatically during installation.
 ### What the hook checks
 
 [`.lintstagedrc.yml`](.lintstagedrc.yml) runs fixpack on a staged `package.json`,
-ESLint on staged `*.ts`, and `pipx run zizmor` on staged workflow YAML, with
-lint-staged appending the matched paths. `npm run ci:lint` checks
-all workflows via `pipx run zizmor .`; `npm run ci:lint:fix` uses the same
+ESLint on staged `*.ts`, and the pinned zizmor (`pipx run --spec zizmor==1.31.1
+zizmor`) on staged workflow YAML, with lint-staged appending the matched paths.
+`npm run ci:lint` checks all workflows with the same pinned zizmor; `npm run ci:lint:fix` uses the same
 command with `--fix=all` (and can modify workflows).
 [The pre-commit hook](.husky/pre-commit) runs lint-staged, then compilation and
 tests. Husky invokes it with `sh -e`: a failed staged check stops the hook.
 
-**The TypeScript glob is not root-only.** Installed lint-staged **16.4.0**
+**The TypeScript glob is not root-only.** Installed lint-staged **17.6.1**
 enables `matchBase: !pattern.includes('/')` in
-[`lib/matchFiles.js:10–21`](https://github.com/lint-staged/lint-staged/blob/v16.4.0/lib/matchFiles.js#L10-L21).
-[`lib/generateTasks.js:22–40`](https://github.com/lint-staged/lint-staged/blob/v16.4.0/lib/generateTasks.js#L22-L40)
+[`lib/matchFiles.js:9–22`](https://github.com/lint-staged/lint-staged/blob/v17.6.1/lib/matchFiles.js#L9-L22).
+[`lib/generateTasks.js:18–45`](https://github.com/lint-staged/lint-staged/blob/v17.6.1/lib/generateTasks.js#L18-L45)
 matches relative paths and returns absolute task paths by default. Keep
 `"*.ts": eslint`: it already includes nested TypeScript files.
 
@@ -217,7 +219,7 @@ actual YAML and installed lint-staged internals through native ESM: root and
 nested TS reach ESLint, unrelated files do not, and workflow paths are retained.
 The matcher anchors above disprove the root-only premise; no glob correction was
 needed. On a box where `pipx` and `python3` are on PATH and PyPI is reachable,
-the same command runs all nine tests — the gated acquisition test executes for
+the same command runs every test — the gated acquisition test executes for
 real instead of skipping.
 
 **Stub evidence, not real zizmor:** the regression test executes lint-staged's
