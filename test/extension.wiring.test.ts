@@ -1,13 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { backgroundTerminalsMessage, canonicalTmuxIdentity, CLIPBOARD_PASTE_DEADLINE_MS, CLIPBOARD_SWEEP_DEADLINE_MS, clipboardExec, CLOSE_BACKGROUND_TERMINALS, deactivate, decideDefaultProfile, DEFAULT_PROFILE_WRITE_DEADLINE_MS, HAND_OFF_NOT_NOW, HAND_OFF_OFFER_MESSAGE, HAND_OFF_TAKE_OVER, KEEP_BACKGROUND_TERMINALS, LIFETIME_DOCS_URL, LIFETIME_LEARN_MORE, LIFETIME_WARNING_MESSAGE, maybeWarnTerminalLifetime, offerBackgroundCleanup, offerHandOff, oncePerKey, decideTmuxWiring, defaultProfileSettingKey, deriveTmuxSessionContext, lazyExec, onceOnly, readTmuxSettings, reconcileDefaultTerminalProfile, resolveSshTarget, TMUX_EXEC_DEADLINE_MS, TMUX_PROFILE_TITLE, TmuxLayerController, tmuxExec, watchTmuxLayerInputs, type TmuxSettings, type TmuxTerminalLayer } from '../src/extension';
+import { backgroundTerminalsMessage, canonicalTmuxIdentity, CLIPBOARD_PASTE_DEADLINE_MS, CLIPBOARD_SWEEP_DEADLINE_MS, clipboardExec, CLOSE_BACKGROUND_TERMINALS, deactivate, decideDefaultProfile, DEFAULT_PROFILE_WRITE_DEADLINE_MS, HAND_OFF_NOT_NOW, HAND_OFF_OFFER_MESSAGE, HAND_OFF_TAKE_OVER, KEEP_BACKGROUND_TERMINALS, LIFETIME_DOCS_URL, LIFETIME_LEARN_MORE, LIFETIME_WARNING_MESSAGE, maybeWarnTerminalLifetime, offerBackgroundCleanup, offerHandOff, oncePerKey, decideTmuxWiring, defaultProfileSettingKey, deriveTmuxSessionContext, lazyExec, onceOnly, readTmuxSettings, reconcileDefaultTerminalProfile, resolveSshTarget, TMUX_EXEC_DEADLINE_MS, TMUX_PROFILE_TITLE, TmuxLayerController, tmuxExec, watchTmuxLayerInputs, wireTmuxTerminalLayer, type TmuxSettings, type TmuxTerminalLayer } from '../src/extension';
 import SSHDestination from '../src/ssh/sshDestination';
-import type { TmuxSessionContext } from '../src/tmux/terminalProvider';
+import { TmuxTerminalProvider, type TmuxSessionContext } from '../src/tmux/terminalProvider';
 import { DeadlineError } from '../src/common/deadline';
 import { wrapWithExitCode } from '../src/tmux/remoteExec';
 import type { RemoteSSHResolver } from '../src/authResolver';
 import type Log from '../src/common/logger';
 import { ConfigurationTarget, configOverrides, inspectOverrides, messageResponses, shownMessages, TerminalProfile, updateCalls, updateControl } from './mocks/vscode';
 import { FallbackTerminalProvider } from '../src/tmux/fallbackTerminalProvider';
+import * as vscodeMock from './mocks/vscode';
+import type * as vscode from 'vscode';
+import SSHConfiguration from '../src/ssh/sshConfig';
+import { TerminalProfileRegistration } from '../src/tmux/profileRegistration';
 
 /** A no-op Log — the default-profile reconcile only calls `trace` on the (untaken) error path. */
 const noopLog = { trace: (): void => { /* no-op */ } } as unknown as Log;
@@ -206,8 +210,8 @@ describe('TmuxLayerController: wire once, refresh on reconnect, rewire/unwire at
 
     it('tells a wiring when it has been superseded, so it can stop before its side effects', async () => {
         const checks: Array<() => boolean> = [];
-        const controller = new TmuxLayerController(stillCurrent => {
-            checks.push(stillCurrent);
+        const controller = new TmuxLayerController(attempt => {
+            checks.push(() => attempt.stillCurrent());
             return new Promise(() => { /* still wiring */ });
         });
         void controller.resolved();
@@ -219,6 +223,53 @@ describe('TmuxLayerController: wire once, refresh on reconnect, rewire/unwire at
 
         expect(checks[0]()).toBe(false); // the first attempt is stale
         expect(checks[1]()).toBe(true);
+    });
+
+    it('unwire rolls an in-flight attempt back at once, not when the attempt next looks', async () => {
+        const rollback = vi.fn();
+        const controller = new TmuxLayerController(attempt => {
+            attempt.onSuperseded(rollback);
+            return new Promise(() => { /* still in the default-profile write */ });
+        });
+        void controller.resolved();
+        await Promise.resolve();
+        expect(rollback).not.toHaveBeenCalled();
+
+        controller.unwire();
+        controller.unwire();
+
+        expect(rollback).toHaveBeenCalledTimes(1);
+    });
+
+    it('a rollback registered by an attempt that is already stale runs at once', async () => {
+        let attemptOf!: Parameters<ConstructorParameters<typeof TmuxLayerController>[0]>[0];
+        const controller = new TmuxLayerController(attempt => {
+            attemptOf = attempt;
+            return new Promise(() => { /* still wiring */ });
+        });
+        void controller.resolved();
+        await Promise.resolve();
+        controller.unwire();
+
+        const rollback = vi.fn();
+        attemptOf.onSuperseded(rollback);
+
+        expect(rollback).toHaveBeenCalledTimes(1);
+    });
+
+    it('a landed layer is disposed by a later unwire, never rolled back by its attempt', async () => {
+        const layer = fakeLayer();
+        const rollback = vi.fn();
+        const controller = new TmuxLayerController(async attempt => {
+            attempt.onSuperseded(rollback);
+            return layer;
+        });
+        await controller.resolved();
+
+        controller.unwire();
+
+        expect(rollback).not.toHaveBeenCalled();
+        expect(layer.dispose).toHaveBeenCalledTimes(1);
     });
 
     it('a setting handed over while wiring is in flight reaches the layer when it lands', async () => {
@@ -1092,5 +1143,85 @@ describe('hand-off UI and window close (03)', () => {
     // dropping (the close watch), so deactivate has nothing to send.
     it('sends nothing on deactivate', () => {
         expect(deactivate()).toBeUndefined();
+    });
+});
+
+// The real wiring, end to end against the mock surface: switching persistence off while the
+// default-profile write is still in flight (seconds on a first connect, up to 15 s) must take
+// the tmux provider and its terminal listeners down AT ONCE — not when the write settles —
+// or "Persistent Shell" keeps starting tmux sessions after the user disabled it.
+describe('wireTmuxTerminalLayer: off during the default-profile write', () => {
+    const terminalSubs: Array<{ dispose: ReturnType<typeof vi.fn> }> = [];
+    const mockWindow = vscodeMock.window as unknown as Record<string, unknown>;
+
+    beforeEach(() => {
+        configOverrides.clear();
+        inspectOverrides.clear();
+        updateCalls.length = 0;
+        terminalSubs.length = 0;
+        const subscribe = (): { dispose: ReturnType<typeof vi.fn> } => {
+            const sub = { dispose: vi.fn() };
+            terminalSubs.push(sub);
+            return sub;
+        };
+        mockWindow.onDidOpenTerminal = subscribe;
+        mockWindow.onDidCloseTerminal = subscribe;
+        mockWindow.terminals = [];
+        const dest = Buffer.from(JSON.stringify({ hostName: 'box' })).toString('hex');
+        vscodeMock.workspace.workspaceFolders = [{ uri: { scheme: 'vscode-remote', authority: `ssh-remote+${dest}`, path: '/w' } }];
+        vi.spyOn(SSHConfiguration, 'loadFromFS').mockResolvedValue({ getHostConfiguration: () => ({}) } as unknown as SSHConfiguration);
+    });
+
+    afterEach(() => {
+        delete mockWindow.onDidOpenTerminal;
+        delete mockWindow.onDidCloseTerminal;
+        delete mockWindow.terminals;
+        vscodeMock.workspace.workspaceFolders = undefined;
+        updateControl.result = undefined;
+        vi.restoreAllMocks();
+    });
+
+    function memento() {
+        const store = new Map<string, unknown>();
+        return {
+            get: <T>(key: string, defaultValue?: T): T | undefined => (store.has(key) ? store.get(key) as T : defaultValue),
+            update: async (key: string, value: unknown): Promise<void> => { store.set(key, value); },
+            keys: (): readonly string[] => [...store.keys()],
+        };
+    }
+
+    it('hands the profile id back to the fallback and drops the listeners before the write resolves', async () => {
+        let finishWrite!: () => void;
+        updateControl.result = () => new Promise<void>(resolve => { finishWrite = resolve; });
+        const owners: unknown[] = [];
+        const registration = new TerminalProfileRegistration('tmux', (_id, provider) => {
+            owners.push(provider);
+            return { dispose: vi.fn() };
+        });
+        const resolver = {
+            getTmuxCapability: () => ({ available: true, version: '3.4', path: '/usr/bin/tmux' }),
+            getRemotePlatform: () => 'linux',
+            getSSHConnection: () => undefined,
+            getAuthority: () => 'ssh-remote+box',
+        } as unknown as RemoteSSHResolver;
+        const context = { workspaceState: memento(), globalState: memento() } as unknown as vscode.ExtensionContext;
+        const log = { trace: vi.fn(), info: vi.fn() } as unknown as Log;
+        const watchClose = vi.fn();
+        const controller = new TmuxLayerController(attempt => wireTmuxTerminalLayer(context, resolver, registration, log, watchClose, attempt));
+
+        const wiring = controller.resolved();
+        await vi.waitFor(() => expect(updateCalls).toHaveLength(1)); // the write is in flight
+        expect(owners.at(-1)).toBeInstanceOf(TmuxTerminalProvider);
+
+        controller.unwire(); // persistence switched off mid-write
+
+        expect(owners.at(-1)).toBeInstanceOf(FallbackTerminalProvider);
+        expect(terminalSubs).toHaveLength(2);
+        terminalSubs.forEach(sub => expect(sub.dispose).toHaveBeenCalledTimes(1));
+
+        finishWrite();
+        expect(await wiring).toBeUndefined();
+        expect(owners.at(-1)).toBeInstanceOf(FallbackTerminalProvider);
+        expect(watchClose).not.toHaveBeenCalled();
     });
 });
