@@ -1046,6 +1046,24 @@ describe('coexisting with VS Code terminal persistence (the cost of restoring sp
         expect(provider.mappedSlots()).toEqual([0]); // still ours, just already on screen
     });
 
+    // The real argv opens with the tmux client's own flags (`-u`, `-T …`) and, on old
+    // versions, a guarded `terminal-overrides` write ahead of `new-session`. The slot is read
+    // back as the element after the first `-s`, so nothing ahead of it may look like one.
+    it.each(['2.6', '3.0a', '3.4', '3.8', undefined])('recognises a revived terminal carrying the real argv (tmux %s)', async tmuxVersion => {
+        const shellArgs = buildAttachOrCreateArgv(name(0), CWD, undefined, { tmuxVersion, owner: ME, takeOver: true });
+        expect(shellArgs[0]).toBe('-u');
+        const terminal = { creationOptions: { shellArgs }, dispose: vi.fn() } as unknown as import('vscode').Terminal;
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const exec = fakeExec({ list: [row(name(0), true)], existing: [name(0)] });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ state, exec, opened, listTerminals: () => [terminal] });
+
+        await provider.initialize();
+
+        expect(opened).toEqual([]);
+        expect(provider.mappedSlots()).toEqual([0]);
+    });
+
     it('still restores the slots VS Code did not revive', async () => {
         // Partial revive is the normal case: VS Code only persists terminals from ITS last
         // window, so a hand-off (or a slot it dropped) still needs reconcile.
@@ -1529,6 +1547,26 @@ describe('window reload', () => {
         expect(provider.mappedSlots()).toEqual([0, 1]);
     });
 
+    it('never answers a relaunch with a queued slot whose pty reconnected after the plan', async () => {
+        // Slot 0 is held by our own previous pty, so it is queued as a reclaim (-D). That pty
+        // reconnects only once the queue is final; handing slot 0 to the next profile request
+        // would -D-evict the tab that just came back, and slot 1 would lose its split place.
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0), '1': name(1) } });
+        const exec = fakeExec({ list: [owned(name(0), true, ME), row(name(1), false)], existing: [name(0), name(1)] });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ state, exec, opened, reviveGraceMs: 50 });
+
+        const init = provider.initialize();
+        await provider.initialized;
+        provider.handleTerminalOpened(revived(0)); // the pty reconnect, after the plan
+        const relaunched = optionsOf(await provider.provideTerminalProfile());
+        await init;
+
+        expect(targetSession(relaunched)).toBe(name(1));
+        expect(relaunched.shellArgs).not.toContain('-D');
+        expect(opened).toEqual([]);
+    });
+
     it('does not resurrect a terminal the user closed before reloading', async () => {
         // The close killed the session and dropped the mapping, so a reload has nothing to
         // restore for that slot — and must not invent one.
@@ -1623,6 +1661,39 @@ describe('races', () => {
         await flush();
 
         expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(1));
+
+        releaseKill();
+        await flush();
+    });
+
+    it('does not re-open a session the user just closed while its kill is in flight', async () => {
+        // A reconnect (or settings change) re-plans while the kill is still travelling: the
+        // list still shows the session, detached and unmapped, which reads as an orphan to
+        // adopt. Re-opening it brings back the tab the user closed — empty, if `-A` lands
+        // after the kill.
+        let releaseKill!: () => void;
+        const killGate = new Promise<void>(res => { releaseKill = res; });
+        const base = fakeExec({ list: [owned(name(0), false, ME)], existing: [name(0)] });
+        const exec = vi.fn(async (command: string) => {
+            if (command.includes('kill-session')) {
+                await killGate;
+            }
+            return base(command);
+        }) as unknown as ReturnType<typeof fakeExec>;
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ exec, opened });
+
+        const profile = await provider.provideTerminalProfile(); // slot 0
+        const term = {
+            creationOptions: optionsOf(profile),
+            exitStatus: { code: undefined, reason: 3 },
+        } as unknown as import('vscode').Terminal;
+        provider.handleTerminalOpened(term);
+        provider.handleTerminalClosed(term); // kill starts, does not finish
+        await provider.initialize({ awaitRevive: false });
+
+        expect(opened).toEqual([]);
+        expect(provider.mappedSlots()).toEqual([]);
 
         releaseKill();
         await flush();

@@ -587,6 +587,14 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         const counts = { restored: 0, reclaimed: 0, adopted: 0, handedOff: 0, pruned: 0, skipped: 0 };
         const decisions: Array<{ slot: number; action: SlotAction }> = [];
         for (const slot of slots) {
+            if (this.killingSlots.has(slot)) {
+                // The user closed it and its kill is still travelling: the list above can still
+                // show the session, detached and unmapped — an "orphan" that adoption would
+                // re-open, bringing the closed tab back (empty, if `-A` lands after the kill).
+                this.log.trace(`tmux reconcile: slot ${slot} is being killed — skipped`);
+                counts.skipped++;
+                continue;
+            }
             const session = remoteBySlot.get(slot);
             const state: SlotInput = {
                 slot,
@@ -973,6 +981,13 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         // layout VS Code is restoring around it), and a user who really did want a new
         // terminal during those first seconds gets one of their own sessions back, which is
         // what they would have asked for next anyway.
+        //
+        // An entry whose slot came on screen after the plan (a pty VS Code reconnected, seen by
+        // `handleTerminalOpened`) is already served: handing it out again would attach a second
+        // client — with `-D` for a reclaim, evicting the tab that just came back.
+        while (this.pendingRestores.length > 0 && this.openSlots.has(this.pendingRestores[0].slot)) {
+            this.pendingRestores.shift();
+        }
         const pending = this.pendingRestores.shift();
         if (pending) {
             this.openSlots.add(pending.slot);
@@ -1175,10 +1190,11 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         for (const heldSlot of this.terminalSlots.values()) {
             if (heldSlot === slot) {
                 // Logged at info, not trace: this only fires for a terminal that arrived
-                // *without* going through `provideTerminalProfile` (which always allocates a
-                // free slot, so a user's new terminal or split can never collide here). If it
-                // ever fires for something else, the user's log has to say so out loud rather
-                // than silently swallowing a tab they asked for.
+                // *without* going through `provideTerminalProfile` (which only ever hands out a
+                // slot not open in this window — a fresh one, or a queued restore it skips once
+                // that slot is on screen — so a user's new terminal or split can never collide
+                // here). If it ever fires for something else, the user's log has to say so out
+                // loud rather than silently swallowing a tab they asked for.
                 this.log.info(`tmux terminals: slot ${slot} is already on screen — discarding the duplicate tab`);
                 // The close this triggers must not be read as the user closing a terminal,
                 // which would kill a session that is very much still in use.
