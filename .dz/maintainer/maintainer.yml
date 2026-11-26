@@ -48,6 +48,11 @@ review:
 
 release:
   # `none`: there is no release manager. Empty channels: the agent publishes nothing itself.
+  # A maintainer cuts a release by pushing a `v*` tag (publish.yml). Cadence (owner, 2026-11-26):
+  # at most one release a week, judged on a Monday; a merge, a fix or a fix count never cuts one.
+  # The only off-cycle release is a fix for a published first-tier advisory (GHSA, NVD, CISA KEV or
+  # the vendor's own) rated high or critical (CVSS >= 7.0, or KEV-listed) in what the .vsix ships;
+  # not a dev-only, test or docs-tooling dependency. Own hardening with no advisory waits for Monday.
   manager: none
   channels: []
 
@@ -73,10 +78,15 @@ schedules:
 # this long is tagged archive/<branch>/<date> at its last commit, then deleted.
 # false keeps every branch. See /docs/maintainer-yml.
 branches:
-  close_inactive_after_days: 60
+  close_inactive_after_days: 14 # owner, 2026-11-26: two weeks idle, archive-tagged then deleted
 
 # scout: the platform's daily survey of this repo files only what is already BROKEN
 # (red CI, failing tests, a security advisory, a broken build or link), never an
 # improvement idea. `full` lets it file ideas too; `off` stops the survey.
 scout:
   survey: broken_only
+
+# devops: off (owner, 2026-11-26): one PR per advisory was noise. Dependabot security updates
+# (.github/dependabot.yml `*-security` groups, one PR per ecosystem) are the advisory lane.
+devops:
+  watch: off
