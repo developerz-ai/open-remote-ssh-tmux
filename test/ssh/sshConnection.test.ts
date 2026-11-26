@@ -62,8 +62,17 @@ const { fakeClients, Client } = vi.hoisted(() => {
 
         // Models a half-dead link: the channel-open request is sent and never
         // answered, so the tunnel's accepted socket is left waiting forever.
-        forwardOut(): this {
+        forwardOut(...args: unknown[]): this {
             this.forwardOutCalls++;
+            this.channelOpenError?.(args[args.length - 1] as (err?: Error) => void);
+            return this;
+        }
+
+        // Set to make the next channel-open requests fail with an error.
+        channelOpenError: ((callback: (err?: Error) => void) => void) | undefined;
+
+        openssh_forwardOutStreamLocal(_path: string, callback: (err?: Error) => void): this {
+            this.channelOpenError?.(callback);
             return this;
         }
     }
@@ -323,4 +332,42 @@ describe('exec(): a channel error rejects instead of hanging', () => {
 
         await expect(result).rejects.toBe(err);
     });
+});
+
+describe('execPartial(): a channel error rejects instead of hanging', () => {
+    it('rejects with the stream error', async () => {
+        const { conn, client } = await connectedConnection();
+
+        const result = conn.execPartial('true', () => false);
+        await vi.waitFor(() => expect(client.execStreams).toHaveLength(1));
+        const err = new Error('channel broke');
+        client.execStreams[0].emit('error', err);
+
+        await expect(result).rejects.toBe(err);
+    });
+});
+
+// A failed channel open left the accepted local socket open (nothing owned it), so the
+// local client hung until it timed out and the socket leaked.
+describe('addTunnel(): a failed channel open destroys the accepted socket', () => {
+    async function openAndExpectDropped(tunnelConfig: { remotePort?: number; remoteSocketPath?: string }) {
+        const { conn, client } = await connectedConnection();
+        client.channelOpenError = (callback) => callback(new Error('open failed'));
+        const tunnel = await conn.addTunnel({ name: 't', remoteAddr: '127.0.0.1', localPort: 0, ...tunnelConfig });
+        try {
+            const socket = net.connect(tunnel.localPort!, '127.0.0.1');
+            socket.on('error', () => { /* reset by the destroy is expected */ });
+            await new Promise<void>((resolve) => socket.on('close', () => resolve()));
+        } finally {
+            tunnel.server.close();
+        }
+    }
+
+    it('on forwardOut error', async () => {
+        await openAndExpectDropped({ remotePort: 1234 });
+    }, 5000);
+
+    it('on openssh_forwardOutStreamLocal error', async () => {
+        await openAndExpectDropped({ remoteSocketPath: '/tmp/x.sock' });
+    }, 5000);
 });

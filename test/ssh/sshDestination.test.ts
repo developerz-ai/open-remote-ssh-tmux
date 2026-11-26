@@ -163,3 +163,16 @@ describe('SSHDestination.toEncodedString / parseEncoded', () => {
         expect(dest.port).toBeUndefined();
     });
 });
+
+describe('SSHDestination.parse: ports outside 1-65535 are not a destination', () => {
+    it.each(['host:0', 'host:65536', 'host:99999', 'u@host:00', '[::1]:0', '[::1]:70000', 'host:99999999999999999999'])(
+        'yields an empty hostname for %s', (input) => {
+            const dest = SSHDestination.parse(input);
+            expect(dest.hostname).toBe('');
+            expect(dest.port).toBeUndefined();
+        });
+
+    it.each([['host:1', 1], ['host:65535', 65535], ['[::1]:65535', 65535]])('still accepts %s', (input, port) => {
+        expect(SSHDestination.parse(input).port).toBe(port);
+    });
+});
