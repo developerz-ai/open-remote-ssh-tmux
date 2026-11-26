@@ -1,3 +1,8 @@
+# Weekly, grouped, quiet (owner, 2026-11-26): every ecosystem Monday; minor and patch updates as one
+# PR per ecosystem, security updates as one more; a major update arrives on its own. The
+# developerz.ai maintainer's own advisory watch is off, so this file is the dependency-advisory lane.
+# The 14-day cooldown lets a compromised release get caught before it reaches us. Security updates
+# are unaffected.
 version: 2
 updates:
   # Maintain dependencies for GitHub Actions
@@ -5,16 +10,34 @@ updates:
     directory: /
     schedule:
       interval: weekly
+      day: monday
     cooldown:
       default-days: 14
+    open-pull-requests-limit: 3
+    groups:
+      github-actions-minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+      github-actions-security:
+        applies-to: security-updates
+        patterns: ["*"]
 
   # Maintain dependencies for npm
   - package-ecosystem: npm
     directory: /
     schedule:
       interval: weekly
+      day: monday
     cooldown:
       default-days: 14
+    open-pull-requests-limit: 3
+    groups:
+      npm-minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+      npm-security:
+        applies-to: security-updates
+        patterns: ["*"]
 
   # Maintain the base image of the real-tmux test rig (test/rig/Dockerfile and
   # test/rig/edh/remote.Dockerfile pin debian by digest). The pin sits in an ARG
@@ -25,5 +48,14 @@ updates:
       - /test/rig/edh
     schedule:
       interval: weekly
+      day: monday
     cooldown:
       default-days: 14
+    open-pull-requests-limit: 3
+    groups:
+      docker-minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+      docker-security:
+        applies-to: security-updates
+        patterns: ["*"]
