@@ -13,8 +13,8 @@ triage:
   ask_for_repro: true
   required_fields: [steps, expected, actual, version]
   qualify_into: [bug, feature, dupe, question, docs]
-  close_unanswered_repro_after_days: 14
-  stale_after_days: 30
+  close_unanswered_repro_after_days: 60
+  stale_after_days: 60
   stale_action: comment_then_close
   non_goals:
     - "A rewrite of the SSH transport: it stays"
@@ -41,7 +41,7 @@ pr:
   # `own` is the strict side of that until it can (owner decision, 2026-11 hardening sweep).
   auto_merge_scope: own
   require_review: true
-  close_awaiting_author_after_days: 21
+  close_awaiting_author_after_days: 60
 
 review:
   force: true # without this the native review defers to CodeRabbit where CodeRabbit is active
@@ -78,7 +78,7 @@ schedules:
 # this long is tagged archive/<branch>/<date> at its last commit, then deleted.
 # false keeps every branch. See /docs/maintainer-yml.
 branches:
-  close_inactive_after_days: 14 # owner, 2026-11-26: two weeks idle, archive-tagged then deleted
+  close_inactive_after_days: 60 # owner, 2026-11-26: 60 days idle, archive-tagged then deleted
 
 # scout: the platform's daily survey of this repo files only what is already BROKEN
 # (red CI, failing tests, a security advisory, a broken build or link), never an
