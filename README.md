@@ -257,7 +257,7 @@ open-remote-ssh-tmux is maintained by AI: by [developerz.ai](https://developerz.
 
 | What arrives | What happens |
 |---|---|
-| an issue | triaged into bug / feature / dupe / question / docs; asked for steps, expected, actual and version when missing; closed after 14 days without a reproduction |
+| an issue | triaged into bug / feature / dupe / question / docs; asked for steps, expected, actual and version when missing; closed after 60 days without a reproduction |
 | a pull request | reviewed (CodeRabbit and the developerz.ai reviewer), driven to green on `check`, the tmux rig and the package job; the agent merges its own on green, everyone else's waits for a member |
 | Dependabot | driven to green, then waits for a member: runtime deps (`ssh2`, `socks`, `simple-socks`) always get a human review |
 | an outside change to CI or publish automation (`.github/`) | declined: members maintain the pipeline that publishes the extension |
