@@ -56,4 +56,14 @@ describe('escapePowerShellArg', () => {
     it('keeps a newline inert instead of starting a new statement', () => {
         expect(escapePowerShellArg('a\nrm -r C:\\')).toBe(`'a\nrm -r C:\\'`);
     });
+
+    // PowerShell's tokenizer accepts four more characters as a single quote (U+2018,
+    // U+2019, U+201A, U+201B): any of them closes a single-quoted string, and any of
+    // them is escaped by doubling. Left alone, `C:\srv’; calc; ‘` was string, command,
+    // string.
+    for (const quote of ['\u2018', '\u2019', '\u201A', '\u201B']) {
+        it(`doubles the single-quote look-alike U+${quote.charCodeAt(0).toString(16).toUpperCase()}`, () => {
+            expect(escapePowerShellArg(`a${quote}; calc; ${quote}b`)).toBe(`'a${quote}${quote}; calc; ${quote}${quote}b'`);
+        });
+    }
 });

@@ -122,4 +122,29 @@ describe('splitProxyCommand', () => {
             'C:\\with\\', 'space\\nc.exe', '%h',
         ]);
     });
+
+    // OpenSSH hands the ProxyCommand to a shell, where '...' is the usual way to group:
+    // `sh -c 'nc %h %p'` came out as `'nc`, `%h`, `%p'` — a syntax error in the inner sh.
+    it('groups a single-quoted span into one token on POSIX, with no escapes inside', () => {
+        expect(splitProxyCommand('sh -c \'nc %h %p\'', false)).toEqual(['sh', '-c', 'nc %h %p']);
+        expect(splitProxyCommand('sh -c \'a\\b "c"\'', false)).toEqual(['sh', '-c', 'a\\b "c"']);
+    });
+
+    it('keeps a single quote inside double quotes, and a double quote inside single quotes, literal', () => {
+        expect(splitProxyCommand('sh -c "aws --parameters \'portNumber=%p\'"', false)).toEqual(['sh', '-c', 'aws --parameters \'portNumber=%p\'']);
+        expect(splitProxyCommand('a \'x"y\'', false)).toEqual(['a', 'x"y']);
+    });
+
+    it('joins adjacent quoted and unquoted spans into one token, like sh', () => {
+        expect(splitProxyCommand('a b\'c d\'e', false)).toEqual(['a', 'bc de']);
+        expect(splitProxyCommand('a \'\'', false)).toEqual(['a', '']);
+    });
+
+    it('takes a backslash-escaped single quote as a literal quote on POSIX', () => {
+        expect(splitProxyCommand('a it\\\'s', false)).toEqual(['a', 'it\'s']);
+    });
+
+    it('leaves a single quote alone on Windows (cmd.exe does not quote with it)', () => {
+        expect(splitProxyCommand('proxy.exe \'a b\'', true)).toEqual(['proxy.exe', '\'a', 'b\'']);
+    });
 });
