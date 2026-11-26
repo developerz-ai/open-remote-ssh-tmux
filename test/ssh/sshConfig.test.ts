@@ -4,7 +4,7 @@ import * as path from 'path';
 import SSHConfig from 'ssh-config';
 import { afterEach, describe, expect, it } from 'vitest';
 import { configOverrides } from '../mocks/vscode';
-import SSHConfiguration from '../../src/ssh/sshConfig';
+import SSHConfiguration, { includePatterns } from '../../src/ssh/sshConfig';
 
 // Characterisation tests for SSHConfiguration, built directly from a parsed
 // SSHConfig (bypassing loadFromFS's filesystem/glob I/O, which needs its own
@@ -319,5 +319,46 @@ describe('SSHConfiguration#getAllConfiguredHosts', () => {
     it('filters pattern names out of a multi-value Host line while keeping concrete ones', () => {
         const config = new SSHConfiguration(SSHConfig.parse('Host dev *.internal !excluded\n    User shared\n'));
         expect(config.getAllConfiguredHosts()).toEqual(['dev']);
+    });
+});
+
+// ssh-config 5.3 made `Include` a multi-value directive: several words arrive as a list
+// of `{ val, quoted }`, one word as a plain string with its quotes stripped and no flag.
+// Parsed with the real library, so a change of that shape fails here first.
+describe('includePatterns', () => {
+    const valueOf = (line: string) => {
+        const [directive] = SSHConfig.parse(line);
+        if (directive.type !== SSHConfig.DIRECTIVE) {
+            throw new Error('not a directive');
+        }
+        return directive.value;
+    };
+
+    it('takes a single pathname as is', () => {
+        expect(includePatterns(valueOf('Include ~/.ssh/conf.d/*'))).toEqual(['~/.ssh/conf.d/*']);
+    });
+
+    it('splits whitespace-separated pathnames', () => {
+        expect(includePatterns(valueOf('Include a.conf  b.conf'))).toEqual(['a.conf', 'b.conf']);
+    });
+
+    it('still splits on commas, the separator upstream honoured', () => {
+        expect(includePatterns(valueOf('Include a.conf,b.conf'))).toEqual(['a.conf', 'b.conf']);
+        expect(includePatterns(valueOf('Include a.conf, b.conf c.conf'))).toEqual(['a.conf', 'b.conf', 'c.conf']);
+    });
+
+    it('keeps a quoted pathname with spaces whole, alone or in a list', () => {
+        expect(includePatterns(valueOf('Include "my dir/a.conf"'))).toEqual(['my dir/a.conf']);
+        expect(includePatterns(valueOf('Include "my dir/a.conf" b.conf'))).toEqual(['my dir/a.conf', 'b.conf']);
+    });
+
+    it('does not comma-split a pathname known to be quoted', () => {
+        expect(includePatterns(valueOf('Include "a,b.conf" c.conf'))).toEqual(['a,b.conf', 'c.conf']);
+        expect(includePatterns(valueOf('Include "my dir/a,b.conf"'))).toEqual(['my dir/a,b.conf']);
+    });
+
+    it('yields nothing for an empty value', () => {
+        expect(includePatterns('')).toEqual([]);
+        expect(includePatterns([])).toEqual([]);
     });
 });

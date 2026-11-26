@@ -87,6 +87,30 @@ function normalizeSSHConfig(config: SSHConfig) {
     return config;
 }
 
+/**
+ * Fork: the pathname patterns of one `Include` directive.
+ *
+ * OpenSSH's Include takes *whitespace*-separated pathnames, a quoted one being the way
+ * to write a pathname with spaces. ssh-config (5.3+) hands the value over already
+ * split: a list of `{ val, quoted }` words when there are several, a plain string when
+ * there is one — quotes stripped, and for that single word with no flag saying whether
+ * it was quoted. (Before 5.3 the whole value was one string, and reading `Include a b`
+ * as the single pattern "a b" made every host in both files disappear without an error.)
+ *
+ * A comma also separates pathnames here: it was the only separator upstream honoured,
+ * so configs written for it keep working. It is not applied to a word known to be
+ * quoted, nor to a single word containing whitespace (which can only have been quoted).
+ */
+export function includePatterns(value: Directive['value']): string[] {
+    const words = typeof value === 'string'
+        ? [{ val: value, quoted: /\s/.test(value) }]
+        : value;
+    return words
+        .flatMap(({ val, quoted }) => quoted ? [val] : val.split(','))
+        .map(s => s.trim())
+        .filter(s => !!s);
+}
+
 // OpenSSH caps nested Include expansion at 16 levels (sshd's `includedepth`)
 // and errors out beyond that; we mirror the cap but degrade gracefully
 // (stop expanding further) rather than throwing, since a malformed/cyclic
@@ -103,19 +127,8 @@ async function resolveIncludes(config: SSHConfig, includeDir: string, visited: S
     for (let i = 0; i < config.length; i++) {
         const line = config[i];
         if (isIncludeDirective(line)) {
-            // OpenSSH's Include takes *whitespace*-separated pathnames, and
-            // ssh-config doesn't array-split this directive — so `Include a b`
-            // arrives as one string and splitting on ',' alone globbed it as
-            // the single literal pattern "a b", which matched nothing and made
-            // every host in both files disappear without any error. Commas stay
-            // accepted: they were the only separator we used to honour.
-            // A quoted value is left whole, because that's the only way a
-            // pathname containing spaces can still be expressed — ssh-config
-            // strips the quote characters before we see the value and leaves
-            // just a per-line `quoted` flag, so a *mixed* quoted/unquoted list
-            // is unrecoverable (it stays broken, exactly as it is today).
-            const rawValue = line.value as string;
-            const values = (line.quoted ? [rawValue] : rawValue.split(/[\s,]+/)).map(s => s.trim()).filter(s => !!s);
+            // Fork: the pathname list — see includePatterns().
+            const values = includePatterns(line.value);
             const configs: SSHConfig[] = [];
             for (const value of values) {
                 const includePaths = await glob(normalizeToSlash(untildify(value)), {

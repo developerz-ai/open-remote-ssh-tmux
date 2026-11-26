@@ -134,20 +134,20 @@ describe('gatherIdentityFiles', () => {
     // touches the real developer machine's `~/.ssh` — see
     // `identityFiles.defaults.test.ts` for that case.
 
-    async function makeKeyPairWithPub(name: string): Promise<{ keyPath: string; parsedKey: import('ssh2-streams').ParsedKey; fingerprint: string }> {
+    async function makeKeyPairWithPub(name: string): Promise<{ keyPath: string; parsedKey: import('ssh2').ParsedKey; fingerprint: string }> {
         tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'identity-files-test-'));
         const keyPath = path.join(tmpDir, name);
         await execFile('ssh-keygen', ['-t', 'ed25519', '-f', keyPath, '-N', '', '-C', '', '-q']);
         const pub = await fs.promises.readFile(`${keyPath}.pub`);
         const parsedResult = ssh2.utils.parseKey(pub);
-        const parsedKey = (Array.isArray(parsedResult) ? parsedResult[0] : parsedResult) as import('ssh2-streams').ParsedKey;
+        const parsedKey = (Array.isArray(parsedResult) ? parsedResult[0] : parsedResult) as import('ssh2').ParsedKey;
         const crypto = await import('crypto');
         const fingerprint = crypto.createHash('sha256').update(parsedKey.getPublicSSH()).digest('base64');
         return { keyPath, parsedKey, fingerprint };
     }
 
     describe('SSH agent identities', () => {
-        function mockAgent(identities: import('ssh2-streams').ParsedKey[]): void {
+        function mockAgent(identities: import('ssh2').ParsedKey[]): void {
             agentIdentities.current = identities;
         }
 

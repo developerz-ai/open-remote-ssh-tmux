@@ -38,8 +38,7 @@
 		"esModuleInterop": true,
 		"types": [
 			"node",
-			"ssh2",
-			"ssh2-streams"
+			"ssh2"
 		]
 	},
 	"include": [
