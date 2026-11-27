@@ -13,8 +13,8 @@ describe('buildProxyCommandSpawn', () => {
         expect(spawn).toEqual({ command: 'nc', args: ['-X', '5', '-x', 'proxy', 'box', '22'], options: {} });
     });
 
-    it('does not reject metacharacters when no shell is involved', () => {
-        expect(buildProxyCommandSpawn('proxy.exe %h', tokens('a&b'), true).args).toEqual(['a&b']);
+    it('leaves cmd-only metacharacters alone when no cmd.exe is involved', () => {
+        expect(buildProxyCommandSpawn('proxy.exe %h', tokens('a^b'), true).args).toEqual(['a^b']);
     });
 
     it('runs a .bat through cmd with the command quoted', () => {
@@ -26,9 +26,9 @@ describe('buildProxyCommandSpawn', () => {
     });
 
     it('quotes an argument containing a space', () => {
-        const spawn = buildProxyCommandSpawn('proxy.cmd %r', { h: 'box', n: 'box', p: '22', r: 'John Smith' }, true);
+        const spawn = buildProxyCommandSpawn('proxy.cmd "John Smith" %h', tokens('box'), true);
 
-        expect(spawn.args).toEqual(['"John Smith"']);
+        expect(spawn.args).toEqual(['"John Smith"', 'box']);
     });
 
     for (const host of ['a&calc', 'a|calc', 'a^b', 'a%PATH%', 'a"b', 'a>out', 'a<in', 'a!b', 'a(b)', 'a\r\nb']) {
@@ -40,6 +40,120 @@ describe('buildProxyCommandSpawn', () => {
     it('rejects a metacharacter in the user token too', () => {
         expect(() => buildProxyCommandSpawn('proxy.bat %r', { h: 'box', n: 'box', p: '22', r: 'me&calc' }, true))
             .toThrow(ProxyCommandRejectedError);
+    });
+});
+
+// `%h`, `%n` and `%r` come from the remote authority (a link, a workspace file), and a
+// ProxyCommand hands them to another program: `ssh bastion nc %h %p` gives them to the
+// bastion's shell, `sh -c "nc %h %p"` to a local one, and a value starting with `-` is
+// an option of the proxy binary. OpenSSH refuses such names on its command line
+// (`valid_hostname`, `valid_ruser` in ssh.c — CVE-2023-51385); this path only checked
+// `.bat`/`.cmd`. We are deliberately stricter than OpenSSH: `valid_ruser` lets `$`,
+// whitespace and a backslash through, and inside the user's own `sh -c "… %r"` those are
+// shell syntax. Anything a POSIX shell or a glob could interpret is refused.
+describe('buildProxyCommandSpawn — unsafe authority tokens, every platform', () => {
+    const hostile = [
+        '-oProxyCommand=calc', 'x;id', 'x$(id)', 'x`id`', 'a b', 'a\tb', 'a|b', 'a&b', 'a>b', 'a<b', 'a(b)', 'a{b}', 'a\'b', 'a"b', 'a\\b', 'a\nb', 'a\u0001b',
+        'a$b', 'a%b', 'a!b', 'a*b', 'a?b', 'a[b', 'a]b', '~a', 'a#b', '%eth0', 'box%eth0;id', 'fe80::1%eth0;id', 'fe80::1%',
+    ];
+    for (const windows of [false, true]) {
+        for (const host of hostile) {
+            it(`rejects the host ${JSON.stringify(host)} (${windows ? 'windows' : 'posix'})`, () => {
+                expect(() => buildProxyCommandSpawn('ssh bastion nc %h %p', tokens(host), windows)).toThrow(ProxyCommandRejectedError);
+            });
+        }
+    }
+
+    it('rejects an unsafe %n when the command uses %n', () => {
+        expect(() => buildProxyCommandSpawn('nc %n %p', { h: 'box', n: 'x;id', p: '22', r: 'me' }, false)).toThrow(ProxyCommandRejectedError);
+    });
+
+    const hostileUsers = [
+        '-oProxyCommand=calc', 'me;id', 'me`id`', 'me|id', 'me&id', 'me(x)', 'me{x}', 'me\'x', 'me"x', 'me<x', 'me>x', 'me -x', 'me\\', 'me\nx',
+        'me$(id)', 'me$', '$HOME', 'John Smith', 'CORP\\me', 'me%h', 'me!', 'me*', 'me?', 'me[x]', '~me', 'me#x',
+    ];
+    for (const user of hostileUsers) {
+        it(`rejects the user ${JSON.stringify(user)}`, () => {
+            expect(() => buildProxyCommandSpawn('sh -c "ssh -l %r bastion"', { h: 'box', n: 'box', p: '22', r: user }, false)).toThrow(ProxyCommandRejectedError);
+        });
+    }
+
+    it('rejects a port that is not a number', () => {
+        expect(() => buildProxyCommandSpawn('nc %h %p', { h: 'box', n: 'box', p: '22;id', r: 'me' }, false)).toThrow(ProxyCommandRejectedError);
+    });
+
+    it('accepts ordinary names: IPv6 literals and zones, underscores, dots', () => {
+        for (const host of ['box', 'my_box.example.com', '::1', 'fe80::1%eth0', 'fe80::1%en0.100', '10.0.0.1', 'box-1', 'a+b', 'a=b', 'a@b', 'a,b', 'a:b']) {
+            expect(buildProxyCommandSpawn('nc %h %p', tokens(host), false).args).toEqual([host, '22']);
+        }
+        for (const user of ['me', 'first.last', 'me@corp', 'a-b', 'a_b', 'a+b']) {
+            expect(buildProxyCommandSpawn('ssh -l %r b', { h: 'box', n: 'box', p: '22', r: user }, false).args).toEqual(['-l', user, 'b']);
+        }
+    });
+
+    // A value the command never expands reaches nothing, so it must not block the
+    // connect: `O'Brien@box` behind `nc %h %p` is fine.
+    it('does not vet a token the command does not use', () => {
+        const odd = { h: 'box', n: 'x;id', p: '22', r: 'O\'Brien' };
+        expect(buildProxyCommandSpawn('nc %h %p', odd, false).args).toEqual(['box', '22']);
+        expect(buildProxyCommandSpawn('corp-proxy', { h: 'x;id', n: 'x;id', p: 'nope', r: 'a b' }, false)).toEqual({ command: 'corp-proxy', args: [], options: {} });
+    });
+
+    it('does not take a literal %% for a token', () => {
+        expect(buildProxyCommandSpawn('nc %h %p 100%%r', { h: 'box', n: 'box', p: '22', r: 'O\'Brien' }, false).args).toEqual(['box', '22', '100%r']);
+    });
+
+    it('vets a token glued to other text in an argument', () => {
+        expect(() => buildProxyCommandSpawn('ssh -W x:%p b', { h: 'box', n: 'box', p: '22 -oX', r: 'me' }, false)).toThrow(ProxyCommandRejectedError);
+        expect(() => buildProxyCommandSpawn('proxy --as=%r', { h: 'box', n: 'box', p: '22', r: 'a b' }, false)).toThrow(ProxyCommandRejectedError);
+    });
+
+    // The first word is the program that gets run. A token there lets the authority pick
+    // it: the value check allows `/` and `..`, so `/opt/%r/proxy` with the user `../../tmp/x`
+    // ran `/tmp/x/proxy`. Tokens are expanded in arguments only.
+    describe('a token in the program name', () => {
+        const clean = { h: 'box', n: 'box', p: '22', r: 'me' };
+
+        for (const windows of [false, true]) {
+            for (const command of ['/opt/%r/proxy %h', '%h', '%n-proxy %h %p', '/usr/bin/proxy%p', '"C:\\tools\\%h\\proxy.bat" %h', '%r.cmd']) {
+                it(`is refused: ${command} (${windows ? 'windows' : 'posix'})`, () => {
+                    expect(() => buildProxyCommandSpawn(command, clean, windows)).toThrow(ProxyCommandRejectedError);
+                });
+            }
+        }
+
+        it('is refused for an array-shaped ProxyCommand too', () => {
+            expect(() => buildProxyCommandSpawn(['/opt/%h/proxy', '%p'], clean, false)).toThrow(ProxyCommandRejectedError);
+        });
+
+        it('says why, without the value', () => {
+            try {
+                buildProxyCommandSpawn('/opt/%r/proxy', { ...clean, r: 'secret-ish' }, false);
+                expect.unreachable();
+            } catch (e) {
+                expect((e as Error).message).toContain('program');
+                expect((e as Error).message).not.toContain('secret-ish');
+            }
+        });
+
+        it('still allows a literal %% and a token-free program', () => {
+            expect(buildProxyCommandSpawn('/opt/100%%/proxy %h', clean, false)).toEqual({ command: '/opt/100%/proxy', args: ['box'], options: {} });
+        });
+    });
+
+    it('on a .bat/.cmd, applies the cmd.exe check to used tokens only', () => {
+        expect(buildProxyCommandSpawn('proxy.bat %h', { h: 'box', n: 'a&calc', p: '22', r: 'me&calc' }, true).args).toEqual(['box']);
+        expect(() => buildProxyCommandSpawn('proxy.bat %h', tokens('a^b'), true)).toThrow(ProxyCommandRejectedError);
+    });
+
+    it('does not name the refused value in the error (it reaches the log and a dialog)', () => {
+        try {
+            buildProxyCommandSpawn('nc %h %p', tokens('x;secret-ish'), false);
+            expect.unreachable();
+        } catch (e) {
+            expect((e as Error).message).not.toContain('secret-ish');
+            expect((e as Error).message).toContain('%h');
+        }
     });
 });
 

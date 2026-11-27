@@ -170,6 +170,11 @@ export async function installCodeServer(
 
     // Get the version and release
     const serverDownloadUrlTemplateFinal = serverDownloadUrlTemplate || vscodeServerConfig.serverDownloadUrlTemplate || DEFAULT_DOWNLOAD_URL_TEMPLATE;
+    // Fork: a line break never belongs in a URL, and is the one character single quoting does
+    // not neutralise in a templated *comment*; refuse it instead of installing.
+    if (/[\r\n]/.test(serverDownloadUrlTemplateFinal)) {
+        throw new ServerInstallError('remote.SSH.serverDownloadUrlTemplate must not contain a line break');
+    }
     const bestRelease: IRelease = await fetchRelease(serverDownloadUrlTemplateFinal, vscodeServerConfig.version, vscodeServerConfig.release, serverVersion, logger);
 
     const installOptions: ServerInstallOptions = {

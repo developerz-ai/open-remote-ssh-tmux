@@ -294,3 +294,23 @@ describe('getRemoteWorkspaceLocationData', () => {
         expect(getRemoteWorkspaceLocationData()).toBeUndefined();
     });
 });
+
+describe('RemoteLocationHistory: hostnames that collide with Object.prototype members', () => {
+    it.each(['constructor', 'toString', 'hasOwnProperty'])('treats "%s" as an ordinary host', async (host) => {
+        const { context } = fakeContext();
+        const history = new RemoteLocationHistory(context);
+
+        expect(history.getHistory(host)).toEqual([]);
+        await history.addLocation(host, '/a');
+        await history.addLocation(host, '/b');
+
+        expect(history.getHistory(host)).toEqual(['/b', '/a']);
+        expect(history.getHosts()).toEqual([host]);
+    });
+
+    it('keeps a persisted "__proto__" host as a key', () => {
+        const { context } = fakeContext(JSON.parse('{"__proto__":["/a"]}'));
+
+        expect(new RemoteLocationHistory(context).getHosts()).toEqual(['__proto__']);
+    });
+});

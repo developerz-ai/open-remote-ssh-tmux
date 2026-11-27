@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { expandTokens, resolveHopPort, buildKeyboardInteractiveFinish, connectionsToClose } from '../src/authResolver';
+import { describe, expect, it, vi } from 'vitest';
+import { expandTokens, resolveHopPort, resolveHostName, resolveProxyJumpHop, resolveUser, buildKeyboardInteractiveFinish, connectionsToClose } from '../src/authResolver';
 import type SSHConnection from '../src/ssh/sshConnection';
 
 // `expandTokens` replaces OpenSSH-style `%x` config tokens (HostName, ProxyCommand
@@ -32,19 +32,18 @@ describe('expandTokens', () => {
     });
 });
 
-// `resolveHopPort` is the shared port-default for a ProxyJump hop's own connection
-// port and for the next hop's forward-out destination port. Before this fix, the
-// *first* form (`src/authResolver.ts:210`) fell back to the final destination's
-// port (`sshPort`) instead of 22 when neither the hop's ssh_config `Port` nor the
-// port embedded in the ProxyJump destination string was set — inconsistent with
-// `:236`, which already defaulted to 22. Both call sites now share this helper.
+// `resolveHopPort` is the shared port rule for the destination, a ProxyJump hop's own
+// connection and the next hop's forward-out port. A port written in the destination
+// (`host:2201`, the equivalent of `ssh -p`) beats ssh_config `Port`, as in OpenSSH;
+// upstream had it the other way round. With neither, a hop defaults to 22 — never the
+// final destination's port.
 describe('resolveHopPort', () => {
-    it('prefers an explicit ssh_config Port over everything else', () => {
-        expect(resolveHopPort('2200', 2201)).toBe(2200);
+    it('prefers the port written in the destination over ssh_config Port', () => {
+        expect(resolveHopPort('2200', 2201)).toBe(2201);
     });
 
-    it('falls back to the port embedded in the ProxyJump destination when no config Port is set', () => {
-        expect(resolveHopPort(undefined, 2201)).toBe(2201);
+    it('falls back to ssh_config Port when the destination names none', () => {
+        expect(resolveHopPort('2200', undefined)).toBe(2200);
     });
 
     it('defaults to 22 — never the final destination\'s port — when nothing else is set', () => {
@@ -53,6 +52,73 @@ describe('resolveHopPort', () => {
 
     it('accepts an explicit fallback override', () => {
         expect(resolveHopPort(undefined, undefined, 2222)).toBe(2222);
+    });
+});
+
+// `ssh admin@box` logs in as admin whatever `User` the config sets for box; the
+// resolver let the config win, so `admin@box` silently became `deploy@box`. The local
+// user name is the last resort and is only looked up then: `os.userInfo()` throws for a
+// UID with no passwd entry, which must not stop a connect that names its user.
+describe('resolveUser', () => {
+    const local = () => 'local';
+
+    it('prefers the user written in the destination over ssh_config User', () => {
+        expect(resolveUser('admin', 'deploy', local)).toBe('admin');
+    });
+
+    it('falls back to ssh_config User, then to the local user', () => {
+        expect(resolveUser(undefined, 'deploy', local)).toBe('deploy');
+        expect(resolveUser(undefined, undefined, local)).toBe('local');
+        expect(resolveUser('', '', local)).toBe('local');
+    });
+
+    it('does not look the local user up when a user is given', () => {
+        const noPasswdEntry = vi.fn(() => {
+            throw new Error('ENOENT: no such user');
+        });
+
+        expect(resolveUser('admin', undefined, noPasswdEntry)).toBe('admin');
+        expect(resolveUser(undefined, 'deploy', noPasswdEntry)).toBe('deploy');
+        expect(noPasswdEntry).not.toHaveBeenCalled();
+    });
+});
+
+// A ProxyJump hop is its own `ssh` invocation: its user is the `user@` of its ProxyJump
+// entry, else that hop's own config `User`, else the local user — never the login of the
+// final destination, which `admin@box` behind `ProxyJump bastion` used to hand to bastion.
+describe('resolveProxyJumpHop', () => {
+    const local = () => 'local';
+
+    it('takes user, host and port from the ProxyJump entry first', () => {
+        expect(resolveProxyJumpHop({ hostname: 'bastion', user: 'jump', port: 2201 }, { HostName: '%h.corp', User: 'cfg', Port: '2200' }, local))
+            .toEqual({ hostName: 'bastion.corp', user: 'jump', port: 2201 });
+    });
+
+    it('falls back to the hop\'s own config', () => {
+        expect(resolveProxyJumpHop({ hostname: 'bastion' }, { User: 'cfg', Port: '2200' }, local))
+            .toEqual({ hostName: 'bastion', user: 'cfg', port: 2200 });
+    });
+
+    it('falls back to the local user and port 22 — it has no way to see the destination\'s', () => {
+        expect(resolveProxyJumpHop({ hostname: 'bastion' }, {}, local)).toEqual({ hostName: 'bastion', user: 'local', port: 22 });
+        expect(resolveProxyJumpHop.length).toBe(3);
+    });
+});
+
+// `HostName` takes `%h` (and `%%`). The destination expanded it; a ProxyJump hop used
+// the raw value, so a hop under `Host *.corp` / `HostName %h.internal` was dialled as
+// the literal `%h.internal`.
+describe('resolveHostName', () => {
+    it('expands %h to the name the host was asked for', () => {
+        expect(resolveHostName('%h.internal', 'bastion')).toBe('bastion.internal');
+    });
+
+    it('uses the asked-for name when HostName is unset', () => {
+        expect(resolveHostName(undefined, 'bastion')).toBe('bastion');
+    });
+
+    it('keeps %% as a literal %', () => {
+        expect(resolveHostName('a%%b', 'x')).toBe('a%b');
     });
 });
 

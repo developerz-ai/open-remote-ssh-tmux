@@ -207,7 +207,9 @@ duplicate/zombie session). The v1.0.0 F5 acceptance run
 matrix in
 [`09-verify.md`](docs/plans/2026/07/24/101-v1-tmux-release/09-verify.md)) is
 superseded by the hardening sweep's run
-([`101-bulletproof-hardening-sweep/09-verify.md`](docs/plans/2026/11/13/101-bulletproof-hardening-sweep/09-verify.md));
+([`101-bulletproof-hardening-sweep/09-verify.md`](docs/plans/2026/11/13/101-bulletproof-hardening-sweep/09-verify.md)),
+itself superseded row by row by the bug sweep's
+([`results-2026-11-26.md`](docs/plans/2026/11/26/101-bug-sweep/results-2026-11-26.md));
 read the newest results file before trusting a row. Re-run the zombie rows (6-9)
 for any change to the tmux terminal layer.
 

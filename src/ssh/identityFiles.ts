@@ -2,8 +2,8 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import type { ParsedKey } from 'ssh2-streams';
 import * as ssh2 from 'ssh2';
+import type { ParsedKey } from 'ssh2';
 import { untildify, exists as fileExists } from '../common/files';
 import Log from '../common/logger';
 import { withDeadline } from '../common/deadline';
@@ -40,6 +40,15 @@ export interface SSHKey {
     isPrivate?: boolean;
 }
 
+/**
+ * Fork: is this `ssh2.utils.parseKey` result "encrypted, and no passphrase given"? ssh2
+ * words it per key format (new OpenSSH, legacy PEM, PPK); upstream compared against the
+ * first wording only, so the other two formats were never offered a passphrase prompt.
+ */
+export function isPassphraseRequired(parseResult: unknown): boolean {
+    return parseResult instanceof Error && /^Encrypted .* detected, but no passphrase given$/.test(parseResult.message);
+}
+
 // From https://github.com/openssh/openssh-portable/blob/acb2059febaddd71ee06c2ebf63dcf211d9ab9f2/sshconnect2.c#L1689-L1690
 export async function gatherIdentityFiles(identityFiles: string[], sshAgentSock: string | undefined, identitiesOnly: boolean, logger: Log, agentDeadlineMs: number = AGENT_LOOKUP_DEADLINE_MS) {
     identityFiles = identityFiles.map(untildify).map(i => i.replace(/\.pub$/, ''));
@@ -65,7 +74,7 @@ export async function gatherIdentityFiles(identityFiles: string[], sshAgentSock:
             // real error. Keep the entry (flagged `isPrivate`, no parsedKey/
             // fingerprint yet) instead of silently dropping the identity, so the
             // SSH auth handler gets a chance to prompt for the passphrase.
-            if (!usingPublicKey && parsedResult instanceof Error && parsedResult.message === 'Encrypted private OpenSSH key detected, but no passphrase given') {
+            if (!usingPublicKey && isPassphraseRequired(parsedResult)) {
                 return {
                     filename: identityFiles[i],
                     isPrivate: true
@@ -98,7 +107,9 @@ export async function gatherIdentityFiles(identityFiles: string[], sshAgentSock:
                 if (err) {
                     reject(err);
                 } else {
-                    resolve(publicKeys || []);
+                    // Fork: the callback is typed to also carry `{ pubKey }` entries; the
+                    // OpenSSH agent yields parsed keys, and only those are usable here.
+                    resolve((publicKeys || []).filter((key): key is ParsedKey => !('pubKey' in key)));
                 }
             });
         }), agentDeadlineMs, 'ssh-agent identity lookup');

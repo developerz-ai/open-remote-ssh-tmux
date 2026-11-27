@@ -156,7 +156,7 @@ if [[ $OS_RELEASE_ID = alpine ]]; then
   PLATFORM=$OS_RELEASE_ID
 fi
 
-# %%SERVER_DOWNLOAD_URL_TEMPLATE%% is substituted as an already single-quoted
+# The download URL template is substituted as an already single-quoted
 # literal (serverSetup.ts) — unquoted here so that quoting is used as-is
 # instead of being nested inside another pair of double quotes.
 SERVER_DOWNLOAD_URL="$(echo %%SERVER_DOWNLOAD_URL_TEMPLATE%% | sed "s/\${quality}/$DISTRO_QUALITY/g" | sed "s/\${version}/$DISTRO_VERSION/g" | sed "s/\${commit}/$DISTRO_COMMIT/g" | sed "s/\${os}/$PLATFORM/g" | sed "s/\${arch}/$SERVER_ARCH/g" | sed "s/\${release}/$DISTRO_VSCODIUM_RELEASE/g")"

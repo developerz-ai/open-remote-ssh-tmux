@@ -21,7 +21,9 @@ export const MAX_LOCATIONS_PER_HOST = 20;
  * down with it. Normalise once, on read, and never trust the raw shape.
  */
 function normalizeHistory(raw: unknown): Record<string, string[]> {
-    const result: Record<string, string[]> = {};
+    // Fork: null-prototype map — a host named `constructor`/`toString`/`__proto__` must be an
+    // ordinary key, not an `Object.prototype` member.
+    const result: Record<string, string[]> = Object.create(null) as Record<string, string[]>;
     if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
         return result;
     }

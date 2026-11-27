@@ -5,13 +5,13 @@ import * as stream from 'stream';
 import { SocksClient, SocksClientOptions } from 'socks';
 import * as vscode from 'vscode';
 import * as ssh2 from 'ssh2';
-import type { ParsedKey } from 'ssh2-streams';
+import type { ParsedKey } from 'ssh2';
 import Log from './common/logger';
 import SSHDestination from './ssh/sshDestination';
 import SSHConnection, { SSHTunnelConfig } from './ssh/sshConnection';
 import SSHConfiguration from './ssh/sshConfig';
-import { gatherIdentityFiles } from './ssh/identityFiles';
-import { verifyKnownHost, knownHostsFiles, knownHostsLookupName, type HostKeyVerdict } from './ssh/hostfile';
+import { gatherIdentityFiles, isPassphraseRequired } from './ssh/identityFiles';
+import { verifyKnownHost, knownHostsFiles, knownHostsLookupName, readKnownHostKeyTypes, serverHostKeyPreference, type HostKeyVerdict } from './ssh/hostfile';
 import { untildify, exists as fileExists } from './common/files';
 import { findRandomPort } from './common/ports';
 import { disposeAll } from './common/disposable';
@@ -73,6 +73,40 @@ export function isProxyDisabled(value: string | string[] | undefined): boolean {
     return !text || text.toLowerCase() === 'none';
 }
 
+/** Which proxy a host's configuration asks for — see {@link chooseProxy}. */
+export type ProxyChoice =
+    | { kind: 'none' }
+    | { kind: 'jump'; value: string }
+    | { kind: 'command'; value: string | string[] };
+
+/**
+ * Fork: pick between `ProxyJump` and `ProxyCommand` the way OpenSSH does. ssh_config(5):
+ * the two compete, and "whichever is specified first will prevent later instances of
+ * the other from taking effect" — `none` included, so `ProxyJump none` in a host block
+ * also cancels a `ProxyCommand` inherited from `Host *`. Upstream always tried
+ * ProxyJump first, and a `none` there fell through to the ProxyCommand.
+ *
+ * "First" is read off the key order of ssh-config's `compute()` result, which lists
+ * each option where it first saw it (pinned by test/authResolver.chooseProxy.test.ts).
+ * A blank value specifies nothing and is skipped — see {@link isProxyDisabled}.
+ */
+export function chooseProxy(hostConfig: Readonly<Record<string, string | string[] | undefined>>): ProxyChoice {
+    for (const [key, value] of Object.entries(hostConfig)) {
+        if ((key !== 'ProxyJump' && key !== 'ProxyCommand') || value === undefined) {
+            continue;
+        }
+        const text = (Array.isArray(value) ? value.join(' ') : value).trim();
+        if (!text) {
+            continue;
+        }
+        if (isProxyDisabled(value)) {
+            return { kind: 'none' };
+        }
+        return key === 'ProxyJump' ? { kind: 'jump', value: text } : { kind: 'command', value };
+    }
+    return { kind: 'none' };
+}
+
 class TunnelInfo implements vscode.Disposable {
     constructor(
         readonly localPort: number,
@@ -85,6 +119,14 @@ class TunnelInfo implements vscode.Disposable {
         disposeAll(this.disposables);
     }
 }
+
+/**
+ * Fork: the callback ssh2 hands an `authHandler`, as ssh2 really takes it (lib/client.js
+ * `doNextAuth`): besides an auth method, `false` — no methods left, fail the connect —
+ * and `null` — skip this attempt and ask again. @types/ssh2's `NextAuthHandler` declares
+ * neither, hence the one cast where the handlers are passed to ssh2.
+ */
+type NextAuth = (nextAuth: ssh2.AnyAuthMethod | false | null) => void;
 
 interface SSHKey {
     filename: string;
@@ -113,6 +155,8 @@ interface SSHKey {
  * so this approximates what that shell would do, which is platform-dependent:
  * - whitespace separates tokens (outside quotes), on both platforms
  * - double quotes group a single token, on both platforms
+ * - single quotes group a single token on a POSIX client only, with nothing inside
+ *   them an escape (`sh -c 'nc %h %p'`); cmd.exe does not quote with them
  * - a backslash escapes the next character only on a POSIX client (`/bin/sh`),
  *   and even there only `"` and `\` are escapes *inside* double quotes — sh
  *   leaves every other backslash in a quoted span alone.
@@ -146,6 +190,14 @@ export function splitProxyCommand(value: string | string[], windows: boolean = i
         if (!windows && ch === '\\' && i + 1 < value.length && (!quoted || value[i + 1] === '"' || value[i + 1] === '\\')) {
             cur += value[i + 1];
             i += 2;
+            hasToken = true;
+            continue;
+        }
+        // An unterminated `'` is kept as an ordinary character rather than swallowing the rest.
+        const closingQuote = !windows && !quoted && ch === '\'' ? value.indexOf('\'', i + 1) : -1;
+        if (closingQuote !== -1) {
+            cur += value.slice(i + 1, closingQuote);
+            i = closingQuote + 1;
             hasToken = true;
             continue;
         }
@@ -201,16 +253,63 @@ export function expandTokens(template: string, tokens: Record<string, string>): 
 }
 
 /**
- * Resolve an SSH hop's port: an explicit ssh_config `Port` wins, else the
- * port embedded in the ProxyJump destination string, else `fallback` (22).
+ * Resolve an SSH port: the port written in the destination (`host:2201`, a ProxyJump
+ * `host:2201`) wins, else ssh_config `Port`, else `fallback` (22).
  *
- * Shared by the hop's own connection port and the *next* hop's forward-out
- * destination port so both agree — the hop's own port previously fell back
+ * Fork: upstream let ssh_config `Port` beat the destination's own port. OpenSSH does
+ * the opposite — a port given on the command line (`-p`, `ssh://host:port`, a
+ * ProxyJump spec) is never overridden by the config — so `box:2201` now means 2201.
+ *
+ * Shared by the destination, a hop's own connection port and the *next* hop's
+ * forward-out destination port so all agree — the hop's own port previously fell back
  * to the final destination's port (`sshPort`) instead of 22, which is wrong
  * whenever the final host listens on a non-standard port.
  */
 export function resolveHopPort(configuredPort: string | undefined, jumpPort: number | undefined, fallback = 22): number {
-    return configuredPort ? parseInt(configuredPort, 10) : (jumpPort || fallback);
+    return jumpPort || (configuredPort ? parseInt(configuredPort, 10) : fallback);
+}
+
+/**
+ * Fork: the login user — the one written in the destination (`admin@box`, the
+ * equivalent of `ssh admin@box` / `-l`), else ssh_config `User`, else the local user.
+ * Upstream let the config win, so `admin@box` logged in as the config's user; OpenSSH
+ * never lets the config override a user given on the command line.
+ *
+ * `localUser` is a function so it is only looked up as the last resort:
+ * `os.userInfo()` throws for a UID with no passwd entry (containers), which must not
+ * stop a connect that names its user.
+ */
+export function resolveUser(destinationUser: string | undefined, configuredUser: string | undefined, localUser: () => string): string {
+    return destinationUser || configuredUser || localUser();
+}
+
+/**
+ * The name to dial for `alias`: ssh_config `HostName` with `%h` (and `%%`) expanded,
+ * else the alias itself. Fork: one rule for the destination and every ProxyJump hop —
+ * upstream expanded `%h` for the destination only, so a hop was dialled as a literal
+ * `%h.internal`.
+ */
+export function resolveHostName(configuredHostName: string | undefined, alias: string): string {
+    return configuredHostName ? expandTokens(configuredHostName, { h: alias }) : alias;
+}
+
+/**
+ * Fork: who and where a ProxyJump hop is. A hop is its own `ssh` invocation, so each
+ * part comes from its ProxyJump entry (`user@host:port`), else from *that hop's* config,
+ * else the default — the local user, port 22. The destination's login is deliberately
+ * not a parameter: upstream fell back to it, and `admin@box` behind `ProxyJump bastion`
+ * tried to log in to bastion as admin.
+ */
+export function resolveProxyJumpHop(
+    hop: { hostname: string; user?: string; port?: number },
+    hopConfig: { HostName?: string; User?: string; Port?: string },
+    localUser: () => string
+): { hostName: string; user: string; port: number } {
+    return {
+        hostName: resolveHostName(hopConfig.HostName, hop.hostname),
+        user: resolveUser(hop.user, hopConfig.User, localUser),
+        port: resolveHopPort(hopConfig.Port, hop.port),
+    };
 }
 
 /**
@@ -350,13 +449,73 @@ export class ProxyCommandRejectedError extends Error {
     }
 }
 
+/**
+ * Fork: ssh2 connect config that asks a server first for the host-key types already on
+ * file for it (`knownKeyTypes`, known_hosts field 2) — see `serverHostKeyPreference`.
+ * It only reorders ssh2's default offer (take the preferred names out, put them back in
+ * front); the RegExp form of `prepend` adds nothing ssh2 does not support, where a
+ * plain name would throw. Empty when nothing is on file: ssh2 keeps its own order.
+ */
+export function hostKeyAlgorithms(knownKeyTypes: readonly string[]): Pick<ssh2.ConnectConfig, 'algorithms'> {
+    const preferred = serverHostKeyPreference(knownKeyTypes);
+    if (!preferred.length) {
+        return {};
+    }
+    const serverHostKey = {
+        remove: preferred,
+        prepend: preferred.map((name) => new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`)),
+    };
+    // ssh2 accepts a RegExp in these lists (lib/utils.js `generateAlgorithmList`); its
+    // typings declare algorithm names only, and require an `append` we have no use for.
+    return { algorithms: { serverHostKey: serverHostKey as unknown as ssh2.AlgorithmList<ssh2.ServerHostKeyAlgorithm> } };
+}
+
+// What a `%h`/`%n`/`%r` value expanded into a ProxyCommand may not contain. It starts
+// from OpenSSH's own checks on a host or user name given on the command line (ssh.c
+// `valid_hostname` / `valid_ruser`, CVE-2023-51385): no leading `-` (an option of the
+// proxy program), no quote, no `;&<>|(){}`, no control character. It is deliberately
+// stricter than OpenSSH from there: `valid_ruser` lets `$`, whitespace and `\` through,
+// and the value may land inside the user's own `sh -c "… %r"` or a remote shell
+// (`ssh bastion nc %h %p`). So anything a POSIX shell or a glob could interpret is
+// refused for both: `$`, `\`, whitespace, `%`, `!`, `*`, `?`, `[`, `]`, `~`, `#`.
+const UNSAFE_TOKEN_VALUE = /^-|['`"$\\;&<>|(){}\s%!*?[\]~#]|\p{Cc}/u;
+// The one `%` a host name may carry: the zone of a link-local IPv6 literal (`fe80::1%eth0`).
+const IPV6_ZONE = /^([0-9a-f.]*:[0-9a-f:.]*)%[A-Za-z0-9_.-]+$/i;
+
+/**
+ * The characters that follow a `%` in a ProxyCommand's words — i.e. the tokens it really
+ * expands. Scanned as {@link expandTokens} does, so `%%r` is a literal `%r`, not a use.
+ */
+function usedTokens(templates: readonly string[]): Set<string> {
+    const used = new Set<string>();
+    for (const template of templates) {
+        for (let i = 0; i < template.length - 1; i++) {
+            if (template[i] === '%') {
+                used.add(template[++i]);
+            }
+        }
+    }
+    return used;
+}
+
 // cmd.exe metacharacters (plus line breaks): inside a `%x` token they would be
 // command syntax, not text — see buildProxyCommandSpawn().
 const CMD_METACHARACTERS = /[&|<>^%"!()\r\n]/;
 
 /**
  * How to spawn a ProxyCommand: argv split ({@link splitProxyCommand}), `%h %n %p %r`
- * expanded ({@link expandTokens}). A Windows `.bat`/`.cmd` must run through cmd.exe
+ * expanded ({@link expandTokens}).
+ *
+ * `%h`, `%n` and `%r` come from the remote authority — a link, a workspace file — and
+ * the command passes them on: `ssh bastion nc %h %p` to the bastion's shell,
+ * `sh -c "nc %h %p"` to a local one. So on every platform a value that a shell could
+ * interpret is refused before anything is spawned (`UNSAFE_TOKEN_VALUE` — stricter than
+ * OpenSSH on purpose), and `%p` must be a number. Only the tokens the command really
+ * uses are vetted: a value that is never expanded reaches nothing, and must not stop
+ * `O'Brien@box` from connecting through `nc %h %p`. The error names the token, never
+ * the value. A token in the first word — the program — is refused whatever its value.
+ *
+ * A Windows `.bat`/`.cmd` must run through cmd.exe
  * (`shell: true`, verbatim args), where a token value from the remote authority — a
  * link, a workspace file — containing `&`, `|`, `%`, `"`, … would be command syntax
  * (`ssh-remote+x&calc` ran `calc`). Such a value is refused before it reaches cmd.
@@ -370,12 +529,30 @@ export function buildProxyCommandSpawn(
     tokens: { h: string; n: string; p: string; r: string },
     windows: boolean = isWindows
 ): { command: string; args: string[]; options: cp.SpawnOptionsWithoutStdio } {
-    let args = splitProxyCommand(value, windows).map((arg) => expandTokens(arg, tokens));
+    const words = splitProxyCommand(value, windows);
+    // The first word is the program to run, and the value checks below allow `/` and
+    // `..`: a token there would let the authority choose what is launched.
+    if (['h', 'n', 'r', 'p'].some((token) => usedTokens(words.slice(0, 1)).has(token))) {
+        throw new ProxyCommandRejectedError('Refusing to run the ProxyCommand: its program name contains a % token; tokens are only expanded in arguments');
+    }
+    const used = usedTokens(words);
+    const isUnsafe: Record<'h' | 'n' | 'r' | 'p', (tokenValue: string) => boolean> = {
+        h: (host) => UNSAFE_TOKEN_VALUE.test(host.replace(IPV6_ZONE, '$1')),
+        n: (host) => UNSAFE_TOKEN_VALUE.test(host.replace(IPV6_ZONE, '$1')),
+        r: (user) => UNSAFE_TOKEN_VALUE.test(user),
+        p: (port) => !/^\d+$/.test(port),
+    };
+    for (const token of ['h', 'n', 'r', 'p'] as const) {
+        if (used.has(token) && isUnsafe[token](tokens[token])) {
+            throw new ProxyCommandRejectedError(`Refusing to run the ProxyCommand: the %${token} value is not a safe ${token === 'r' ? 'user name' : token === 'p' ? 'port' : 'host name'}`);
+        }
+    }
+    let args = words.map((arg) => expandTokens(arg, tokens));
     let command = args.shift()!;
     let options: cp.SpawnOptionsWithoutStdio = {};
     if (windows && /\.(bat|cmd)$/.test(command)) {
         for (const [token, tokenValue] of Object.entries(tokens)) {
-            if (CMD_METACHARACTERS.test(tokenValue)) {
+            if (used.has(token) && CMD_METACHARACTERS.test(tokenValue)) {
                 throw new ProxyCommandRejectedError(`Refusing to run a .bat/.cmd ProxyCommand: the %${token} value contains a cmd.exe metacharacter`);
             }
         }
@@ -643,11 +820,14 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                 // Every attempt starts from a clean slate — see teardownPreviousAttempt().
                 this.teardownPreviousAttempt();
 
-                const sshconfig = await SSHConfiguration.loadFromFS();
+                // Fork: Include problems (a legacy comma-separated list) go to the log.
+                const sshconfig = await SSHConfiguration.loadFromFS(undefined, (message) => this.logger.info(`SSH config: ${message}`));
                 const sshHostConfig = sshconfig.getHostConfiguration(sshDest.hostname);
-                const sshHostName = sshHostConfig['HostName'] ? expandTokens(sshHostConfig['HostName'], { h: sshDest.hostname }) : sshDest.hostname;
-                const sshUser = sshHostConfig['User'] || sshDest.user || os.userInfo().username || ''; // https://github.com/openssh/openssh-portable/blob/5ec5504f1d328d5bfa64280cd617c3efec4f78f3/sshconnect.c#L1561-L1562
-                const sshPort = sshHostConfig['Port'] ? parseInt(sshHostConfig['Port'], 10) : (sshDest.port || 22);
+                const sshHostName = resolveHostName(sshHostConfig['HostName'], sshDest.hostname);
+                // Fork: a user/port written in the destination beats ssh_config, as in OpenSSH — see resolveUser(), resolveHopPort().
+                const localUser = () => os.userInfo().username || '';
+                const sshUser = resolveUser(sshDest.user, sshHostConfig['User'], localUser); // https://github.com/openssh/openssh-portable/blob/5ec5504f1d328d5bfa64280cd617c3efec4f78f3/sshconnect.c#L1561-L1562
+                const sshPort = resolveHopPort(sshHostConfig['Port'], sshDest.port);
 
                 this.sshAgentSock = sshHostConfig['IdentityAgent'] || process.env['SSH_AUTH_SOCK'] || (isWindows ? '\\\\.\\pipe\\openssh-ssh-agent' : undefined);
                 this.sshAgentSock = this.sshAgentSock ? untildify(this.sshAgentSock) : undefined;
@@ -662,9 +842,11 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
 
                 // Create proxy jump connections if any. `none` cancels an inherited
                 // proxy and must not be treated as a host/command — see isProxyDisabled().
+                // Fork: whichever of ProxyJump/ProxyCommand comes first wins — see chooseProxy().
                 let proxyStream: ssh2.ClientChannel | stream.Duplex | undefined;
-                if (!isProxyDisabled(sshHostConfig['ProxyJump'])) {
-                    const proxyJumps = sshHostConfig['ProxyJump'].split(',').filter(i => !!i.trim())
+                const proxyChoice = chooseProxy(sshHostConfig);
+                if (proxyChoice.kind === 'jump') {
+                    const proxyJumps = proxyChoice.value.split(',').filter(i => !!i.trim())
                         .map(i => {
                             const proxy = SSHDestination.parse(i);
                             const proxyHostConfig = sshconfig.getHostConfiguration(proxy.hostname);
@@ -672,9 +854,8 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                         });
                     for (let i = 0; i < proxyJumps.length; i++) {
                         const [proxy, proxyHostConfig] = proxyJumps[i];
-                        const proxyHostName = proxyHostConfig['HostName'] || proxy.hostname;
-                        const proxyUser = proxyHostConfig['User'] || proxy.user || sshUser;
-                        const proxyPort = resolveHopPort(proxyHostConfig['Port'], proxy.port);
+                        // Fork: the hop's own user/host/port, never the destination's login — see resolveProxyJumpHop().
+                        const { hostName: proxyHostName, user: proxyUser, port: proxyPort } = resolveProxyJumpHop(proxy, proxyHostConfig, localUser);
 
                         const proxyAgentForward = enableAgentForwarding && (proxyHostConfig['ForwardAgent'] || 'no').toLowerCase() === 'yes';
                         const proxyAgent = proxyAgentForward && this.sshAgentSock ? new ssh2.OpenSSHAgent(this.sshAgentSock) : undefined;
@@ -693,23 +874,25 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                             // Fork: notice a half-dead hop instead of waiting on it forever.
                             ...keepaliveConfig(proxyHostConfig['ServerAliveInterval'], proxyHostConfig['ServerAliveCountMax']),
                             strictVendor: false,
+                            // Fork: ask for the host-key types already in known_hosts first.
+                            ...await this.preferredHostKeyAlgorithms(proxyHostName, proxyPort, proxyHostConfig),
                             agentForward: proxyAgentForward,
                             agent: proxyAgent,
                             hostVerifier: this.buildHostVerifier(proxyHostName, proxyPort, proxyHostConfig),
-                            authHandler: (arg0, arg1, arg2) => (proxyAuthHandler(arg0, arg1, arg2), undefined)
+                            authHandler: (arg0, arg1, arg2) => (proxyAuthHandler(arg0, arg1, arg2 as NextAuth), undefined)
                         });
                         this.proxyConnections.push(proxyConnection);
 
                         const nextProxyJump = i < proxyJumps.length - 1 ? proxyJumps[i + 1] : undefined;
-                        const destIP = nextProxyJump ? (nextProxyJump[1]['HostName'] || nextProxyJump[0].hostname) : sshHostName;
+                        const destIP = nextProxyJump ? resolveHostName(nextProxyJump[1]['HostName'], nextProxyJump[0].hostname) : sshHostName;
                         const destPort = nextProxyJump ? resolveHopPort(nextProxyJump[1]['Port'], nextProxyJump[0].port) : sshPort;
                         // Fork: bounded — an unanswered channel open on a dead hop hung the connect.
                         proxyStream = await openProxyJumpStream(proxyConnection, destIP, destPort, connectTimeout * 1000);
                     }
-                } else if (!isProxyDisabled(sshHostConfig['ProxyCommand'] as unknown as string | string[] | undefined)) {
-                    // Fork: argv construction extracted (cmd.exe injection guard) — see buildProxyCommandSpawn().
+                } else if (proxyChoice.kind === 'command') {
+                    // Fork: argv construction extracted (unsafe-token and cmd.exe injection guards) — see buildProxyCommandSpawn().
                     const { command: proxyCommand, args: proxyArgs, options } = buildProxyCommandSpawn(
-                        sshHostConfig['ProxyCommand'] as unknown as string | string[],
+                        proxyChoice.value,
                         { h: sshHostName, n: sshDest.hostname, p: sshPort.toString(), r: sshUser });
 
                     this.logger.trace(`Spawning ProxyCommand: ${redactedProxyCommandLine(proxyCommand, proxyArgs)}`);
@@ -750,10 +933,12 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                     // Fork: notice a half-dead link instead of waiting on it forever.
                     ...keepaliveConfig(sshHostConfig['ServerAliveInterval'], sshHostConfig['ServerAliveCountMax']),
                     strictVendor: false,
+                    // Fork: ask for the host-key types already in known_hosts first.
+                    ...await this.preferredHostKeyAlgorithms(sshHostName, sshPort, sshHostConfig),
                     agentForward,
                     agent,
                     hostVerifier: this.buildHostVerifier(sshHostName, sshPort, sshHostConfig),
-                    authHandler: (arg0, arg1, arg2) => (sshAuthHandler(arg0, arg1, arg2), undefined),
+                    authHandler: (arg0, arg1, arg2) => (sshAuthHandler(arg0, arg1, arg2 as NextAuth), undefined),
                 });
                 await this.sshConnection.connect();
 
@@ -965,15 +1150,13 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
         port: number,
         // Fork: the known-hosts files and HostKeyAlias OpenSSH would use for this host.
         hostConfig: { UserKnownHostsFile?: string | string[]; GlobalKnownHostsFile?: string | string[]; HostKeyAlias?: string }
-    ): NonNullable<ssh2.ConnectConfig['hostVerifier']> {
+    ): ssh2.HostVerifier {
         const identity = knownHostsLookupName(host, port, hostConfig.HostKeyAlias);
         const files = knownHostsFiles(hostConfig.UserKnownHostsFile, hostConfig.GlobalKnownHostsFile);
-        return (keyHash, callback) => {
-            // We never set `hostHash`, so ssh2 hands us the raw wire-format host-key
-            // Buffer here even though @types/ssh2 declares the parameter `string`.
-            // known_hosts stores that blob base64-encoded, which is what
-            // verifyKnownHost compares against.
-            const key = keyHash as unknown as Buffer;
+        // We never set `hostHash`, so ssh2 hands us the raw wire-format host-key Buffer.
+        // known_hosts stores that blob base64-encoded, which is what verifyKnownHost
+        // compares against.
+        return (key, callback) => {
             void verifyKnownHost({
                 host: identity,
                 key,
@@ -1000,6 +1183,20 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
     }
 
     /**
+     * Fork: the host-key algorithm order for a target, from the key types its
+     * known-hosts files (the same ones {@link buildHostVerifier} reads) hold for it.
+     */
+    private async preferredHostKeyAlgorithms(
+        host: string,
+        port: number,
+        hostConfig: { UserKnownHostsFile?: string | string[]; GlobalKnownHostsFile?: string | string[]; HostKeyAlias?: string }
+    ): Promise<Pick<ssh2.ConnectConfig, 'algorithms'>> {
+        const identity = knownHostsLookupName(host, port, hostConfig.HostKeyAlias);
+        const files = knownHostsFiles(hostConfig.UserKnownHostsFile, hostConfig.GlobalKnownHostsFile);
+        return hostKeyAlgorithms(await readKnownHostKeyTypes(identity, files));
+    }
+
+    /**
      * First-connect consent prompt for an unknown host key (OpenSSH-style wording,
      * fingerprint shown). Cancelling or dismissing the modal rejects the key.
      */
@@ -1017,7 +1214,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
         let passwordRetryCount = PASSWORD_RETRY_COUNT;
         let keyboardRetryCount = PASSWORD_RETRY_COUNT;
         identityKeys = identityKeys.slice();
-        return async (methodsLeft: string[] | null, _partialSuccess: boolean | null, callback: (nextAuth: ssh2.AuthHandlerResult) => void) => {
+        return async (methodsLeft: string[] | null, _partialSuccess: boolean | null, callback: NextAuth) => {
             // ssh2 invokes this handler without awaiting it (it's a plain
             // callback-style API), so a throw/rejection anywhere below (e.g. the
             // identity file is deleted between the fileExists check and readFile,
@@ -1047,7 +1244,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                             username: sshUser,
                             agent: new class extends ssh2.OpenSSHAgent {
                                 // Only return the current key
-                                override getIdentities(callback: (err: Error | undefined, publicKeys?: ParsedKey[]) => void): void {
+                                override getIdentities(callback: ssh2.IdentityCallback<ParsedKey>): void {
                                     // Invariant: agentSupport is only ever set alongside a resolved parsedKey (see identityFiles.ts).
                                     callback(undefined, [identityKey.parsedKey!]);
                                 }
@@ -1063,13 +1260,13 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                     }
                     if (!await fileExists(identityKey.filename)) {
                         // Try next identity file
-                        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                        return callback(null as any);
+                        return callback(null);
                     }
 
                     const keyBuffer = await fs.promises.readFile(identityKey.filename);
                     let result = ssh2.utils.parseKey(keyBuffer); // First try without passphrase
-                    if (result instanceof Error && result.message === 'Encrypted private OpenSSH key detected, but no passphrase given') {
+                    // Fork: every encrypted format (OpenSSH, legacy PEM, PPK) — see isPassphraseRequired().
+                    if (isPassphraseRequired(result)) {
                         let passphraseRetryCount = PASSPHRASE_RETRY_COUNT;
                         while (result instanceof Error && passphraseRetryCount > 0) {
                             const passphrase = await vscode.window.showInputBox({
@@ -1086,8 +1283,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                     }
                     if (!result || result instanceof Error) {
                         // Try next identity file
-                        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                        return callback(null as any);
+                        return callback(null);
                     }
 
                     const key = Array.isArray(result) ? result[0] : result;

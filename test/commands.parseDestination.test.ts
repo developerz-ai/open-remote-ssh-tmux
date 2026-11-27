@@ -57,4 +57,11 @@ describe('promptOpenRemoteSSHWindow', () => {
 
         expect(executedCommands.map(({ args }) => (args[0] as { reuseWindow: boolean }).reuseWindow)).toEqual([true, false]);
     });
+
+    it.each(['dev.example.com:0', 'dev.example.com:99999', '[::1]:70000'])('rejects the out-of-range port in %s', async (typed) => {
+        await promptOpenRemoteSSHWindow(false, answer(typed));
+
+        expect(executedCommands).toHaveLength(0);
+        expect(shownMessages.error).toHaveLength(1);
+    });
 });

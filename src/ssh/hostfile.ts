@@ -33,6 +33,8 @@ interface KnownHostsRecord {
     marker: KnownHostsMarker | undefined;
     /** The host field: one hashed token or a comma-separated pattern list. */
     hostsField: string;
+    /** The key type (field 2, e.g. `ssh-ed25519`), or `''` when the record carries none. */
+    keyType: string;
     /** The base64 key blob (field 3), or `''` when the record carries none. */
     key: string;
 }
@@ -64,30 +66,111 @@ function parseKnownHostsLine(line: string): KnownHostsRecord | undefined {
         return undefined;
     }
 
-    return { marker, hostsField: fields[0], key: fields.length > 2 ? fields[2] : '' };
+    return { marker, hostsField: fields[0], keyType: fields[1] ?? '', key: fields.length > 2 ? fields[2] : '' };
+}
+
+/**
+ * Lower-case the ASCII letters only — what OpenSSH's `lowercase()` / `tolower` on bytes
+ * do to a host name and a pattern. `String#toLowerCase` also folds non-ASCII letters,
+ * which would match (and hash) names differently from `ssh`.
+ */
+function asciiLowerCase(value: string): string {
+    return value.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+}
+
+const STAR = 0x2a;
+const QUESTION_MARK = 0x3f;
+
+/**
+ * OpenSSH's `match_pattern`: `*` matches any run of bytes (including none), `?` exactly
+ * one byte, everything else itself. Both sides are UTF-8 bytes, as in OpenSSH — on
+ * UTF-16 code units `?` would cover a whole `é` here and half of it in `ssh`, and a
+ * `??` revocation `ssh` honours would be missed. Only the *pattern's* `*` and `?` are
+ * special: `text` is a name (a HostKeyAlias may hold any character), so the pattern's
+ * `*` is tried before literal equality — otherwise a `*` in the name consumed it as a
+ * literal.
+ *
+ * The standard iterative matcher with a single backtrack point (the last `*` and where
+ * in `text` it resumed), O(text × pattern) at worst — not a RegExp and not recursive,
+ * so a hostile known_hosts line can neither inject regex syntax nor stall the connect.
+ */
+function matchPattern(text: Buffer, pattern: Buffer): boolean {
+    let t = 0;
+    let p = 0;
+    let star = -1;
+    let resume = 0;
+    while (t < text.length) {
+        if (p < pattern.length && pattern[p] === STAR) {
+            star = p++;
+            resume = t;
+        } else if (p < pattern.length && (pattern[p] === QUESTION_MARK || pattern[p] === text[t])) {
+            t++;
+            p++;
+        } else if (star !== -1) {
+            p = star + 1;
+            t = ++resume;
+        } else {
+            return false;
+        }
+    }
+    while (p < pattern.length && pattern[p] === STAR) {
+        p++;
+    }
+    return p === pattern.length;
+}
+
+/**
+ * OpenSSH's `match_pattern_list` as `match_hostname` uses it: `host` (already
+ * lower-cased) must match at least one pattern of the comma-separated list, compared
+ * case-insensitively (ASCII), and a matching `!pattern` vetoes the whole line wherever
+ * it sits.
+ */
+function matchPatternList(host: string, patternList: string): boolean {
+    const hostBytes = Buffer.from(host, 'utf8');
+    let matched = false;
+    for (const entry of patternList.split(',')) {
+        const negated = entry.startsWith('!');
+        const pattern = asciiLowerCase(negated ? entry.substring(1) : entry);
+        if (!pattern || !matchPattern(hostBytes, Buffer.from(pattern, 'utf8'))) {
+            continue;
+        }
+        if (negated) {
+            return false;
+        }
+        matched = true;
+    }
+    return matched;
 }
 
 /**
  * Does a known_hosts host field (the first whitespace-delimited token) name
  * `host`? The field is either a single hashed `|1|salt|hash` token, or a
- * comma-separated list of plaintext patterns (`host`, `host,alias`, and the
- * `[host]:port` form OpenSSH uses for non-default ports). Sole owner of the
- * host-matching rule so `checkNewHostInHostkeys` and `verifyHostKey` agree.
+ * comma-separated list of plaintext patterns (`host`, `host,alias`, `*.example.com`,
+ * `!host`, and the `[host]:port` form OpenSSH uses for non-default ports). Sole owner
+ * of the host-matching rule so `checkNewHostInHostkeys` and `verifyHostKey` agree.
+ *
+ * OpenSSH lower-cases the host name before it matches or records it, so `host` is
+ * lower-cased here: a record `ssh` wrote for `mybox` must be found for `MyBox`, or a
+ * changed key reads as a first connect.
  */
 function hostFieldMatches(hostsField: string, host: string): boolean {
+    const lowerHost = asciiLowerCase(host);
     if (hostsField.startsWith(HASH_MAGIC)) {
         const [salt_, hostHash_] = hostsField.substring(HASH_MAGIC.length).split(HASH_DELIM);
         if (!salt_ || !hostHash_) {
             return false;
         }
-        const hostHash = crypto.createHmac('sha1', Buffer.from(salt_, 'base64')).update(host).digest();
-        return hostHash.toString('base64') === hostHash_;
+        const salt = Buffer.from(salt_, 'base64');
+        // The verbatim spelling too: before this lower-casing, a mixed-case name was
+        // hashed as written, and those records must keep guarding their host.
+        const candidates = lowerHost === host ? [lowerHost] : [lowerHost, host];
+        return candidates.some((name) => crypto.createHmac('sha1', salt).update(name).digest().toString('base64') === hostHash_);
     }
 
     // Upstream only ever matched hashed lines, so OpenSSH's default plaintext and
     // `[host]:port` records were reported "new" on every connect (→ a duplicate
     // append each time). Match those plaintext forms here too.
-    return hostsField.split(',').includes(host);
+    return matchPatternList(lowerHost, hostsField);
 }
 
 export async function checkNewHostInHostkeys(host: string, knownHostsFile: string = KNOW_HOST_FILE): Promise<boolean> {
@@ -189,6 +272,45 @@ export function verifyHostKey(host: string, key: Buffer, knownHostsContent: stri
 }
 
 /**
+ * The key types (known_hosts field 2) on file for `host`, in file order, each once.
+ * Marker lines hold no host key and keyless lines are malformed; both are skipped, as
+ * in {@link verifyHostKey}.
+ */
+export function knownHostKeyTypes(host: string, knownHostsContent: string): string[] {
+    const types = new Set<string>();
+    for (const line of knownHostsContent.split(/\r?\n/)) {
+        const record = parseKnownHostsLine(line);
+        if (record && !record.marker && record.key && record.keyType && hostFieldMatches(record.hostsField, host)) {
+            types.add(record.keyType);
+        }
+    }
+    return [...types];
+}
+
+// ssh2's default host-key algorithms, in its order of preference, grouped by the
+// known_hosts key type each one verifies (an `ssh-rsa` key signs with any of three).
+const HOST_KEY_ALGORITHMS: ReadonlyArray<readonly [keyType: string, algorithms: readonly string[]]> = [
+    ['ssh-ed25519', ['ssh-ed25519']],
+    ['ecdsa-sha2-nistp256', ['ecdsa-sha2-nistp256']],
+    ['ecdsa-sha2-nistp384', ['ecdsa-sha2-nistp384']],
+    ['ecdsa-sha2-nistp521', ['ecdsa-sha2-nistp521']],
+    ['ssh-rsa', ['rsa-sha2-512', 'rsa-sha2-256', 'ssh-rsa']],
+];
+
+/**
+ * The host-key algorithms to ask a server for first, given the key types on file for
+ * it — what OpenSSH does (`order_hostkeyalgs`). Without it ssh2 negotiates ed25519
+ * whenever the server has one, and a host on file with only its RSA or ECDSA key
+ * presents a key we have never seen: a `'mismatch'` refusal for a host that is fine.
+ *
+ * Only names from ssh2's default list are returned, in ssh2's order, so the caller can
+ * reorder its offer but never widen it (`ssh-dss`, an `sk-` key type: ignored).
+ */
+export function serverHostKeyPreference(knownKeyTypes: readonly string[]): string[] {
+    return HOST_KEY_ALGORITHMS.filter(([keyType]) => knownKeyTypes.includes(keyType)).flatMap(([, algorithms]) => algorithms);
+}
+
+/**
  * The known_hosts host identity for a target: the bare hostname on the default
  * SSH port, or OpenSSH's `[host]:port` form otherwise. Every known_hosts
  * lookup/record for a host must use this same string so match and append agree.
@@ -199,7 +321,9 @@ export function hostKeyIdentity(host: string, port: number): string {
 
 /**
  * The name a host's key is looked up and recorded under: `HostKeyAlias` verbatim when
- * set (OpenSSH then ignores the port too), else {@link hostKeyIdentity}.
+ * set (OpenSSH then ignores the port too), else {@link hostKeyIdentity}. Its case is
+ * kept for display; matching and recording lower-case it (`hostFieldMatches`,
+ * `addHostToHostFile`).
  */
 export function knownHostsLookupName(host: string, port: number, hostKeyAlias: string | undefined): string {
     return hostKeyAlias || hostKeyIdentity(host, port);
@@ -247,6 +371,21 @@ async function readKnownHostsFiles(files: readonly string[]): Promise<string> {
         }
     }));
     return contents.join('\n');
+}
+
+/**
+ * {@link knownHostKeyTypes} over every known-hosts file of a host. A file that cannot
+ * be read yields no preference rather than an error: this only orders the offer, and
+ * the verifier reads the same files again and fails closed on that error itself.
+ */
+export async function readKnownHostKeyTypes(host: string, files: KnownHostsFiles): Promise<string[]> {
+    let content: string;
+    try {
+        content = await readKnownHostsFiles([...files.user, ...files.global]);
+    } catch {
+        return [];
+    }
+    return knownHostKeyTypes(host, content);
 }
 
 /**
@@ -323,7 +462,8 @@ export async function addHostToHostFile(host: string, hostKey: Buffer, type: str
     await fs.promises.mkdir(path.dirname(knownHostsFile), { recursive: true, mode: 0o700 });
 
     const salt = crypto.randomBytes(20);
-    const hostHash = crypto.createHmac('sha1', salt).update(host).digest();
+    // Lower-cased, as OpenSSH records it (`write_host_entry`) and looks it up.
+    const hostHash = crypto.createHmac('sha1', salt).update(asciiLowerCase(host)).digest();
 
     const entry = `${HASH_MAGIC}${salt.toString('base64')}${HASH_DELIM}${hostHash.toString('base64')} ${type} ${hostKey.toString('base64')}\n`;
 

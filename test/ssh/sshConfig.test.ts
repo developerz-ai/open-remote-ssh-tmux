@@ -4,7 +4,7 @@ import * as path from 'path';
 import SSHConfig from 'ssh-config';
 import { afterEach, describe, expect, it } from 'vitest';
 import { configOverrides } from '../mocks/vscode';
-import SSHConfiguration from '../../src/ssh/sshConfig';
+import SSHConfiguration, { includePatterns } from '../../src/ssh/sshConfig';
 
 // Characterisation tests for SSHConfiguration, built directly from a parsed
 // SSHConfig (bypassing loadFromFS's filesystem/glob I/O, which needs its own
@@ -161,22 +161,67 @@ describe('SSHConfiguration.loadFromFS', () => {
         expect(config.getHostConfiguration('bar')['HostName']).toBe('bar.example.com');
     });
 
-    it('expands a comma-separated Include value as multiple independent patterns, not one literal path', async () => {
+    // OpenSSH separates Include pathnames by whitespace only; a comma is part of the name.
+    // Upstream split on commas (and only on commas), which made `a,b.conf` unreachable.
+    it('reads a comma in an Include value as part of the pathname, as OpenSSH does', async () => {
         tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ssh-config-test-'));
         const first = path.join(tmpDir, 'first.conf');
-        const second = path.join(tmpDir, 'second.conf');
+        const withComma = path.join(tmpDir, 'a,b.conf');
         await fs.promises.writeFile(first, 'Host first-host\n    HostName first.example.com\n');
-        await fs.promises.writeFile(second, 'Host second-host\n    HostName second.example.com\n');
+        await fs.promises.writeFile(withComma, 'Host comma-host\n    HostName comma.example.com\n');
         const configPath = path.join(tmpDir, 'config');
-        await fs.promises.writeFile(configPath, `Include ${first}, ${second}\n`);
+        await fs.promises.writeFile(configPath, `Include ${withComma}\nInclude ${first},${first}\n`);
         configOverrides.set('remote.SSH.configFile', configPath);
 
         const config = await SSHConfiguration.loadFromFS();
-        expect(config.getHostConfiguration('first-host')['HostName']).toBe('first.example.com');
-        expect(config.getHostConfiguration('second-host')['HostName']).toBe('second.example.com');
+        expect(config.getHostConfiguration('comma-host')['HostName']).toBe('comma.example.com');
+        expect(config.getHostConfiguration('first-host')['HostName']).toBeUndefined();
     });
 
-    it('resolves each comma-separated Include entry as its own glob, matching multiple files per entry', async () => {
+    // The comma form used to work (upstream split on it), so it must not fail silently.
+    describe('a legacy comma-separated Include', () => {
+        async function loadWithInclude(include: string, files: string[]): Promise<string[]> {
+            tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ssh-config-test-'));
+            for (const file of files) {
+                await fs.promises.writeFile(path.join(tmpDir, file), 'Host secret-host\n    HostName secret.example.com\n');
+            }
+            const configPath = path.join(tmpDir, 'config');
+            await fs.promises.writeFile(configPath, `Include ${include.replace(/@/g, tmpDir)}\n`);
+            configOverrides.set('remote.SSH.configFile', configPath);
+            const warnings: string[] = [];
+            await SSHConfiguration.loadFromFS(path.join(tmpDir, 'no-system-config'), (message) => warnings.push(message));
+            return warnings;
+        }
+
+        it('warns, naming the pattern and the fix, when it matches no file', async () => {
+            const warnings = await loadWithInclude('@/a.conf,@/b.conf', ['a.conf', 'b.conf']);
+
+            expect(warnings).toHaveLength(1);
+            expect(warnings[0]).toContain(`${tmpDir}/a.conf,${tmpDir}/b.conf`);
+            expect(warnings[0]).toMatch(/spaces/);
+            expect(warnings[0]).not.toContain('secret');
+        });
+
+        it('does not warn when a pathname with a comma exists', async () => {
+            expect(await loadWithInclude('@/a,b.conf', ['a,b.conf'])).toEqual([]);
+        });
+
+        it('does not warn about a comma-free pattern that matches nothing (an empty conf.d is normal)', async () => {
+            expect(await loadWithInclude('@/conf.d/*.conf @/a.conf', ['a.conf'])).toEqual([]);
+        });
+
+        it('stays silent, and still loads, when no warning sink is given', async () => {
+            tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ssh-config-test-'));
+            const configPath = path.join(tmpDir, 'config');
+            await fs.promises.writeFile(configPath, 'Include /nope/a.conf,/nope/b.conf\nHost here\n    HostName here.example.com\n');
+            configOverrides.set('remote.SSH.configFile', configPath);
+
+            const config = await SSHConfiguration.loadFromFS();
+            expect(config.getHostConfiguration('here')['HostName']).toBe('here.example.com');
+        });
+    });
+
+    it('resolves an Include entry as a glob, matching multiple files', async () => {
         tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ssh-config-test-'));
         const includeDir = path.join(tmpDir, 'config.d');
         await fs.promises.mkdir(includeDir, { recursive: true });
@@ -319,5 +364,43 @@ describe('SSHConfiguration#getAllConfiguredHosts', () => {
     it('filters pattern names out of a multi-value Host line while keeping concrete ones', () => {
         const config = new SSHConfiguration(SSHConfig.parse('Host dev *.internal !excluded\n    User shared\n'));
         expect(config.getAllConfiguredHosts()).toEqual(['dev']);
+    });
+});
+
+// ssh-config 5.3 made `Include` a multi-value directive: several words arrive as a list
+// of `{ val, quoted }`, one word as a plain string with its quotes stripped and no flag.
+// Parsed with the real library, so a change of that shape fails here first.
+describe('includePatterns', () => {
+    const valueOf = (line: string) => {
+        const [directive] = SSHConfig.parse(line);
+        if (directive.type !== SSHConfig.DIRECTIVE) {
+            throw new Error('not a directive');
+        }
+        return directive.value;
+    };
+
+    it('takes a single pathname as is', () => {
+        expect(includePatterns(valueOf('Include ~/.ssh/conf.d/*'))).toEqual(['~/.ssh/conf.d/*']);
+    });
+
+    it('splits whitespace-separated pathnames', () => {
+        expect(includePatterns(valueOf('Include a.conf  b.conf'))).toEqual(['a.conf', 'b.conf']);
+    });
+
+    it('does not split on commas: OpenSSH separates pathnames by whitespace only', () => {
+        expect(includePatterns(valueOf('Include a.conf,b.conf'))).toEqual(['a.conf,b.conf']);
+        expect(includePatterns(valueOf('Include a,b.conf c.conf'))).toEqual(['a,b.conf', 'c.conf']);
+    });
+
+    it('keeps a quoted pathname whole, alone or in a list', () => {
+        expect(includePatterns(valueOf('Include "my dir/a.conf"'))).toEqual(['my dir/a.conf']);
+        expect(includePatterns(valueOf('Include "my dir/a.conf" b.conf'))).toEqual(['my dir/a.conf', 'b.conf']);
+        expect(includePatterns(valueOf('Include "a,b.conf"'))).toEqual(['a,b.conf']);
+        expect(includePatterns(valueOf('Include "a,b.conf" c.conf'))).toEqual(['a,b.conf', 'c.conf']);
+    });
+
+    it('yields nothing for an empty value', () => {
+        expect(includePatterns('')).toEqual([]);
+        expect(includePatterns([])).toEqual([]);
     });
 });

@@ -1,3 +1,10 @@
+// Fork: a port outside 1-65535 is not a destination. `:0` used to be dropped by `toString`
+// (silently connecting on 22) and `:99999` only failed later as an opaque connect error.
+// The empty hostname is what callers already treat as "not a valid destination".
+function validPort(port: number | undefined): boolean {
+    return port === undefined || (Number.isInteger(port) && port >= 1 && port <= 65535);
+}
+
 export default class SSHDestination {
     constructor(
         public readonly hostname: string,
@@ -21,7 +28,7 @@ export default class SSHDestination {
         const bracketMatch = /^\[(.+)\](?::(\d+))?$/.exec(rest);
         if (bracketMatch) {
             const port = bracketMatch[2] !== undefined ? parseInt(bracketMatch[2], 10) : undefined;
-            return new SSHDestination(bracketMatch[1], user, port);
+            return validPort(port) ? new SSHDestination(bracketMatch[1], user, port) : INVALID_DESTINATION;
         }
 
         // Unbracketed: only split on ":" when there is exactly one of them
@@ -35,7 +42,8 @@ export default class SSHDestination {
         if (isSingleColon) {
             const suffix = rest.substring(colonPos + 1);
             if (/^\d+$/.test(suffix)) {
-                return new SSHDestination(rest.substring(0, colonPos), user, parseInt(suffix, 10));
+                const port = parseInt(suffix, 10);
+                return validPort(port) ? new SSHDestination(rest.substring(0, colonPos), user, port) : INVALID_DESTINATION;
             }
         }
 
@@ -90,3 +98,5 @@ export default class SSHDestination {
         return this.toString().replace(/[A-Z]/g, (ch) => `\\x${ch.charCodeAt(0).toString(16).toLowerCase()}`);
     }
 }
+
+const INVALID_DESTINATION = new SSHDestination('');
