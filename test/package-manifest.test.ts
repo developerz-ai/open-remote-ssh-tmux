@@ -4,7 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
 import { describe, expect, it } from 'vitest';
-import { satisfies } from 'semver';
+import { rcompare, satisfies } from 'semver';
 import { KILL_WORKSPACE_SESSIONS_COMMAND_ID } from '../src/commands';
 import { TMUX_PROFILE_ID, TMUX_PROFILE_TITLE } from '../src/extension';
 
@@ -1050,34 +1050,55 @@ describe('README fork identity', () => {
     });
 });
 
+// One file per release in docs/changelog/<version>.md; the root CHANGELOG.md (shipped in
+// the vsix as the extension's Changelog tab) is an index of them, newest first.
 describe('CHANGELOG', () => {
     // The real script, not a copy of its parsing: a copy stays green when the script breaks.
-    const { changelogEntry } = createRequire(__filename)(path.resolve(repoRoot, '.github/scripts/get-changelog.js')) as {
-        changelogEntry(changelog: string, tag: string): string | undefined;
+    const { changelogBody } = createRequire(__filename)(path.resolve(repoRoot, '.github/scripts/get-changelog.js')) as {
+        changelogBody(contents: string, version: string): string | undefined;
     };
+    const changelogDir = path.resolve(repoRoot, 'docs', 'changelog');
+    const fileVersions = fs.readdirSync(changelogDir)
+        .filter(name => name.endsWith('.md'))
+        .map(name => name.slice(0, -'.md'.length));
+    const index = fs.readFileSync(path.resolve(repoRoot, 'CHANGELOG.md'), 'utf8');
+    const indexVersions = [...index.matchAll(/^- \[(\d+\.\d+\.\d+)\]\(docs\/changelog\/(\d+\.\d+\.\d+)\.md\) — \S/gm)]
+        .map(match => {
+            expect(match[2], `the index line for ${match[1]} links another version's file`).toBe(match[1]);
+            return match[1];
+        });
 
-    it('has a first heading that get-changelog.js finds a non-empty section for', () => {
-        const changelog = fs.readFileSync(path.resolve(repoRoot, 'CHANGELOG.md'), 'utf8');
-        const firstHeading = changelog.match(/^## (\d+\.\d+\.\d+)/m);
-        expect(firstHeading, 'CHANGELOG.md must start with a "## x.y.z" heading').not.toBeNull();
+    it('names every file docs/changelog/<x.y.z>.md, titled with that version', () => {
+        for (const version of fileVersions) {
+            expect(version).toMatch(/^\d+\.\d+\.\d+$/);
+            const contents = fs.readFileSync(path.join(changelogDir, `${version}.md`), 'utf8');
+            expect(contents.split('\n')[0], `docs/changelog/${version}.md`).toBe(`# ${version}`);
+            expect(changelogBody(contents, version), `docs/changelog/${version}.md has no notes`).toMatch(/\S/);
+        }
+    });
 
-        const version = firstHeading![1];
-        const notes = changelogEntry(changelog, `v${version}`);
-        expect(notes, `get-changelog.js found no section for ${version}`).toBeDefined();
-        expect(notes!.length).toBeGreaterThan(0);
+    it('lists every release file in the CHANGELOG.md index, newest first', () => {
+        expect(indexVersions).toEqual([...fileVersions].sort(rcompare));
     });
 
     // The release workflow tags `v<package.json version>` and then asks
-    // .github/scripts/get-changelog.js for that exact section (`## <version>`) to build the
-    // release body — a missing section fails the publish job *after* the tag is already
-    // pushed. Pinning the head of the CHANGELOG to the manifest version catches a bump that
-    // forgot its entry (or an entry that forgot its bump) at test time instead. Deliberately
-    // a drift guard rather than a hardcoded version: this file should not need editing every
-    // release.
-    it('first heading matches the version in package.json', () => {
-        const changelog = fs.readFileSync(path.resolve(repoRoot, 'CHANGELOG.md'), 'utf8');
-        const firstHeading = changelog.match(/^## (\d+\.\d+\.\d+)/m);
-        expect(firstHeading![1]).toBe(readPackageJson().version);
+    // .github/scripts/get-changelog.js for docs/changelog/<version>.md to build the release
+    // body — a missing file fails the publish job *after* the tag is already pushed.
+    // Pinning the head of the index to the manifest version catches a bump that forgot its
+    // notes (or notes that forgot their bump) at test time instead.
+    it('opens the index with the version in package.json', () => {
+        expect(indexVersions[0]).toBe(readPackageJson().version);
+    });
+
+    // Only meaningful where tags were fetched (the Linux `check` job clones with
+    // fetch-depth 0); elsewhere `git tag` lists nothing and there is nothing to check.
+    it('has notes for every released (tagged) version', () => {
+        const tags = spawnSync('git', ['tag', '--list', 'v*'], { cwd: repoRoot, encoding: 'utf8' }).stdout
+            .split('\n')
+            .filter(tag => /^v\d+\.\d+\.\d+$/.test(tag))
+            .map(tag => tag.slice(1));
+
+        expect(tags.filter(version => !fileVersions.includes(version))).toEqual([]);
     });
 });
 

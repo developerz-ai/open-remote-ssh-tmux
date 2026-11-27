@@ -168,7 +168,7 @@ remote and its **path** is pasted, which is all a CLI tool needs.
   and verified `0700` *before* the first byte is written. Screenshots routinely
   contain tokens and session cookies, so they are kept inside the user's own
   home rather than anywhere under world-writable `/tmp` (which through 1.1.3
-  they were — see the 1.2.0 entry in [CHANGELOG.md](CHANGELOG.md)).
+  they were — see the [1.2.0 release notes](docs/changelog/1.2.0.md)).
 - Transfer goes over the **already-open** remote connection
   (`vscode.workspace.fs`) — no `scp`, no second channel, no daemon.
 - The path is sent as a **bracketed paste** (`ESC[200~ … ESC[201~`), so a TUI
@@ -331,7 +331,8 @@ Report vulnerabilities privately — see [SECURITY.md](SECURITY.md).
 
 ## Release history
 
-See [CHANGELOG.md](CHANGELOG.md).
+See [CHANGELOG.md](CHANGELOG.md): one line per release, linking its notes in
+[`docs/changelog/`](docs/changelog/).
 
 ## SSH Host Requirements
 

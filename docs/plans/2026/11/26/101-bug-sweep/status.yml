@@ -10,7 +10,7 @@ slices:
   - file: overview.md
     status: complete
     percent: 100
-evidence: ["#86", "#87", "#88", "results-2026-11-26.md"]
+evidence: ["#86", "#87", "#88", "results-2026-11-26.md", "deferred.md"]
 notes: >-
   Owner decisions applied: toolchain Node 24 (runtime stays VS Code's Electron Node 20);
   dz maintainer policy is the single stale owner (60 days); weekly Monday health + maintain

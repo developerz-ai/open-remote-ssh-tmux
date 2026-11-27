@@ -134,6 +134,6 @@ grep -noE '`[A-Za-z0-9_./-]+:[0-9]+(-[0-9]+)?`' .dz/schedules/*.md
   `chore(maintain): weekly maintenance <YYYY-MM-DD>` (the squash subject on `main`; commitlint judges it).
   Body: one section per task that changed something, with the command and its output before and
   after; lines ≤ 200 characters. `bin/check` is green on the final head before it is opened.
-- Never in this PR: a version bump, `CHANGELOG.md`, `.github/workflows/publish.yml`, `.release-it.yml`,
+- Never in this PR: a version bump, `CHANGELOG.md` or `docs/changelog/`, `.github/workflows/publish.yml`, `.release-it.yml`,
   `dependencies`, the upstream merge, or any change under `src/` other than the `gate` fix.
 - One PR per run (`docs/standards/pr-batching.md`): no second PR for a task, no PR for a lone typo.
