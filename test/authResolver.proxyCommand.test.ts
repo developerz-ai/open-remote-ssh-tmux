@@ -103,9 +103,42 @@ describe('buildProxyCommandSpawn — unsafe authority tokens, every platform', (
         expect(buildProxyCommandSpawn('nc %h %p 100%%r', { h: 'box', n: 'box', p: '22', r: 'O\'Brien' }, false).args).toEqual(['box', '22', '100%r']);
     });
 
-    it('vets a token used in the command name or glued to other text', () => {
-        expect(() => buildProxyCommandSpawn('/opt/%r/proxy %h', { h: 'box', n: 'box', p: '22', r: '../x y' }, false)).toThrow(ProxyCommandRejectedError);
+    it('vets a token glued to other text in an argument', () => {
         expect(() => buildProxyCommandSpawn('ssh -W x:%p b', { h: 'box', n: 'box', p: '22 -oX', r: 'me' }, false)).toThrow(ProxyCommandRejectedError);
+        expect(() => buildProxyCommandSpawn('proxy --as=%r', { h: 'box', n: 'box', p: '22', r: 'a b' }, false)).toThrow(ProxyCommandRejectedError);
+    });
+
+    // The first word is the program that gets run. A token there lets the authority pick
+    // it: the value check allows `/` and `..`, so `/opt/%r/proxy` with the user `../../tmp/x`
+    // ran `/tmp/x/proxy`. Tokens are expanded in arguments only.
+    describe('a token in the program name', () => {
+        const clean = { h: 'box', n: 'box', p: '22', r: 'me' };
+
+        for (const windows of [false, true]) {
+            for (const command of ['/opt/%r/proxy %h', '%h', '%n-proxy %h %p', '/usr/bin/proxy%p', '"C:\\tools\\%h\\proxy.bat" %h', '%r.cmd']) {
+                it(`is refused: ${command} (${windows ? 'windows' : 'posix'})`, () => {
+                    expect(() => buildProxyCommandSpawn(command, clean, windows)).toThrow(ProxyCommandRejectedError);
+                });
+            }
+        }
+
+        it('is refused for an array-shaped ProxyCommand too', () => {
+            expect(() => buildProxyCommandSpawn(['/opt/%h/proxy', '%p'], clean, false)).toThrow(ProxyCommandRejectedError);
+        });
+
+        it('says why, without the value', () => {
+            try {
+                buildProxyCommandSpawn('/opt/%r/proxy', { ...clean, r: 'secret-ish' }, false);
+                expect.unreachable();
+            } catch (e) {
+                expect((e as Error).message).toContain('program');
+                expect((e as Error).message).not.toContain('secret-ish');
+            }
+        });
+
+        it('still allows a literal %% and a token-free program', () => {
+            expect(buildProxyCommandSpawn('/opt/100%%/proxy %h', clean, false)).toEqual({ command: '/opt/100%/proxy', args: ['box'], options: {} });
+        });
     });
 
     it('on a .bat/.cmd, applies the cmd.exe check to used tokens only', () => {

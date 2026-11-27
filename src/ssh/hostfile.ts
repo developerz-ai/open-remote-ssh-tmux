@@ -70,25 +70,40 @@ function parseKnownHostsLine(line: string): KnownHostsRecord | undefined {
 }
 
 /**
- * OpenSSH's `match_pattern`: `*` matches any run of characters (including none), `?`
- * exactly one, everything else itself. Only the *pattern's* `*` and `?` are special:
- * `text` is a name (a HostKeyAlias may hold any character), so the pattern's `*` is
- * tried before literal equality — otherwise a `*` in the name consumed it as a literal.
+ * Lower-case the ASCII letters only — what OpenSSH's `lowercase()` / `tolower` on bytes
+ * do to a host name and a pattern. `String#toLowerCase` also folds non-ASCII letters,
+ * which would match (and hash) names differently from `ssh`.
+ */
+function asciiLowerCase(value: string): string {
+    return value.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+}
+
+const STAR = 0x2a;
+const QUESTION_MARK = 0x3f;
+
+/**
+ * OpenSSH's `match_pattern`: `*` matches any run of bytes (including none), `?` exactly
+ * one byte, everything else itself. Both sides are UTF-8 bytes, as in OpenSSH — on
+ * UTF-16 code units `?` would cover a whole `é` here and half of it in `ssh`, and a
+ * `??` revocation `ssh` honours would be missed. Only the *pattern's* `*` and `?` are
+ * special: `text` is a name (a HostKeyAlias may hold any character), so the pattern's
+ * `*` is tried before literal equality — otherwise a `*` in the name consumed it as a
+ * literal.
  *
  * The standard iterative matcher with a single backtrack point (the last `*` and where
  * in `text` it resumed), O(text × pattern) at worst — not a RegExp and not recursive,
  * so a hostile known_hosts line can neither inject regex syntax nor stall the connect.
  */
-function matchPattern(text: string, pattern: string): boolean {
+function matchPattern(text: Buffer, pattern: Buffer): boolean {
     let t = 0;
     let p = 0;
     let star = -1;
     let resume = 0;
     while (t < text.length) {
-        if (p < pattern.length && pattern[p] === '*') {
+        if (p < pattern.length && pattern[p] === STAR) {
             star = p++;
             resume = t;
-        } else if (p < pattern.length && (pattern[p] === '?' || pattern[p] === text[t])) {
+        } else if (p < pattern.length && (pattern[p] === QUESTION_MARK || pattern[p] === text[t])) {
             t++;
             p++;
         } else if (star !== -1) {
@@ -98,7 +113,7 @@ function matchPattern(text: string, pattern: string): boolean {
             return false;
         }
     }
-    while (p < pattern.length && pattern[p] === '*') {
+    while (p < pattern.length && pattern[p] === STAR) {
         p++;
     }
     return p === pattern.length;
@@ -107,14 +122,16 @@ function matchPattern(text: string, pattern: string): boolean {
 /**
  * OpenSSH's `match_pattern_list` as `match_hostname` uses it: `host` (already
  * lower-cased) must match at least one pattern of the comma-separated list, compared
- * case-insensitively, and a matching `!pattern` vetoes the whole line wherever it sits.
+ * case-insensitively (ASCII), and a matching `!pattern` vetoes the whole line wherever
+ * it sits.
  */
 function matchPatternList(host: string, patternList: string): boolean {
+    const hostBytes = Buffer.from(host, 'utf8');
     let matched = false;
     for (const entry of patternList.split(',')) {
         const negated = entry.startsWith('!');
-        const pattern = (negated ? entry.substring(1) : entry).toLowerCase();
-        if (!pattern || !matchPattern(host, pattern)) {
+        const pattern = asciiLowerCase(negated ? entry.substring(1) : entry);
+        if (!pattern || !matchPattern(hostBytes, Buffer.from(pattern, 'utf8'))) {
             continue;
         }
         if (negated) {
@@ -137,7 +154,7 @@ function matchPatternList(host: string, patternList: string): boolean {
  * changed key reads as a first connect.
  */
 function hostFieldMatches(hostsField: string, host: string): boolean {
-    const lowerHost = host.toLowerCase();
+    const lowerHost = asciiLowerCase(host);
     if (hostsField.startsWith(HASH_MAGIC)) {
         const [salt_, hostHash_] = hostsField.substring(HASH_MAGIC.length).split(HASH_DELIM);
         if (!salt_ || !hostHash_) {
@@ -446,7 +463,7 @@ export async function addHostToHostFile(host: string, hostKey: Buffer, type: str
 
     const salt = crypto.randomBytes(20);
     // Lower-cased, as OpenSSH records it (`write_host_entry`) and looks it up.
-    const hostHash = crypto.createHmac('sha1', salt).update(host.toLowerCase()).digest();
+    const hostHash = crypto.createHmac('sha1', salt).update(asciiLowerCase(host)).digest();
 
     const entry = `${HASH_MAGIC}${salt.toString('base64')}${HASH_DELIM}${hostHash.toString('base64')} ${type} ${hostKey.toString('base64')}\n`;
 

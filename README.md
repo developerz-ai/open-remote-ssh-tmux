@@ -320,7 +320,8 @@ Scheduled checkups, briefs in [`.dz/schedules/`](.dz/schedules/), every Monday: 
   they are refused too, because your own `sh -c "… %r"` would interpret them — so
   a login such as `CORP\me` or `John Smith` cannot be combined with a ProxyCommand
   that uses `%r`. IPv6 literals, including a zone (`fe80::1%eth0`), are accepted. A
-  token the command does not use is not checked.
+  token the command does not use is not checked. A token in the program name itself
+  (`/opt/%h/proxy`) is always refused: tokens are expanded in arguments only.
 - **`user@host:port` beats the SSH config.** A user or port written in the destination
   (or in a `ProxyJump` entry) is used even when the config sets `User`/`Port` for that
   host, as with `ssh`. A `ProxyJump` host without a user of its own (in the entry or

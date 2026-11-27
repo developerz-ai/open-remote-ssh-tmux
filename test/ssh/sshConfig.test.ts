@@ -178,6 +178,49 @@ describe('SSHConfiguration.loadFromFS', () => {
         expect(config.getHostConfiguration('first-host')['HostName']).toBeUndefined();
     });
 
+    // The comma form used to work (upstream split on it), so it must not fail silently.
+    describe('a legacy comma-separated Include', () => {
+        async function loadWithInclude(include: string, files: string[]): Promise<string[]> {
+            tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ssh-config-test-'));
+            for (const file of files) {
+                await fs.promises.writeFile(path.join(tmpDir, file), 'Host secret-host\n    HostName secret.example.com\n');
+            }
+            const configPath = path.join(tmpDir, 'config');
+            await fs.promises.writeFile(configPath, `Include ${include.replace(/@/g, tmpDir)}\n`);
+            configOverrides.set('remote.SSH.configFile', configPath);
+            const warnings: string[] = [];
+            await SSHConfiguration.loadFromFS(path.join(tmpDir, 'no-system-config'), (message) => warnings.push(message));
+            return warnings;
+        }
+
+        it('warns, naming the pattern and the fix, when it matches no file', async () => {
+            const warnings = await loadWithInclude('@/a.conf,@/b.conf', ['a.conf', 'b.conf']);
+
+            expect(warnings).toHaveLength(1);
+            expect(warnings[0]).toContain(`${tmpDir}/a.conf,${tmpDir}/b.conf`);
+            expect(warnings[0]).toMatch(/spaces/);
+            expect(warnings[0]).not.toContain('secret');
+        });
+
+        it('does not warn when a pathname with a comma exists', async () => {
+            expect(await loadWithInclude('@/a,b.conf', ['a,b.conf'])).toEqual([]);
+        });
+
+        it('does not warn about a comma-free pattern that matches nothing (an empty conf.d is normal)', async () => {
+            expect(await loadWithInclude('@/conf.d/*.conf @/a.conf', ['a.conf'])).toEqual([]);
+        });
+
+        it('stays silent, and still loads, when no warning sink is given', async () => {
+            tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ssh-config-test-'));
+            const configPath = path.join(tmpDir, 'config');
+            await fs.promises.writeFile(configPath, 'Include /nope/a.conf,/nope/b.conf\nHost here\n    HostName here.example.com\n');
+            configOverrides.set('remote.SSH.configFile', configPath);
+
+            const config = await SSHConfiguration.loadFromFS();
+            expect(config.getHostConfiguration('here')['HostName']).toBe('here.example.com');
+        });
+    });
+
     it('resolves an Include entry as a glob, matching multiple files', async () => {
         tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ssh-config-test-'));
         const includeDir = path.join(tmpDir, 'config.d');

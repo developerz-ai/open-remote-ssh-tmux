@@ -513,7 +513,7 @@ const CMD_METACHARACTERS = /[&|<>^%"!()\r\n]/;
  * OpenSSH on purpose), and `%p` must be a number. Only the tokens the command really
  * uses are vetted: a value that is never expanded reaches nothing, and must not stop
  * `O'Brien@box` from connecting through `nc %h %p`. The error names the token, never
- * the value.
+ * the value. A token in the first word — the program — is refused whatever its value.
  *
  * A Windows `.bat`/`.cmd` must run through cmd.exe
  * (`shell: true`, verbatim args), where a token value from the remote authority — a
@@ -530,6 +530,11 @@ export function buildProxyCommandSpawn(
     windows: boolean = isWindows
 ): { command: string; args: string[]; options: cp.SpawnOptionsWithoutStdio } {
     const words = splitProxyCommand(value, windows);
+    // The first word is the program to run, and the value checks below allow `/` and
+    // `..`: a token there would let the authority choose what is launched.
+    if (['h', 'n', 'r', 'p'].some((token) => usedTokens(words.slice(0, 1)).has(token))) {
+        throw new ProxyCommandRejectedError('Refusing to run the ProxyCommand: its program name contains a % token; tokens are only expanded in arguments');
+    }
     const used = usedTokens(words);
     const isUnsafe: Record<'h' | 'n' | 'r' | 'p', (tokenValue: string) => boolean> = {
         h: (host) => UNSAFE_TOKEN_VALUE.test(host.replace(IPV6_ZONE, '$1')),
@@ -815,7 +820,8 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                 // Every attempt starts from a clean slate — see teardownPreviousAttempt().
                 this.teardownPreviousAttempt();
 
-                const sshconfig = await SSHConfiguration.loadFromFS();
+                // Fork: Include problems (a legacy comma-separated list) go to the log.
+                const sshconfig = await SSHConfiguration.loadFromFS(undefined, (message) => this.logger.info(`SSH config: ${message}`));
                 const sshHostConfig = sshconfig.getHostConfiguration(sshDest.hostname);
                 const sshHostName = resolveHostName(sshHostConfig['HostName'], sshDest.hostname);
                 // Fork: a user/port written in the destination beats ssh_config, as in OpenSSH — see resolveUser(), resolveHopPort().

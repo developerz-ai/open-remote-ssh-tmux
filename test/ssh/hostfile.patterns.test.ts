@@ -108,6 +108,36 @@ describe('verifyHostKey — glob characters in the lookup name', () => {
     });
 });
 
+// OpenSSH matches bytes: `?` is one byte of the UTF-8 name, and only ASCII letters are
+// case-folded (`tolower` per byte). Matching UTF-16 code units instead made `é` one `?`
+// here and two in `ssh`, so a `??` revocation `ssh` honours was missed.
+describe('verifyHostKey — non-ASCII names are matched as UTF-8 bytes', () => {
+    it('revokes a non-ASCII alias under a `??` pattern, one ? per byte', () => {
+        expect(verifyHostKey('\u00e9', keyA, `@revoked ?? ssh-ed25519 ${b64(keyA)}\n`)).toBe('revoked');
+        expect(verifyHostKey('\u00e9', keyA, `\u00e9 ssh-ed25519 ${b64(keyA)}\n@revoked ?? ssh-ed25519 ${b64(keyA)}\n`)).toBe('revoked');
+    });
+
+    it('does not let one ? stand for a whole multi-byte character', () => {
+        expect(verifyHostKey('\u00e9', keyA, `@revoked ? ssh-ed25519 ${b64(keyA)}\n`)).toBe('unknown');
+        expect(verifyHostKey('\u{1F600}', keyA, `@revoked ???? ssh-ed25519 ${b64(keyA)}\n`)).toBe('revoked');
+        expect(verifyHostKey('\u{1F600}', keyA, `@revoked ?? ssh-ed25519 ${b64(keyA)}\n`)).toBe('unknown');
+    });
+
+    it('still matches a non-ASCII name literally and under *', () => {
+        expect(verifyHostKey('b\u00fccher.example', keyB, `b\u00fccher.example ssh-ed25519 ${b64(keyA)}\n`)).toBe('mismatch');
+        expect(verifyHostKey('b\u00fccher.example', keyB, `*.example ssh-ed25519 ${b64(keyA)}\n`)).toBe('mismatch');
+    });
+
+    it('folds case for ASCII letters only, as OpenSSH does', () => {
+        expect(verifyHostKey('B\u00dcCHER', keyB, `b\u00dccher ssh-ed25519 ${b64(keyA)}\n`)).toBe('mismatch');
+        expect(verifyHostKey('B\u00dcCHER', keyB, `b\u00fccher ssh-ed25519 ${b64(keyA)}\n`)).toBe('unknown');
+    });
+
+    it('hashes the ASCII-lower-cased name, the bytes OpenSSH hashes', () => {
+        expect(verifyHostKey('B\u00dcCHER', keyB, `${hashedField('b\u00dccher')} ssh-ed25519 ${b64(keyA)}\n`)).toBe('mismatch');
+    });
+});
+
 describe('verifyHostKey — a hostile pattern cannot stall the connect', () => {
     it('decides a many-star pattern against a long name in bounded time', () => {
         const name = 'a'.repeat(20_000);

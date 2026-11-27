@@ -109,12 +109,15 @@ export function includePatterns(value: Directive['value']): string[] {
 // config shouldn't take down the whole extension.
 const MAX_INCLUDE_DEPTH = 16;
 
+/** Fork: where a note about an `Include` that needs the user's attention goes (the caller's log). */
+export type IncludeWarning = (message: string) => void;
+
 // Walks `config` looking for Include directives to expand in place, and
 // recurses into Host/Match sections so a host-scoped Include (inside a
 // `Host foo { Include ... }` block) is honoured too, not just top-level ones.
 // `includeDir` is where a relative Include resolves: OpenSSH reads it against ~/.ssh for the
 // user config and against the system config's own directory for the system config.
-async function resolveIncludes(config: SSHConfig, includeDir: string, visited: Set<string>): Promise<void> {
+async function resolveIncludes(config: SSHConfig, includeDir: string, visited: Set<string>, warn: IncludeWarning): Promise<void> {
     const includedConfigs: [number, SSHConfig[]][] = [];
     for (let i = 0; i < config.length; i++) {
         const line = config[i];
@@ -127,13 +130,18 @@ async function resolveIncludes(config: SSHConfig, includeDir: string, visited: S
                     absolute: true,
                     cwd: normalizeToSlash(includeDir)
                 });
+                // Fork: upstream split Include on commas; OpenSSH (and now this) does not, so
+                // a legacy `Include a.conf,b.conf` names one file that is not there. Say so.
+                if (!includePaths.length && value.includes(',')) {
+                    warn(`Include "${value}" matches no file. Include paths are separated by spaces, not commas — write each path separated by a space.`);
+                }
                 for (const p of includePaths) {
-                    configs.push(await parseSSHConfigFromFile(p, includeDir, visited));
+                    configs.push(await parseSSHConfigFromFile(p, includeDir, warn, visited));
                 }
             }
             includedConfigs.push([i, configs]);
         } else if (isNestedSection(line)) {
-            await resolveIncludes(line.config, includeDir, visited);
+            await resolveIncludes(line.config, includeDir, visited, warn);
         }
     }
     for (const [idx, includeConfigs] of includedConfigs.reverse()) {
@@ -141,7 +149,7 @@ async function resolveIncludes(config: SSHConfig, includeDir: string, visited: S
     }
 }
 
-async function parseSSHConfigFromFile(filePath: string, includeDir: string, visited: Set<string> = new Set()): Promise<SSHConfig> {
+async function parseSSHConfigFromFile(filePath: string, includeDir: string, warn: IncludeWarning, visited: Set<string> = new Set()): Promise<SSHConfig> {
     // Guard against Include cycles (self-include, mutual A<->B include) and
     // runaway include chains, both of which would otherwise hang the
     // resolver by recursing forever. `visited` tracks the ancestor chain for
@@ -160,7 +168,7 @@ async function parseSSHConfigFromFile(filePath: string, includeDir: string, visi
 
     const nestedVisited = new Set(visited);
     nestedVisited.add(resolvedPath);
-    await resolveIncludes(config, includeDir, nestedVisited);
+    await resolveIncludes(config, includeDir, nestedVisited, warn);
 
     return config;
 }
@@ -169,9 +177,11 @@ export default class SSHConfiguration {
 
     // The system config is a parameter so a caller (a test) can pin it: the default reads the
     // host's real /etc/ssh/ssh_config, whose hosts differ machine to machine.
-    static async loadFromFS(systemConfigPath: string = systemSSHConfig): Promise<SSHConfiguration> {
-        const config = await parseSSHConfigFromFile(getSSHConfigPath(), path.dirname(defaultSSHConfigPath));
-        config.push(...await parseSSHConfigFromFile(systemConfigPath, path.dirname(systemConfigPath)));
+    // Fork: `warn` receives Include problems worth telling the user (see resolveIncludes); it
+    // defaults to nothing, so the callers that only list hosts stay silent.
+    static async loadFromFS(systemConfigPath: string = systemSSHConfig, warn: IncludeWarning = () => undefined): Promise<SSHConfiguration> {
+        const config = await parseSSHConfigFromFile(getSSHConfigPath(), path.dirname(defaultSSHConfigPath), warn);
+        config.push(...await parseSSHConfigFromFile(systemConfigPath, path.dirname(systemConfigPath), warn));
 
         return new SSHConfiguration(config);
     }
