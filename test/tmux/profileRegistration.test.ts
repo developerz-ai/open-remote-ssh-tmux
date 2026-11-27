@@ -83,4 +83,33 @@ describe('TerminalProfileRegistration: one provider per profile id, swappable', 
         expect(() => registration.dispose()).not.toThrow();
         expect(failing).toHaveBeenCalledTimes(1);
     });
+
+    // A superseded tmux layer releasing the id must not unregister the layer that replaced
+    // it: "Persistent Shell" would then open plain shells while the new layer looked wired.
+    it('release hands the id to the replacement only while the given provider still owns it', () => {
+        const { register, providerFor } = fakeRegistry();
+        const registration = new TerminalProfileRegistration('tmux', register as never);
+        const stale = { kind: 'stale' };
+        const live = { kind: 'live' };
+        const fallback = { kind: 'fallback' };
+
+        registration.use(stale as never);
+        registration.use(live as never);
+        registration.release(stale as never, fallback as never);
+        expect(providerFor('tmux')).toBe(live);
+
+        registration.release(live as never, fallback as never);
+        expect(providerFor('tmux')).toBe(fallback);
+    });
+
+    it('release after dispose leaves the id free (nothing owns it any more)', () => {
+        const { register, providerFor } = fakeRegistry();
+        const registration = new TerminalProfileRegistration('tmux', register as never);
+        const live = { kind: 'live' };
+
+        registration.use(live as never);
+        registration.dispose();
+        registration.release(live as never, { kind: 'fallback' } as never);
+        expect(providerFor('tmux')).toBeUndefined();
+    });
 });

@@ -162,7 +162,14 @@ strategy:
 - **Housekeeping on connect** (`remote.SSH.tmux.reapOnConnect`, shipped). Kills
   sessions of ours whose pane is dead, and detached sessions of ours with no
   activity for `remote.SSH.tmux.orphanMaxAgeDays` (default 14; `0` = never) — the
-  ones a renamed or abandoned folder leaves behind. Never an attached session,
+  ones a renamed or abandoned folder leaves behind. "Activity" is input **or
+  output**: the later of `#{session_activity}` (typing, attaching) and the newest
+  `#{window_activity}` (a pane printing) of **any** of the session's windows — a
+  program can open a second window and print there — so a detached task that is
+  still producing output is never aged out. Windows and sessions are read in one
+  tmux invocation (a single snapshot), and a session whose windows did not come
+  back is kept: an unknown age is never old enough. The age is measured on the remote's own
+  clock, reported by the same list command — never the local machine's. Never an attached session,
   never a name we did not mint, never this window's own mapped sessions. One Info
   line reports the count: `tmux housekeeping: K killed, O old sessions kept`. The
   manual "Kill Persistent Terminal Sessions (this workspace)" command stays for
@@ -229,7 +236,17 @@ Session-scoped, on our `code-*` sessions only, on every attach: `@orst_owner`
 `mouse on`, `prefix None`, `prefix2 None` (Ctrl-B reaches the program). Also
 session-scoped: `@orst_closed`, written by the per-connection close watch when the
 window's SSH connection ends and reset to `none` when it reconnects (user options
-are overwritten, never unset — unsetting one crashes tmux 2.6).
+are overwritten, never unset — unsetting one crashes tmux 2.6). At create only, on
+tmux ≥ 3.2: `COLORTERM=truecolor` in the session's environment (`new-session -e`),
+because the pane inherits the tmux server's environment, not VS Code's terminal's.
+
+Not written anywhere — properties of our own tmux client, passed as its flags:
+`-u` (the terminal is UTF-8 whatever the locale says; under `LC_ALL=C` tmux
+otherwise prints `_` for every non-ASCII glyph) and, on tmux ≥ 3.2,
+`-T RGB,sync` (plus `hyperlinks` from 3.4): xterm.js does 24-bit colour,
+synchronized output and OSC 8 hyperlinks, none of which tmux assumes of
+`xterm-256color`. A client flag describes that one client, so the user's own
+clients and sessions are not touched by it.
 
 Server-scoped, and when:
 
@@ -239,7 +256,8 @@ Server-scoped, and when:
 | server user option `@orst_saved_hl` | tmux < 3.7: holds the user's value during that swap; left set afterwards (inert) | unsetting a global user option crashes the tmux 2.6 server |
 | `escape-time` → 10 ms | only while it is still 500, the pre-3.5 default | a lone Esc otherwise lags half a second in every TUI |
 | `set-clipboard` → `on` | only while it is still `external`, the default | drag-select in tmux reaches the local clipboard over OSC 52 |
-| root-table `PageUp` / `PageDown` bindings | only if the key is unbound | key tables are server-global; the bindings act only at a bare shell prompt (alternate screen and non-shell programs such as Claude Code keep the keys) |
+| `terminal-overrides` += `,xterm*:Tc` | tmux < 3.2 only (no `-T` there), or a tmux whose version could not be read; appended once per server, and not at all if any `terminal-overrides` entry already mentions `Tc` — set or removed (`Tc@`), for whatever terminal: that is the user's decision about 24-bit colour, and a later entry of ours would override it (two first attaches racing on a fresh server can each append it; the duplicate entry is identical and inert) | the only way to get 24-bit colour through before 3.2. It adds that one capability for every client whose `TERM` matches `xterm*` — the user's own clients on this server included: a terminal that calls itself `xterm*` but cannot do 24-bit colour would show wrong colours for programs that emit it. Nothing else about their sessions changes |
+| root-table `PageUp` / `PageDown` bindings | only if the user has no binding of their own on the key — read from the binding's header, `bind-key [-r] -T root <key>`, never from a command that merely mentions the key (ours from an earlier attach is replaced) | key tables are server-global, so the binding exists in the user's own sessions too — but its predicate passes the key straight through unless the session name has exactly our shape (`code-<12 hex>-<slot>`; a user's own `code-a-0` keeps its keys). A binding counts as ours, and is replaced, only if it is exactly one we made (today's or a released one: predicate and actions) — a user's binding that resembles it, or reuses our predicate with actions of their own, is left alone. In ours it acts only at a bare shell prompt: the alternate screen, `ssh`, and non-shell programs such as Claude Code keep the keys |
 
 ## Deferred (not in this release)
 

@@ -67,7 +67,7 @@ export async function activate(context: vscode.ExtensionContext) {
         log: logger,
     });
     const layers = new TmuxLayerController(
-        () => wireTmuxTerminalLayer(context, remoteSSHResolver, profileRegistration, logger, watchClose)
+        attempt => wireTmuxTerminalLayer(context, remoteSSHResolver, profileRegistration, logger, watchClose, attempt)
     );
     // Released before the registration it swaps the fallback back into.
     context.subscriptions.push({ dispose: () => layers.unwire() });
@@ -191,28 +191,46 @@ export async function activate(context: vscode.ExtensionContext) {
  *
  * Called by {@link TmuxLayerController}. Resolves the {@link TmuxTerminalLayer} handle whose
  * `refresh()` a later resolve (reconnect) calls instead of wiring again, or `undefined` when a
- * gate is unmet (capability unavailable / setting off / no folder) or wiring throws — so the
- * controller retries wiring on the next resolve.
+ * gate is unmet (capability unavailable / setting off / no folder), the attempt was superseded
+ * (see {@link WireAttempt}), or wiring throws — so the controller retries wiring on the next
+ * resolve. Exported for the wiring tests only.
  */
-async function wireTmuxTerminalLayer(
+export async function wireTmuxTerminalLayer(
     context: vscode.ExtensionContext,
     resolver: RemoteSSHResolver,
     profileRegistration: TerminalProfileRegistration,
     logger: Log,
     watchClose: (command: string) => void,
+    attempt: WireAttempt,
 ): Promise<TmuxTerminalLayer | undefined> {
     // Disposables this attempt has registered but not yet handed to the layer. Declared
     // out here so the catch can roll them back — see where it is filled below for why a
     // retried attempt must not inherit the previous one's.
     const wired: vscode.Disposable[] = [];
     let terminalProvider: TmuxTerminalProvider | undefined;
+    // Undo a half-built attempt (a throw, or superseded mid-way). The id goes back to the
+    // fallback only if this attempt's provider still owns it — a newer layer may hold it.
+    // Idempotent: a superseded attempt is rolled back by the controller at once and may
+    // reach its own stale check afterwards. `disposeAll` rethrows the first failing
+    // dispose; that must not escape the caller.
+    const rollback = (): void => {
+        if (terminalProvider) {
+            terminalProvider.dispose();
+            profileRegistration.release(terminalProvider, new FallbackTerminalProvider());
+        }
+        try {
+            disposeAll(wired);
+        } catch (rollbackErr) {
+            logger.trace(`Tmux wiring rollback failed: ${errorMessage(rollbackErr)}`);
+        }
+    };
     try {
         // Read the remote.SSH.tmux.* settings up front. `enabled` is read BEFORE the
         // capability probe so an explicit `'on'` ("require tmux") can surface a
         // user-visible error when the remote can't provide tmux, instead of silently
-        // skipping like `'auto'` does — see decideTmuxWiring. A change while this attempt
-        // is in flight is the settings watcher's to apply (the controller counts an
-        // in-flight wiring as wired).
+        // skipping like `'auto'` does — see decideTmuxWiring. A live change (scrollback,
+        // hand-off) while this attempt is in flight is held by the controller and applied
+        // to the layer when it lands; turning the feature off makes this attempt stale.
         const settings = readTmuxSettings();
 
         // Decide whether to wire from (enabled setting × tmux availability). `'off'` → skip;
@@ -231,8 +249,10 @@ async function wireTmuxTerminalLayer(
         }
         if (decision === 'require-error') {
             // The one path that reaches the user: they required tmux but it isn't there.
-            // Best-effort notification; the failed connection is already succeeded.
-            void vscode.window.showErrorMessage(TMUX_REQUIRED_UNAVAILABLE_MESSAGE);
+            // Best-effort notification; the failed connection is already succeeded. Once per
+            // host per window — every reconnect lands here again, and a flaky link must not
+            // turn one missing package into a toast per reconnect.
+            notifyTmuxRequired(resolver.getAuthority() ?? '');
             // Not wiring → remove any stale tmux default we wrote on a prior (tmux-capable)
             // connect, so "New Terminal" falls back to the base shell instead of a profile
             // we never registered.
@@ -250,6 +270,12 @@ async function wireTmuxTerminalLayer(
         // Session identity (canonical host + workspace, plus the legacy one to adopt from) —
         // shared with the kill command so both name this workspace's sessions identically.
         const identity = await currentTmuxIdentity(logger);
+        if (!attempt.stillCurrent()) {
+            // Switched off or rewired while the SSH config was read: register nothing — a
+            // stale provider registered now would replace the newer layer's.
+            logger.trace('Tmux wiring superseded before it registered anything');
+            return undefined;
+        }
         if (!identity) {
             // No resolved remote SSH workspace folder to key sessions to (an empty remote
             // window, or a non-ssh-remote folder) — there is no stable host+workspace
@@ -294,6 +320,11 @@ async function wireTmuxTerminalLayer(
             offerTakeOver: offerHandOff,
         });
         terminalProvider = provider;
+        // From here on this attempt holds things a switch-off must take down the moment it
+        // happens — the provider on the profile id and its terminal listeners — not when
+        // the default-profile write below settles (seconds; up to 15 s). Until then
+        // "Persistent Shell" would keep starting tmux sessions after the user disabled it.
+        attempt.onSuperseded(rollback);
 
         // These go into `wired`, and are handed to the layer only once every fallible step
         // below has succeeded. This function is *retried*: the controller re-wires on the
@@ -349,6 +380,13 @@ async function wireTmuxTerminalLayer(
         // row 01b). The provider is already registered above, so the moment VS Code sees the
         // default, it is ours that answers.
         await reconcileDefaultTerminalProfile(logger, true, resolver.getRemotePlatform());
+        if (!attempt.stillCurrent()) {
+            // Switched off or rewired during the write: already rolled back (above), so
+            // start no close watch or lifetime probe for a layer nobody owns. The write
+            // itself is the turn-off cleanup's to remove: it waits for this attempt to land.
+            logger.trace('Tmux wiring superseded during the default profile write');
+            return undefined;
+        }
 
         // Every fallible step is behind us, so this attempt is the one that keeps the
         // listeners: they now belong to the layer, released by its `dispose`.
@@ -397,7 +435,7 @@ async function wireTmuxTerminalLayer(
             },
             dispose: () => {
                 provider.dispose();
-                profileRegistration.use(new FallbackTerminalProvider());
+                profileRegistration.release(provider, new FallbackTerminalProvider());
                 disposeAll(listeners);
             },
         };
@@ -406,18 +444,15 @@ async function wireTmuxTerminalLayer(
         // is returned, so the controller retries wiring on the next resolve — which is
         // exactly why anything this attempt registered has to go first. `wired` is empty
         // on the success path (handed to the layer above), so this only ever releases a
-        // half-built layer. `disposeAll` rethrows the first failing dispose, and that must
-        // not escape and mask `err`.
-        terminalProvider?.dispose();
-        try {
-            disposeAll(wired);
-        } catch (rollbackErr) {
-            logger.trace(`Tmux wiring rollback failed: ${errorMessage(rollbackErr)}`);
-        }
+        // half-built layer.
+        rollback();
         logger.trace(`Tmux wiring failed: ${errorMessage(err)}`);
         return undefined;
     }
 }
+
+/** The "tmux required but missing" error, once per remote authority per window. */
+const notifyTmuxRequired = oncePerKey(() => void vscode.window.showErrorMessage(TMUX_REQUIRED_UNAVAILABLE_MESSAGE));
 
 /** Hosts whose terminal lifetime this window has already checked — once per window. */
 const lifetimeChecked = new Set<string>();
@@ -477,6 +512,16 @@ export interface TmuxTerminalLayer extends vscode.Disposable {
     protectedSessions(): Promise<string[]>;
 }
 
+/** What {@link TmuxLayerController} hands each wiring attempt, so a switch-off or rebuild
+ * reaches an attempt that is still in flight. */
+export interface WireAttempt {
+    /** False once `unwire`/`rewire` has superseded this attempt. */
+    stillCurrent(): boolean;
+    /** Run `rollback` the moment this attempt is superseded — at once if it already is. Never
+     * run once the attempt's layer has landed: the layer's own `dispose` owns that. */
+    onSuperseded(rollback: () => void): void;
+}
+
 /**
  * Owns the one tmux terminal layer of this window across resolves, settings changes and
  * folder changes: wire it once, refresh it on every reconnect, rebuild or drop it when a
@@ -484,18 +529,30 @@ export interface TmuxTerminalLayer extends vscode.Disposable {
  * without the VS Code terminal surface; it resolves `undefined` while a gate is unmet, in
  * which case wiring is retried on the next resolve.
  *
- * Wiring is asynchronous (the identity reads the SSH config), so two guards matter: a
- * resolve arriving while wiring is in flight JOINS it rather than wiring a second layer, and
- * a wiring superseded by `unwire`/`rewire` meanwhile disposes what it built instead of
- * installing it — a layer nobody owns would keep allocating slots in the background.
+ * Wiring is asynchronous (the identity reads the SSH config, the default-profile write
+ * takes seconds), so four guards matter:
+ *  - a resolve arriving while wiring is in flight JOINS it rather than wiring a second layer;
+ *  - `unwire`/`rewire` meanwhile makes that wiring stale. The {@link WireAttempt} handed to
+ *    `wire` rolls back what it has registered right then (`onSuperseded`) and lets it stop
+ *    before registering more (`stillCurrent`); whatever it still hands back is disposed
+ *    instead of installed — a layer nobody owns would keep allocating slots;
+ *  - a live setting change ({@link reconfigure}) while wiring is held and applied when the
+ *    layer lands, since the attempt read its settings when it started;
+ *  - {@link idle} lets a cleanup wait until every attempt, stale ones included, has landed.
  */
 export class TmuxLayerController {
     private layer: TmuxTerminalLayer | undefined;
     private wiring: Promise<TmuxTerminalLayer | undefined> | undefined;
     /** Bumped by every unwire; a wiring started under an older value is stale. */
     private generation = 0;
+    /** The latest live setting change that arrived while the current wiring was in flight. */
+    private pendingSettings: TmuxSettings | undefined;
+    /** Settles once every wiring started so far has landed. Never rejects. */
+    private landed: Promise<void> = Promise.resolve();
+    /** Rolls back the in-flight attempt; cleared when it lands. */
+    private supersede: (() => void) | undefined;
 
-    constructor(private readonly wire: () => Promise<TmuxTerminalLayer | undefined>) {
+    constructor(private readonly wire: (attempt: WireAttempt) => Promise<TmuxTerminalLayer | undefined>) {
     }
 
     /** The live layer, if one is wired. */
@@ -523,11 +580,29 @@ export class TmuxLayerController {
         return this.wireNow();
     }
 
+    /** Hand changed live settings to the layer — now, or when the in-flight wiring lands. */
+    reconfigure(settings: TmuxSettings): void {
+        if (this.layer) {
+            this.layer.reconfigure(settings);
+        } else if (this.wiring) {
+            this.pendingSettings = settings;
+        }
+    }
+
+    /** Resolves once every wiring started so far — superseded ones included — has landed. */
+    idle(): Promise<void> {
+        return this.landed;
+    }
+
     /** Drop the current layer, cancel an in-flight wiring, and hand back the dropped
      * layer's identity (what the "still running" offer is about). */
     unwire(): TmuxSessionContext | undefined {
         this.generation++;
         this.wiring = undefined;
+        this.pendingSettings = undefined;
+        const supersede = this.supersede;
+        this.supersede = undefined;
+        supersede?.();
         const layer = this.layer;
         this.layer = undefined;
         layer?.dispose();
@@ -539,19 +614,41 @@ export class TmuxLayerController {
             return this.wiring;
         }
         const generation = this.generation;
+        const stillCurrent = (): boolean => generation === this.generation;
+        const rollbacks: Array<() => void> = [];
+        const attempt: WireAttempt = {
+            stillCurrent,
+            onSuperseded: rollback => {
+                if (stillCurrent()) {
+                    rollbacks.push(rollback);
+                } else {
+                    rollback();
+                }
+            },
+        };
+        this.supersede = () => rollbacks.splice(0).forEach(rollback => rollback());
         const settle = (layer: TmuxTerminalLayer | undefined): TmuxTerminalLayer | undefined => {
-            if (generation !== this.generation) {
+            if (!stillCurrent()) {
                 layer?.dispose(); // superseded while wiring: nobody owns it
                 return undefined;
             }
+            rollbacks.length = 0; // landed: the layer's dispose owns teardown now
+            this.supersede = undefined;
             this.wiring = undefined;
             this.layer = layer;
+            const pending = this.pendingSettings;
+            this.pendingSettings = undefined;
+            if (layer && pending) {
+                layer.reconfigure(pending);
+            }
             return layer;
         };
-        this.wiring = Promise.resolve()
-            .then(() => this.wire())
+        const wiring = Promise.resolve()
+            .then(() => this.wire(attempt))
             .then(settle, () => settle(undefined));
-        return this.wiring;
+        this.wiring = wiring;
+        this.landed = this.landed.then(() => wiring).then(() => undefined, () => undefined);
+        return wiring;
     }
 }
 
@@ -605,25 +702,39 @@ export function watchTmuxLayerInputs(events: TmuxLayerEvents, reactions: TmuxLay
 
 function applySettingsAction(action: ReturnType<typeof decideSettingsChange>, next: TmuxSettings, reactions: TmuxLayerReactions): void {
     switch (action) {
-        case 'offer-cleanup': {
-            const identity = reactions.controller.unwire();
-            reactions.clearDefaultProfile();
-            if (identity) {
-                reactions.offerCleanup(identity)
-                    .catch(err => reactions.log.trace(`Persistent terminals: cleanup offer failed: ${errorMessage(err)}`));
-            }
+        case 'offer-cleanup':
+            cleanUpAfterTurnOff(reactions.controller.unwire(), reactions)
+                .catch(err => reactions.log.trace(`Persistent terminals: cleanup offer failed: ${errorMessage(err)}`));
             break;
-        }
         case 'rewire':
             if (reactions.connected()) {
                 void reactions.controller.rewire();
             }
             break;
         case 'refresh':
-            reactions.controller.current?.reconfigure(next);
+            reactions.controller.reconfigure(next);
             break;
         case 'none':
             break;
+    }
+}
+
+/**
+ * After persistent terminals were switched off: remove our default-profile write and offer to
+ * close what still runs. Waits for any wiring that was in flight first — it may still be
+ * writing the default profile, and clearing before that write lands would find nothing and
+ * leave the write behind. Such a wiring never landed a layer, so the offer is made for the
+ * current folder's identity. Turned back on meanwhile → the new layer owns both; do neither.
+ */
+async function cleanUpAfterTurnOff(dropped: TmuxSessionContext | undefined, reactions: TmuxLayerReactions): Promise<void> {
+    await reactions.controller.idle();
+    if (reactions.controller.wired) {
+        return;
+    }
+    reactions.clearDefaultProfile();
+    const identity = dropped ?? await reactions.currentIdentity();
+    if (identity) {
+        await reactions.offerCleanup(identity);
     }
 }
 
@@ -746,6 +857,18 @@ export function onceOnly(action: () => void): () => void {
         }
         ran = true;
         action();
+    };
+}
+
+/** Run `action` once per distinct key, never again for the same one. */
+export function oncePerKey(action: (key: string) => void): (key: string) => void {
+    const seen = new Set<string>();
+    return key => {
+        if (seen.has(key)) {
+            return;
+        }
+        seen.add(key);
+        action(key);
     };
 }
 

@@ -26,19 +26,24 @@ const NOW = 1_700_000_000;
 const OLD = NOW - 3600;
 
 /**
- * A `tmux list-sessions -F` stdout line: `<name> <attached> <windows> <created> <paneDead>`.
+ * One session as the list command reports it: a `__win <activity> <name>` line per window
+ * (`windowRows` overrides how many — fewer than `windows` is a session the window list did
+ * not fully cover; `windowRow: false` is none at all), then the
+ * `tmux list-sessions -F` line: `<name> <attached> <windows> <created> <paneDead>`.
  * A reapable corpse is detached with a dead pane (`paneDead: true`); a live session
  * has `paneDead: false`. `windows` is ≥1 for any real session and is never the reap gate.
  */
 const row = (
     name: string,
     attached: boolean,
-    opts: { windows?: number; paneDead?: boolean; created?: number; activity?: number } = {},
+    opts: { windows?: number; paneDead?: boolean; created?: number; activity?: number; windowRow?: boolean; windowRows?: number } = {},
 ): string => {
     const windows = opts.windows ?? 1;
     const created = opts.created ?? OLD;
     const activity = opts.activity ?? created;
-    return `${name} ${attached ? 1 : 0} ${windows} ${created} ${opts.paneDead ? 1 : 0} a:${activity} o:`;
+    const session = `${name} ${attached ? 1 : 0} ${windows} ${created} ${opts.paneDead ? 1 : 0} a:${activity} o:`;
+    const rows = opts.windowRow === false ? 0 : opts.windowRows ?? windows;
+    return [...Array.from({ length: rows }, () => `__win ${activity} ${name}`), session].join('\n');
 };
 
 /**
@@ -53,8 +58,12 @@ function fakeExec(opts: {
     throwKillFor?: string;
     failKillFor?: { name: string; stderr: string; code: number | undefined };
     listResult?: { stdout: string; stderr: string; code: number | undefined };
+    /** The remote's own clock, as the list command reports it ahead of the rows. Defaults to
+     * `NOW`; `null` leaves the clock line out (an answer that lost it). */
+    remoteNow?: number | null;
 } = {}) {
-    const listOut = (opts.list ?? []).join('\n');
+    const clock = opts.remoteNow === null ? [] : [`__now ${opts.remoteNow ?? NOW}`];
+    const listOut = [...clock, ...(opts.list ?? [])].join('\n');
     return vi.fn(async (command: string): Promise<{ stdout: string; stderr: string; code: number | undefined }> => {
         if (command.includes('list-sessions')) {
             if (opts.throwOnList) {
@@ -354,6 +363,82 @@ describe('reap — orphan aging (05: remote.SSH.tmux.orphanMaxAgeDays)', () => {
         const { reaper } = makeReaper({ exec, orphanMaxAgeDays: 14 });
 
         expect(await reaper.reap()).toEqual({ killed: 0, orphansKept: 1, orphansTotal: 1 });
+    });
+});
+
+// Every epoch in a `list-sessions` row is the REMOTE's. Aging them against the local clock
+// made the verdict depend on how far apart two machines' clocks are: a laptop whose clock
+// runs 20 days ahead reaped sessions that had been used the day before.
+describe('reap — ages against the remote clock, never the local one', () => {
+    const DAY = 86400;
+
+    it('a local clock 20 days ahead does not reap a session idle for one day', async () => {
+        const exec = fakeExec({ remoteNow: NOW, list: [row(ours(0), false, { activity: NOW - DAY })] });
+        const { reaper } = makeReaper({ exec, now: NOW + 20 * DAY, orphanMaxAgeDays: 14 });
+
+        expect(await reaper.reap()).toEqual({ killed: 0, orphansKept: 1, orphansTotal: 1 });
+        expect(killCommands(exec)).toEqual([]);
+    });
+
+    it('a local clock 20 days behind still reaps a session idle for 15 days', async () => {
+        const exec = fakeExec({ remoteNow: NOW, list: [row(ours(0), false, { activity: NOW - 15 * DAY })] });
+        const { reaper } = makeReaper({ exec, now: NOW - 20 * DAY, orphanMaxAgeDays: 14 });
+
+        expect(await reaper.reap()).toEqual({ killed: 1, orphansKept: 0, orphansTotal: 1 });
+    });
+
+    // Without the remote's clock there is nothing sound to age against: orphans are counted
+    // and kept. A corpse needs no clock to be a corpse — only its short startup grace, for
+    // which the local clock is good enough.
+    it('no remote clock in the answer: orphans are kept, corpses are still reaped', async () => {
+        const exec = fakeExec({
+            remoteNow: null,
+            list: [
+                row(ours(0), false, { activity: NOW - 99 * DAY }),
+                row(ours(1), false, { paneDead: true }),
+            ],
+        });
+        const { reaper, log } = makeReaper({ exec, orphanMaxAgeDays: 14 });
+
+        expect(await reaper.reap()).toEqual({ killed: 1, orphansKept: 1, orphansTotal: 1 });
+        expect(killCommands(exec)).toEqual([buildKillSession(ours(1))]);
+        expect(log.trace).toHaveBeenCalledWith(expect.stringContaining('remote clock'));
+    });
+
+    // Windows and sessions are one snapshot, so a session without a window line is data
+    // that did not arrive: its last output is unknown, and it is kept.
+    it('a session the window list did not cover is never aged out', async () => {
+        const exec = fakeExec({
+            list: [
+                row(ours(0), false, { activity: NOW - 99 * DAY, windowRow: false }),
+                row(ours(1), false, { activity: NOW - 99 * DAY }),
+            ],
+        });
+        const { reaper } = makeReaper({ exec, orphanMaxAgeDays: 14 });
+
+        expect(await reaper.reap()).toEqual({ killed: 1, orphansKept: 1, orphansTotal: 2 });
+        expect(killCommands(exec)).toEqual([buildKillSession(ours(1))]);
+    });
+
+    // Two windows, one reported: the other may hold the live task. Kept, and counted.
+    it('a session with a window the list did not report is never aged out', async () => {
+        const exec = fakeExec({
+            list: [
+                row(ours(0), false, { activity: NOW - 99 * DAY, windows: 2, windowRows: 1 }),
+                row(ours(1), false, { activity: NOW - 99 * DAY, windows: 2 }),
+            ],
+        });
+        const { reaper } = makeReaper({ exec, orphanMaxAgeDays: 14 });
+
+        expect(await reaper.reap()).toEqual({ killed: 1, orphansKept: 1, orphansTotal: 2 });
+        expect(killCommands(exec)).toEqual([buildKillSession(ours(1))]);
+    });
+
+    it('measures the corpse grace on the remote clock too', async () => {
+        const exec = fakeExec({ remoteNow: NOW, list: [row(ours(0), false, { paneDead: true, created: NOW - 2 })] });
+        const { reaper } = makeReaper({ exec, now: NOW + 20 * DAY });
+
+        expect(await reaper.reap()).toEqual({ killed: 0, orphansKept: 0, orphansTotal: 0 });
     });
 });
 

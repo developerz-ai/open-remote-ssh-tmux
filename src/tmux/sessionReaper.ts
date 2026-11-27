@@ -4,6 +4,7 @@ import {
     buildListSessions,
     classifyTmuxFailure,
     DEFAULT_ORPHAN_MAX_AGE_DAYS,
+    parseListSessionsClock,
     readListSessionsResult,
     reapVerdict,
     sessionSlot,
@@ -21,6 +22,12 @@ import {
 // (`reapVerdict`) — this module only orchestrates list -> parse -> decide -> kill and
 // keeps the counts for one invisible log line, so there is no tmux string concatenation
 // outside the session model.
+//
+// Ages are measured on the REMOTE's clock, which the list command reports alongside the
+// rows (`parseListSessionsClock`): every epoch in a row is the remote's, and two machines'
+// clocks differ — against the local clock, a laptop running 20 days ahead reaped sessions
+// used the day before. The injected local clock is only the fallback for the corpse grace
+// when the remote's did not come back; orphans are never aged without it.
 //
 // Dependency-inverted (D in SOLID) and side-effect-narrow: the remote command
 // runner, an epoch-seconds clock (so reap decisions are deterministic and this
@@ -51,6 +58,8 @@ export interface TmuxLog {
 /** Collaborators + config for a `SessionReaper`. */
 export interface SessionReaperDeps {
     readonly exec: RemoteExec;
+    /** The LOCAL clock: used only for the corpse grace, and only when the remote's own clock
+     * did not come back with the list. Orphan aging never reads it. */
     readonly now: Clock;
     readonly log: TmuxLog;
     /** Never reap a session younger than this many seconds — guards a session whose
@@ -131,14 +140,21 @@ export class SessionReaper {
      * a long absence must find their terminals, not a reaper that got there first.
      */
     async reap(options: { protect?: readonly string[] } = {}): Promise<ReapOutcome> {
-        const sessions = await this.listSessions();
-        if (sessions === undefined) {
+        const listed = await this.listSessions();
+        if (listed === undefined) {
             return { killed: 0, orphansKept: 0, orphansTotal: 0 }; // already traced; never break the connect
         }
+        const { sessions, remoteNow } = listed;
+        if (remoteNow === undefined) {
+            this.log.trace('tmux reaper: the remote clock did not come back — old sessions are not aged this pass');
+        }
 
-        const now = this.now();
+        const now = remoteNow ?? this.now();
         const protect = new Set(options.protect ?? []);
-        const reapOptions = { minAgeSeconds: this.minAgeSeconds, orphanMaxAgeDays: this.orphanMaxAgeDays };
+        const reapOptions = {
+            minAgeSeconds: this.minAgeSeconds,
+            orphanMaxAgeDays: remoteNow === undefined ? 0 : this.orphanMaxAgeDays,
+        };
         let killed = 0;
         let orphansTotal = 0;
         let orphansKilled = 0;
@@ -207,21 +223,22 @@ export class SessionReaper {
     /** The listed sessions that decode to a slot of one of `identities` (the full
      * `code-<hash>-` prefix, so a sibling workspace or a foreign session never qualifies). */
     private async workspaceSessions(identities: readonly WorkspaceIdentity[]): Promise<TmuxSession[] | undefined> {
-        const sessions = await this.listSessions();
-        return sessions?.filter(session =>
+        const listed = await this.listSessions();
+        return listed?.sessions.filter(session =>
             identities.some(({ hostKey, workspaceKey }) => sessionSlot(session.name, hostKey, workspaceKey) !== undefined));
     }
 
-    /** Snapshot the remote's sessions, or `undefined` if the probe itself failed
-     * (distinct from "zero sessions", which is a normal empty array). */
-    private async listSessions(): Promise<TmuxSession[] | undefined> {
+    /** Snapshot the remote's sessions and its clock, or `undefined` if the probe itself
+     * failed (distinct from "zero sessions", which is a normal empty array). */
+    private async listSessions(): Promise<{ sessions: TmuxSession[]; remoteNow: number | undefined } | undefined> {
         try {
             const result = await this.exec(buildListSessions(this.tmuxPath));
             const sessions = readListSessionsResult(result);
             if (sessions === undefined) {
                 this.log.trace(`tmux reaper: list-sessions failed (rc ${result.code ?? 'unknown'}): ${result.stderr.trim()}`);
+                return undefined;
             }
-            return sessions;
+            return { sessions, remoteNow: parseListSessionsClock(result.stdout) };
         } catch (err) {
             this.log.trace(`tmux reaper: list-sessions failed: ${errorText(err)}`);
             return undefined;
