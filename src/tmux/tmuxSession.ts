@@ -103,8 +103,9 @@ const CLIENT_FEATURES_WITH_HYPERLINKS = 'RGB,hyperlinks,sync';
 
 /** Below tmux 3.2 there is no `-T`; the only way to get 24-bit colour through is the `Tc`
  * terminal override, and that is a SERVER option matched on the client's `TERM`. It is
- * appended once (see {@link buildAttachOrCreateArgv}) and adds the one capability to
- * `xterm*` clients — the user's own included. */
+ * appended once, and only to a server that says nothing about `Tc` yet (see
+ * {@link truecolorOverridden}); it adds the one capability to `xterm*` clients — the user's
+ * own included. */
 const TRUECOLOR_OVERRIDE = 'xterm*:Tc';
 
 /** What the pane is told about colour where `new-session -e` exists. The pane's environment
@@ -236,7 +237,8 @@ export interface TmuxSession {
     /** Unix epoch seconds of the session's last activity, the age evidence of the orphan rule
      * in {@link reapVerdict}: the later of `#{session_activity}` (client input, attach) and
      * the newest `#{window_activity}` (pane output) of ANY of its windows, so a detached
-     * task that is still printing — in whichever window — is not idle. `undefined` for a row that carried neither — and then the session is never aged out. */
+     * task that is still printing — in whichever window — is not idle. Needs the output
+     * side: a session no window line was reported for has an unknown age. `undefined` for a row that carried neither — and then the session is never aged out. */
     readonly activityEpoch?: number;
     /** `#{@orst_owner}` — the client id of the window that last attached, or `undefined` for
      * a session that carries no tag (created before tags existed, or never attached by us). */
@@ -411,7 +413,10 @@ function jobTmux(tmuxPath: string): string {
  * version) and what is left must EQUAL (`grep -Fx`) a binding we make. A prefix we never
  * print — `bind-key -r …`, the repeat flag — is not cut, so that line stays the user's.
  *
- * `list-keys -T root <key>` does not exist at 2.6, hence the first grep. The patterns are
+ * `list-keys -T root <key>` does not exist at 2.6, hence the first grep. It reads the key
+ * from the binding's HEADER only (`bind-key [-r] -T root <key>`, anchored at the line start):
+ * unanchored, another key whose command merely mentioned `-T root PPage` counted as a PageUp
+ * binding of the user's, and ours was never made. The patterns are
  * fixed strings in single quotes (they contain none), with `#` doubled: tmux format-expands
  * the job before the shell sees it.
  */
@@ -419,22 +424,31 @@ function rootKeyBound(tmux: string, key: PagingKey): string {
     const ours = OUR_BINDING_PREDICATES
         .map(predicate => `-e '${printedPagingBinding(key, predicate).replace(/#/g, '##')}'`)
         .join(' ');
-    return `${tmux} list-keys -T root | grep -E -- '-T root +${key} '`
-        + ` | sed -E 's/^bind-key +-T root +${key} +//' | grep -Fxqv ${ours}`;
+    return `${tmux} list-keys -T root | grep -E '^bind-key +(-r +)?-T +root +${key} '`
+        + ` | sed -E 's/^bind-key +-T +root +${key} +//' | grep -Fxqv ${ours}`;
 }
 
-/** `if-shell` test that succeeds when the server's `terminal-overrides` already carry
- * {@link TRUECOLOR_OVERRIDE} — from the user's own config or an earlier attach of ours — so
- * the append below happens once per server, never once per attach.
+/**
+ * `if-shell` test that succeeds when the server's `terminal-overrides` already say anything
+ * about `Tc` — the user's own config or an earlier attach of ours — so the append below
+ * happens once per server, never once per attach, and never against the user's wishes.
+ *
+ * ANY mention counts, removal (`Tc@`) included and whatever the pattern: looking only for our
+ * own `xterm*:Tc` missed a user's `xterm-256color:Tc@`, and the append — later entries win —
+ * switched back on the 24-bit colour they had switched off. The price of asking no more than
+ * "is Tc mentioned" is that a server whose only mention is for an unrelated terminal stays at
+ * 256 colours here; that is the safe side of a setting that is the user's. The pattern takes
+ * `Tc` as a whole capability (`:Tc`, then `@`, `:`, the closing quote 2.6 prints, or the end).
  *
  * Check and append are two steps with a shell job between them, so two FIRST attaches racing
  * on a fresh server can both append. That is left as it is: the entry is identical, tmux
  * applies overrides in order and the second sets the same capability again, and the race
  * closes for good once either lands. A check inside the server is not available — an array
  * option expands to nothing in a format (`#{terminal-overrides}` is empty on 2.6, 3.0a and
- * 3.4), and a marker option would stop recognising an override the user already has. */
+ * 3.4), and a marker option would stop recognising an override the user already has.
+ */
 function truecolorOverridden(tmux: string): string {
-    return `${tmux} show-options -s terminal-overrides | grep -Fq '${TRUECOLOR_OVERRIDE}'`;
+    return `${tmux} show-options -s terminal-overrides | grep -Eq ':Tc(@|:|"|$)'`;
 }
 
 /**
@@ -611,28 +625,33 @@ export function isDuplicateSession(stderr: string): boolean {
  * signal `shouldReap` needs — `#{session_windows}` can never fall to 0 on a live
  * session (tmux destroys it with its last window). It expands to `0`/`1`, so it is
  * always a token: the last of the four numeric fields, which `parseListSessions` reads
- * from the right once the tagged fields behind it (`a:` `w:` `o:` `c:`) are taken off.
+ * from the right once the tagged fields behind it (`a:` `o:` `c:`) are taken off.
  *
  * The rows are preceded by the remote's clock (`__now <epoch>`, as in
  * {@link buildListClientsCommand}; read with {@link parseListSessionsClock}): the reaper
  * ages sessions against it, never against the local clock — two machines' clocks differ,
  * and a local clock running days ahead aged a fresh session into an orphan.
  *
- * Between the two, `list-windows -a` reports every window's `#{window_activity}`
- * (`__win <epoch> <session>`): the one in a session row is its CURRENT window's only, and a
- * program in the pane can open another (`tmux new-window`) and print there while the
- * current one sits idle (verified 2.6, 3.0a, 3.4). `parseListSessions` merges them. Its
- * errors are discarded and `list-sessions` runs last, so the exit status and stderr callers
- * classify are still `list-sessions`'s.
+ * Output activity is a WINDOW's (`#{session_activity}` only moves on client input and
+ * attach: a detached pane printing every second left it unchanged, verified on 3.4), and a
+ * program in the pane can open a second window (`tmux new-window`) and print there while
+ * the current one sits idle. So `list-windows -a` reports every window
+ * (`__win <epoch> <session>`), and `parseListSessions` takes the newest per session.
+ *
+ * Both lists come from ONE tmux invocation, `list-windows … ; list-sessions …`: a client's
+ * commands run back to back inside the server, so they are a single snapshot. As two
+ * invocations, a window created between them was in neither list's favour — its session was
+ * listed, its output was not, and a session still printing could be reaped. Verified on
+ * 2.6, 3.0a, 3.4, 3.5a and 3.8: both outputs in order with exit 0; with no server, one
+ * "error connecting"/"no server running" on stderr and exit 1 — what callers already
+ * classify. A session that still has no window line has unknown output and is never aged.
  */
 export function buildListSessions(tmuxPath = TMUX_BIN): string {
-    const tmux = escapeShellArg(tmuxPath);
-    return `printf '${NOW_TAG} %s\\n' "$(date +%s)"; `
-        + `${tmux} list-windows -a -F ${escapeShellArg(`${WINDOW_TAG} #{window_activity} #{session_name}`)} 2>/dev/null; `
-        + `${tmux} list-sessions -F `
+    return `printf '${NOW_TAG} %s\\n' "$(date +%s)"; ${escapeShellArg(tmuxPath)} `
+        + `list-windows -a -F ${escapeShellArg(`${WINDOW_TAG} #{window_activity} #{session_name}`)} `
+        + `${escapeShellArg(';')} list-sessions -F `
         + escapeShellArg(`#{session_name} #{session_attached} #{session_windows} #{session_created} #{pane_dead} `
-            + `${ACTIVITY_FIELD}#{session_activity} ${OUTPUT_FIELD}#{window_activity} `
-            + `${OWNER_FIELD}#{${OWNER_OPTION}} ${CLOSED_FIELD}#{${CLOSED_OPTION}}`);
+            + `${ACTIVITY_FIELD}#{session_activity} ${OWNER_FIELD}#{${OWNER_OPTION}} ${CLOSED_FIELD}#{${CLOSED_OPTION}}`);
 }
 
 /** The remote's own clock (epoch seconds) from a {@link buildListSessions} run, or `undefined`
@@ -646,13 +665,6 @@ export function parseListSessionsClock(stdout: string): number | undefined {
 /** Prefix of the activity field in a {@link buildListSessions} row — tagged like the owner
  * field, so a row from before it existed (or a fixture) still parses unambiguously. */
 const ACTIVITY_FIELD = 'a:';
-
-/** Prefix of the `#{window_activity}` field: the last time the session's CURRENT window had
- * OUTPUT (the other windows' come on {@link WINDOW_TAG} lines).
- * `#{session_activity}` moves only on client input and attach (verified on 3.4: a detached
- * pane printing every second left it unchanged), so on its own it aged a detached long task
- * that prints but is never typed into — the very thing this fork exists to keep alive. */
-const OUTPUT_FIELD = 'w:';
 
 /** Tag on each per-window line of {@link buildListSessions}: `__win <window_activity> <session
  * name>` — the name last, so one with spaces survives. */
@@ -893,7 +905,6 @@ export function parseListSessions(stdout: string): TmuxSession[] {
         // here: `popTagged` then finds nothing, and the length check below skips the line.
         const closedToken = popTagged(tokens, CLOSED_FIELD);
         const ownerToken = popTagged(tokens, OWNER_FIELD);
-        const outputToken = popTagged(tokens, OUTPUT_FIELD);
         const activityToken = popTagged(tokens, ACTIVITY_FIELD);
         if (tokens.length < 5) {
             continue;
@@ -913,11 +924,8 @@ export function parseListSessions(stdout: string): TmuxSession[] {
             windows,
             paneDead: paneDeadFlag > 0,
             createdEpoch,
-            activityEpoch: latestEpoch(
-                latestEpoch(
-                    activityToken === undefined ? undefined : toNonNegativeInt(activityToken.slice(ACTIVITY_FIELD.length)),
-                    outputToken === undefined ? undefined : toNonNegativeInt(outputToken.slice(OUTPUT_FIELD.length)),
-                ),
+            activityEpoch: lastAlive(
+                activityToken === undefined ? undefined : toNonNegativeInt(activityToken.slice(ACTIVITY_FIELD.length)),
                 windowActivity.get(name),
             ),
             owner: ownerToken === undefined || ownerToken === OWNER_FIELD ? undefined : ownerToken.slice(OWNER_FIELD.length),
@@ -1011,12 +1019,14 @@ function newestWindowActivity(lines: readonly string[]): Map<string, number> {
     return newest;
 }
 
-/** The later of two optional epochs; `undefined` only when neither was reported. */
-function latestEpoch(a: number | undefined, b: number | undefined): number | undefined {
-    if (a === undefined || b === undefined) {
-        return a ?? b;
+/** When a session was last alive: the later of its last input and its newest window output.
+ * `undefined` without the output side — no window line came back for it, so its real age is
+ * unknown, and unknown is never old enough to reap. */
+function lastAlive(input: number | undefined, output: number | undefined): number | undefined {
+    if (output === undefined) {
+        return undefined;
     }
-    return Math.max(a, b);
+    return input === undefined ? output : Math.max(input, output);
 }
 
 /** A close marker's value, or `undefined` for anything that is not one (unset, withdrawn). */

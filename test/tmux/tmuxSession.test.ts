@@ -117,10 +117,9 @@ describe('buildListSessions', () => {
         // `#{session_windows}` alone can never be 0 for a live session, so it is not it.
         expect(buildListSessions()).toBe(
             `printf '__now %s\\n' "$(date +%s)"; `
-            + `'tmux' list-windows -a -F '__win #{window_activity} #{session_name}' 2>/dev/null; `
-            + `'tmux' list-sessions -F `
+            + `'tmux' list-windows -a -F '__win #{window_activity} #{session_name}' ';' list-sessions -F `
             + `'#{session_name} #{session_attached} #{session_windows} #{session_created} #{pane_dead} `
-            + `a:#{session_activity} w:#{window_activity} o:#{@orst_owner} c:#{@orst_closed}'`,
+            + `a:#{session_activity} o:#{@orst_owner} c:#{@orst_closed}'`,
         );
     });
 
@@ -128,7 +127,7 @@ describe('buildListSessions', () => {
     // too, so the same command reports it first (exit status stays list-sessions's — last).
     it('reports the remote clock ahead of the rows', () => {
         expect(buildListSessions()).toMatch(/^printf '__now %s\\n' "\$\(date \+%s\)"; /);
-        expect(parseListSessionsClock('__now 1700000123\ncode-x-0 0 1 1700000000 0 a:1 w:2 o: c:\n')).toBe(1700000123);
+        expect(parseListSessionsClock('__now 1700000123\ncode-x-0 0 1 1700000000 0 a:1 o: c:\n')).toBe(1700000123);
         expect(parseListSessionsClock('banner\n__now 5 \n')).toBe(5);
         expect(parseListSessionsClock('code-x-0 0 1 1700000000 0\n')).toBeUndefined();
         expect(parseListSessionsClock('__now soon\n')).toBeUndefined();
@@ -136,22 +135,24 @@ describe('buildListSessions', () => {
         expect(parseListSessions('__now 1700000123\n')).toEqual([]);
     });
 
-    // `#{window_activity}` in a list-sessions row is the session's CURRENT window only. A
-    // program in the pane can open a second window (`tmux new-window`) and print there for
-    // weeks while the current one sits idle — so every window's activity is listed too, and
-    // list-sessions stays LAST: the exit status callers classify is still its own.
-    it('lists every window\'s activity ahead of the sessions, and list-sessions runs last', () => {
+    // Output activity is per WINDOW, and a program in the pane can open a second window
+    // (`tmux new-window`) and print there for weeks, so every window is listed. Windows and
+    // sessions must come from ONE tmux invocation: as two, a window created between them
+    // was missing from the first list while its session was in the second — read as "no
+    // output", and the session was reaped. One client's commands run back to back inside
+    // the server (verified 2.6 … 3.8: both outputs, exit 0; no server: one error, exit 1).
+    it('lists windows and sessions in one tmux invocation — a single snapshot', () => {
         const command = buildListSessions('/opt/tmux');
-        const windows = command.indexOf(`'/opt/tmux' list-windows -a -F '__win #{window_activity} #{session_name}' 2>/dev/null; `);
-        expect(windows).toBeGreaterThan(0);
-        expect(command.indexOf(`'/opt/tmux' list-sessions -F `)).toBeGreaterThan(windows);
+        expect(command.match(/'\/opt\/tmux' /g)).toHaveLength(1);
+        expect(command).toContain(`'/opt/tmux' list-windows -a -F '__win #{window_activity} #{session_name}' ';' list-sessions -F '`);
+        // Nothing is hidden from stderr: the "no server" message is what callers classify.
+        expect(command).not.toContain('2>');
         expect(command).toMatch(/c:#\{@orst_closed\}'$/);
     });
 
     // The pty launches the probe's absolute path; exec-side commands must address the SAME
     // binary, or a bare `tmux` on a different PATH can talk to a different server.
     it('runs the given tmux binary, quoted', () => {
-        expect(buildListSessions(`/home/a b/tmux`)).toContain(`; '/home/a b/tmux' list-sessions -F `);
         expect(buildListSessions(`/home/a b/tmux`)).toContain(`; '/home/a b/tmux' list-windows -a -F `);
     });
 });
@@ -341,7 +342,7 @@ describe('buildAttachOrCreateArgv', () => {
     const printed = (predicate: string, key: string): string =>
         `if-shell -F "${predicate}" "send-keys ${key}"${key === 'PPage' ? ' "copy-mode -eu"' : ''}`;
     const userBound = (tmux: string, key: string): string =>
-        `${tmux} list-keys -T root | grep -E -- '-T root +${key} ' | sed -E 's/^bind-key +-T root +${key} +//'`
+        `${tmux} list-keys -T root | grep -E '^bind-key +(-r +)?-T +root +${key} ' | sed -E 's/^bind-key +-T +root +${key} +//'`
         + ` | grep -Fxqv -e '${inJob(printed(PASS_THROUGH, key))}' -e '${inJob(printed(PASS_THROUGH_V1, key))}'`;
     /** The client flags and the create's `-e` on tmux >= 3.4. */
     const CLIENT = ['-u', '-T', 'RGB,hyperlinks,sync'];
@@ -418,12 +419,58 @@ describe('buildAttachOrCreateArgv', () => {
         const argv = buildAttachOrCreateArgv(NAME, '/p', undefined, { tmuxPath: TMUX, tmuxVersion });
         expect(argv.slice(0, 6)).toEqual([
             '-u',
-            'if-shell', `${Q} show-options -s terminal-overrides | grep -Fq 'xterm*:Tc'`, '',
+            'if-shell', `${Q} show-options -s terminal-overrides | grep -Eq ':Tc(@|:|"|$)'`, '',
             'set-option -as terminal-overrides ",xterm*:Tc"',
             ';',
         ]);
         expect(argv).not.toContain('-T');
         expect(argv.indexOf('if-shell')).toBeLessThan(argv.indexOf('new-session'));
+    });
+
+    // The check that guards the append, run by a real `sh` over `show-options` output in the
+    // shapes tmux prints (2.6 quotes each entry; 3.x does not). Exit 0 = leave it alone.
+    describe.skipIf(process.platform === 'win32')('the "does the server already say something about Tc?" job, run under sh', () => {
+        const dir = mkdtempSync(join(tmpdir(), 'orst-tc-'));
+        const stub = join(dir, 'tmux');
+        const lines = join(dir, 'lines');
+        writeFileSync(stub, `#!/bin/sh\ncat ${escapeShellArg(lines)}\n`);
+        chmodSync(stub, 0o755);
+        afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+        const DEFAULT_26 = 'terminal-overrides[0] "xterm*:XT:Ms=\\\\E]52;%p1%s;%p2%s\\\\007:Cs=\\\\E]12;%p1%s\\\\007:Cr=\\\\E]112\\\\007:Ss=\\\\E[%p1%d q:Se=\\\\E[2 q"';
+
+        function alreadySaid(overrides: string[]): boolean {
+            writeFileSync(lines, overrides.map(line => `${line}\n`).join(''));
+            const job = buildAttachOrCreateArgv(NAME, '/p', undefined, { tmuxPath: stub, tmuxVersion: '2.6' })[2];
+            const result = spawnSync('sh', ['-c', job.replace(/##/g, '#')], { encoding: 'utf8' });
+            expect(result.stderr).toBe('');
+            return result.status === 0;
+        }
+
+        it('tmux\'s own defaults say nothing about Tc: append', () => {
+            expect(alreadySaid([DEFAULT_26, 'terminal-overrides[1] "screen*:XT"'])).toBe(false);
+            expect(alreadySaid(['terminal-overrides'])).toBe(false);
+            expect(alreadySaid([])).toBe(false);
+        });
+
+        // A user who REMOVED truecolor (`Tc@`) had it re-enabled by our append, which the
+        // old check (`xterm*:Tc` literally) did not see. Any mention of Tc is their decision.
+        it.each([
+            'terminal-overrides[2] "xterm-256color:Tc@"',
+            'terminal-overrides[2] xterm-256color:Tc@',
+            'terminal-overrides[1] xterm*:Tc',
+            'terminal-overrides[1] "xterm*:Tc"',
+            'terminal-overrides[1] xterm*:Tc:smcup@',
+            'terminal-overrides[1] xterm-kitty:XT:Tc@:sitm=x',
+            'terminal-overrides[1] *:Tc',
+            'terminal-overrides ",xterm*:Tc"',
+        ])('%s: the user has decided — never append', entry => {
+            expect(alreadySaid([DEFAULT_26, entry])).toBe(true);
+        });
+
+        it('a capability that merely starts with or contains "Tc" is not Tc', () => {
+            expect(alreadySaid(['terminal-overrides[1] xterm*:XTc=1:Tcx'])).toBe(false);
+        });
     });
 
     // The pane's environment is the tmux SERVER's, not VS Code's terminal's, so COLORTERM
@@ -476,7 +523,8 @@ describe('buildAttachOrCreateArgv', () => {
     it('tells its own bindings by the complete binding, never by the predicate alone', () => {
         for (const key of ['PPage', 'NPage']) {
             const job = userBound(Q, key);
-            expect(job).toContain(`sed -E 's/^bind-key +-T root +${key} +//'`);
+            expect(job).toContain(`grep -E '^bind-key +(-r +)?-T +root +${key} '`);
+            expect(job).toContain(`sed -E 's/^bind-key +-T +root +${key} +//'`);
             expect(job).toContain(`grep -Fxqv -e '${inJob(printed(PASS_THROUGH, key))}' -e '${inJob(printed(PASS_THROUGH_V1, key))}'`);
             // tmux format-expands the job before the shell runs it: every `#` is written `##`.
             expect(job.replace(/##/g, '')).not.toContain('#');
@@ -507,7 +555,7 @@ describe('buildAttachOrCreateArgv', () => {
         function userHasBound(key: string, rootTable: string[]): boolean {
             writeFileSync(lines, [MOUSE, ...rootTable].map(line => `${line}\n`).join(''));
             const argv = buildAttachOrCreateArgv(NAME, '/p', undefined, { tmuxPath: stub });
-            const job = argv.find(arg => arg.includes('list-keys') && arg.includes(`+${key} `))!;
+            const job = argv.find(arg => arg.includes('list-keys') && arg.includes(`+root +${key} `))!;
             // What tmux hands the shell: the job with its `##` escapes expanded.
             const result = spawnSync('sh', ['-c', job.replace(/##/g, '#')], { encoding: 'utf8' });
             expect(result.stderr).toBe('');
@@ -544,6 +592,16 @@ describe('buildAttachOrCreateArgv', () => {
             it('our command under the user\'s -r flag: theirs', () => {
                 const repeat = PREFIXES[version]('PPage').replace('bind-key', 'bind-key -r');
                 expect(userHasBound('PPage', [`${repeat}${printed(PASS_THROUGH, 'PPage')}`])).toBe(true);
+            });
+
+            // The key is the one in the binding's HEADER. Another key whose command merely
+            // mentions this one was counted as a binding of it — and ours was never made.
+            it.each(['PPage', 'NPage'])('another key whose command text mentions %s is not a binding of it', key => {
+                expect(userHasBound(key, [
+                    line('F5', `run-shell "tmux list-keys -T root ${key} | head"`),
+                    line('F6', `display-message "bind-key -T root ${key} copy-mode"`),
+                    line('C-a', `send-keys ${key} `),
+                ])).toBe(false);
             });
 
             it('a binding of the other key never decides this one', () => {
@@ -621,7 +679,7 @@ describe('buildAttachOrCreateArgv', () => {
             .toBe(`${quoted} set-option -g @orst_saved_hl "$(${quoted} show-options -gv history-limit)"`);
         expect(argv).toContain(userBound(quoted, 'PPage'));
         const old = buildAttachOrCreateArgv(NAME, '/p', undefined, { tmuxPath: `/opt/it's #1/tmux`, tmuxVersion: '2.6' });
-        expect(old[2]).toBe(`${quoted} show-options -s terminal-overrides | grep -Fq 'xterm*:Tc'`);
+        expect(old[2]).toBe(`${quoted} show-options -s terminal-overrides | grep -Eq ':Tc(@|:|"|$)'`);
     });
 
     // SECURITY: tmux format-expands `new-session -c`, so a directory named
@@ -775,7 +833,7 @@ describe('parseListSessions', () => {
 
     // A login-shell banner line of one or two tagged-looking tokens ran the parser out of
     // tokens: `tokens[tokens.length - 1]` was undefined and the whole list read threw.
-    it.each(['c:', 'o:x c:', 'c:\\>', 'a:1 o: c:', 'a:1 w:2 o: c:', 'w:'])('skips the noise line %j instead of throwing', noise => {
+    it.each(['c:', 'o:x c:', 'c:\\>', 'a:1 o: c:', 'a:'])('skips the noise line %j instead of throwing', noise => {
         expect(parseListSessions(`${noise}\ncode-x-0 1 1 1700000000 0\n${noise}`)).toEqual([
             { name: 'code-x-0', attached: true, windows: 1, paneDead: false, createdEpoch: 1700000000 },
         ]);
@@ -968,7 +1026,7 @@ describe('close marker (bug A: a window that went away says so)', () => {
 
     describe('parseListSessions', () => {
         it('reads the marker: which client went away, and when (remote clock)', () => {
-            expect(parseListSessions(`code-x-0 1 1 1700000000 0 a:1700000500 o:${OWNER} c:${OWNER}:1700000900`)[0]).toMatchObject({
+            expect(parseListSessions(`__win 1700000400 code-x-0\ncode-x-0 1 1 1700000000 0 a:1700000500 o:${OWNER} c:${OWNER}:1700000900`)[0]).toMatchObject({
                 name: 'code-x-0', owner: OWNER, activityEpoch: 1700000500, closed: { client: OWNER, at: 1700000900 },
             });
         });
@@ -981,7 +1039,7 @@ describe('close marker (bug A: a window that went away says so)', () => {
 
         it('still parses a row from before the marker existed', () => {
             expect(parseListSessions(`code-x-0 1 1 1700000000 0 a:1700000500 o:${OWNER}`)[0]).toMatchObject({
-                name: 'code-x-0', owner: OWNER, activityEpoch: 1700000500, closed: undefined,
+                name: 'code-x-0', owner: OWNER, closed: undefined,
             });
         });
     });
@@ -1048,27 +1106,19 @@ describe('close marker (bug A: a window that went away says so)', () => {
 });
 
 describe('parseListSessions with the activity field (05: orphan aging)', () => {
-    it('reads #{session_activity} as activityEpoch', () => {
-        expect(parseListSessions('code-x-0 0 1 1700000000 0 a:1700000500 o:')[0]).toMatchObject({
-            name: 'code-x-0', createdEpoch: 1700000000, activityEpoch: 1700000500, owner: undefined,
-        });
-    });
-
     // `#{session_activity}` moves on client input and attach only (verified on 3.4 and the
     // rig): a DETACHED pane that prints for weeks never moves it. `#{window_activity}` is
-    // the output side; the later of the two is when the session was last alive.
-    it('takes the later of session activity (a:) and window output (w:)', () => {
-        expect(parseListSessions('code-x-0 0 1 1700000000 0 a:1700000500 w:1700009000 o: c:')[0].activityEpoch).toBe(1700009000);
-        expect(parseListSessions('code-x-0 0 1 1700000000 0 a:1700009000 w:1700000500 o: c:')[0].activityEpoch).toBe(1700009000);
-        expect(parseListSessions('code-x-0 0 1 1700000000 0 w:1700000700 o: c:')[0].activityEpoch).toBe(1700000700);
-        expect(parseListSessions('code-x-0 0 1 1700000000 0 a:1700000500 w: o: c:')[0].activityEpoch).toBe(1700000500);
-        expect(parseListSessions('my s 0 1 1700000000 0 a:1 w:2 o:1a2b3c4d-0011aabb c:')[0]).toMatchObject({
-            name: 'my s', activityEpoch: 2, owner: '1a2b3c4d-0011aabb',
-        });
+    // the output side, reported per window on `__win <epoch> <session>` lines; the later of
+    // the two is when the session was last alive.
+    it('takes the later of session activity (a:) and its window\'s output', () => {
+        const latest = (win: number, input: string): number | undefined =>
+            parseListSessions(`__win ${win} code-x-0\ncode-x-0 0 1 1700000000 0 ${input} o: c:`)[0].activityEpoch;
+        expect(latest(1700009000, 'a:1700000500')).toBe(1700009000);
+        expect(latest(1700000500, 'a:1700009000')).toBe(1700009000);
+        expect(latest(1700000700, 'a:')).toBe(1700000700);
     });
 
-    // The row's `w:` is the CURRENT window only; `__win <epoch> <session>` lines (one per
-    // window, any order, ahead of or after the rows) carry the rest.
+    // One line per window, any order, ahead of or after the rows.
     it('takes the newest activity across ALL of the session\'s windows', () => {
         const out = [
             '__now 1700099999',
@@ -1076,35 +1126,42 @@ describe('parseListSessions with the activity field (05: orphan aging)', () => {
             '__win 1700050000 code-x-0',   // a background window, still printing
             '__win 1700070000 code-x-1',   // another session's window
             '__win 1700090000 my s',
-            'code-x-0 0 2 1700000000 0 a:1700000500 w:1700000600 o: c:',
-            'code-x-1 0 1 1700000000 0 a:1700000500 w:1700000600 o: c:',
-            'my s 0 1 1700000000 0 a:1 w:2 o: c:',
-            'code-x-2 0 1 1700000000 0 a:1700000500 w:1700000600 o: c:',
+            'code-x-0 0 2 1700000000 0 a:1700000500 o: c:',
+            'code-x-1 0 1 1700000000 0 a:1700000500 o: c:',
+            'my s 0 1 1700000000 0 a:1 o:1a2b3c4d-0011aabb c:',
+            '__win 1700000001 code-x-2',
+            'code-x-2 0 1 1700000000 0 a:1700000500 o: c:',
         ].join('\n');
-        expect(parseListSessions(out).map(session => [session.name, session.activityEpoch])).toEqual([
-            ['code-x-0', 1700050000],
-            ['code-x-1', 1700070000],
-            ['my s', 1700090000],
-            ['code-x-2', 1700000600],
+        expect(parseListSessions(out).map(session => [session.name, session.activityEpoch, session.owner])).toEqual([
+            ['code-x-0', 1700050000, undefined],
+            ['code-x-1', 1700070000, undefined],
+            ['my s', 1700090000, '1a2b3c4d-0011aabb'],
+            ['code-x-2', 1700000500, undefined],
         ]);
     });
 
+    // A session with NO window line is incomplete data: its output activity is unknown, so
+    // its age is unknown — `activityEpoch` stays undefined and it is never aged out
+    // (`reapVerdict`). A session always has a window, so this only happens when the window
+    // list did not come back for it; reading "no output since the last keystroke" into
+    // that is how a session still printing would be reaped.
+    it('leaves activityEpoch undefined for a session without any window line', () => {
+        const out = '__win 1700050000 code-x-1\ncode-x-0 0 1 1700000000 0 a:1700000500 o: c:\ncode-x-1 0 1 1700000000 0 a:1 o: c:';
+        expect(parseListSessions(out).map(session => session.activityEpoch)).toEqual([undefined, 1700050000]);
+        expect(parseListSessions('code-x-0 0 1 1700000000 0 a:1700000500 o:')[0].activityEpoch).toBeUndefined();
+        expect(shouldReap(parseListSessions(`code-${HASH_PROJ}-0 0 1 1700000000 0 a:1700000500 o: c:`)[0], 1900000000, { orphanMaxAgeDays: 14 })).toBe(false);
+    });
+
     it('window lines are never sessions, and malformed ones are ignored', () => {
-        // The last one would read as a session row if it were not recognised by its tag.
-        const out = '__win 5 a 1 2 3 4\n__win soon code-x-0\n__win\n__win 9\ncode-x-0 0 1 1700000000 0 a:7 w:8 o: c:';
+        // The first would read as a session row if it were not recognised by its tag.
+        const out = '__win 5 a 1 2 3 4\n__win soon code-x-0\n__win\n__win 9\n__win 8 code-x-0\ncode-x-0 0 1 1700000000 0 a:7 o: c:';
         expect(parseListSessions(out)).toMatchObject([{ name: 'code-x-0', activityEpoch: 8 }]);
         expect(parseListSessions(out)).toHaveLength(1);
     });
 
-    it('reads activity alongside an owner tag, and a name with spaces', () => {
-        expect(parseListSessions('my s 0 1 1700000000 0 a:1700000001 o:1a2b3c4d-0011aabb')[0]).toMatchObject({
-            name: 'my s', activityEpoch: 1700000001, owner: '1a2b3c4d-0011aabb',
-        });
-    });
-
     it('leaves activityEpoch undefined for rows without it, or with a non-numeric value', () => {
         expect(parseListSessions('code-x-0 0 1 1700000000 0 o:')[0].activityEpoch).toBeUndefined();
-        expect(parseListSessions('code-x-0 0 1 1700000000 0 a: o:')[0].activityEpoch).toBeUndefined();
+        expect(parseListSessions('__win soon code-x-0\ncode-x-0 0 1 1700000000 0 a: o:')[0].activityEpoch).toBeUndefined();
     });
 });
 

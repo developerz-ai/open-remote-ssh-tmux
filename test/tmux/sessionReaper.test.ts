@@ -26,19 +26,22 @@ const NOW = 1_700_000_000;
 const OLD = NOW - 3600;
 
 /**
- * A `tmux list-sessions -F` stdout line: `<name> <attached> <windows> <created> <paneDead>`.
+ * One session as the list command reports it: its window's `__win <activity> <name>` line
+ * (left out with `windowRow: false` — a session the window list did not cover), then the
+ * `tmux list-sessions -F` line: `<name> <attached> <windows> <created> <paneDead>`.
  * A reapable corpse is detached with a dead pane (`paneDead: true`); a live session
  * has `paneDead: false`. `windows` is ≥1 for any real session and is never the reap gate.
  */
 const row = (
     name: string,
     attached: boolean,
-    opts: { windows?: number; paneDead?: boolean; created?: number; activity?: number } = {},
+    opts: { windows?: number; paneDead?: boolean; created?: number; activity?: number; windowRow?: boolean } = {},
 ): string => {
     const windows = opts.windows ?? 1;
     const created = opts.created ?? OLD;
     const activity = opts.activity ?? created;
-    return `${name} ${attached ? 1 : 0} ${windows} ${created} ${opts.paneDead ? 1 : 0} a:${activity} o:`;
+    const session = `${name} ${attached ? 1 : 0} ${windows} ${created} ${opts.paneDead ? 1 : 0} a:${activity} o:`;
+    return opts.windowRow === false ? session : `__win ${activity} ${name}\n${session}`;
 };
 
 /**
@@ -398,6 +401,21 @@ describe('reap — ages against the remote clock, never the local one', () => {
         expect(await reaper.reap()).toEqual({ killed: 1, orphansKept: 1, orphansTotal: 1 });
         expect(killCommands(exec)).toEqual([buildKillSession(ours(1))]);
         expect(log.trace).toHaveBeenCalledWith(expect.stringContaining('remote clock'));
+    });
+
+    // Windows and sessions are one snapshot, so a session without a window line is data
+    // that did not arrive: its last output is unknown, and it is kept.
+    it('a session the window list did not cover is never aged out', async () => {
+        const exec = fakeExec({
+            list: [
+                row(ours(0), false, { activity: NOW - 99 * DAY, windowRow: false }),
+                row(ours(1), false, { activity: NOW - 99 * DAY }),
+            ],
+        });
+        const { reaper } = makeReaper({ exec, orphanMaxAgeDays: 14 });
+
+        expect(await reaper.reap()).toEqual({ killed: 1, orphansKept: 1, orphansTotal: 2 });
+        expect(killCommands(exec)).toEqual([buildKillSession(ours(1))]);
     });
 
     it('measures the corpse grace on the remote clock too', async () => {

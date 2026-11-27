@@ -161,6 +161,20 @@ describeRig('argv chain hardening (real tmux)', target => {
         expect(await serverOption('terminal-overrides')).toBe(before);
     });
 
+    // A user who switched 24-bit colour OFF for their terminal (`Tc@`) must not get it
+    // switched back on: a later `xterm*:Tc` entry would win. Any mention of Tc is theirs.
+    it('a user who removed Tc for their terminal keeps it removed — nothing is appended', async () => {
+        expect((await rig.tmux('new-session', '-d', '-s', 'main')).code).toBe(0);
+        expect((await rig.tmux('set-option', '-as', 'terminal-overrides', ',xterm-256color:Tc@')).code).toBe(0);
+        const before = await serverOption('terminal-overrides');
+        expect(before).toMatch(/xterm-256color:Tc@/);
+
+        await launch(sessionName(HOST, home, 0), home);
+        expect((await rig.exec(buildClaimSessionCommand(sessionName(HOST, home, 1), home, probed))).code).toBe(0);
+
+        expect(await serverOption('terminal-overrides')).toBe(before);
+    });
+
     describeClient(target, () => home);
     describeKeys(target, () => rig, () => home);
     describePaging(target, () => rig, () => home);
@@ -305,7 +319,7 @@ function describePaging(target: RigTarget, rig: () => RigSession, home: () => st
      * `if-shell` job of the argv with tmux's `##` escapes undone. Exit 0 = the user has. */
     async function userHasBound(key: string): Promise<boolean> {
         const argv = buildAttachOrCreateArgv(ours(), home(), undefined, { tmuxPath: RIG_TMUX, tmuxVersion: target.version });
-        const job = argv.find(arg => arg.includes(`-T root +${key} `) && arg.includes('list-keys'))!;
+        const job = argv.find(arg => arg.includes(`+root +${key} `) && arg.includes('list-keys'))!;
         return (await rig().run(job.replace(/##/g, '#'))).code === 0;
     }
 
@@ -316,6 +330,24 @@ function describePaging(target: RigTarget, rig: () => RigSession, home: () => st
 
         expect(await userHasBound('PPage')).toBe(false);
         expect(await userHasBound('NPage')).toBe(false);
+    });
+
+    // The key a binding is FOR is the one in its header. A user's binding of another key
+    // whose command merely mentions PageUp was read as "the user has bound PageUp", and our
+    // binding was never made.
+    it('a user\'s binding of another key that mentions PPage/NPage in its command does not stand in for them', async () => {
+        expect((await rig().tmux('new-session', '-d', '-s', 'main')).code).toBe(0);
+        expect((await rig().tmux('bind-key', '-n', 'F5', 'run-shell', 'tmux list-keys -T root PPage | head')).code).toBe(0);
+        expect((await rig().tmux('bind-key', '-n', 'F6', 'display-message', 'bind-key -T root NPage copy-mode')).code).toBe(0);
+        expect(await userHasBound('PPage')).toBe(false);
+        expect(await userHasBound('NPage')).toBe(false);
+
+        (await openOurs('fakesh')).close();
+
+        const rootKeys = (await rig().tmux('list-keys', '-T', 'root')).stdout;
+        expect(rootKeys).toMatch(/-T root +PPage .*session_name/);
+        expect(rootKeys).toMatch(/-T root +NPage .*session_name/);
+        expect(rootKeys).toMatch(/-T root +F5 .*list-keys -T root PPage/);
     });
 
     // Our exact predicate, the user's own actions (they copied ours and changed what it does):

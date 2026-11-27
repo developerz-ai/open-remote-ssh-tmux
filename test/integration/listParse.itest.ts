@@ -63,6 +63,12 @@ describeRig('list-sessions parsing (real tmux, every login shell)', target => {
             expect(byName.get(OURS)).toMatchObject({ attached: false, windows: 1, paneDead: false });
             expect(byName.get(CORPSE)).toMatchObject({ attached: false, windows: 1, paneDead: true });
             expect(byName.get(OURS)!.createdEpoch).toBeGreaterThan(1_700_000_000);
+            // Windows and sessions travel as ONE tmux invocation (`… ';' list-sessions …`);
+            // the separator must survive this login shell, and every session — a name with
+            // a space included — must find its window line, or its age would be unknown.
+            for (const row of parsed) {
+                expect(row.activityEpoch, row.name).toBeGreaterThan(1_700_000_000);
+            }
         });
     }
 
