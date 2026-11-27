@@ -39,12 +39,14 @@ for `$TIP`: no verdict if `on.push` in `ci-main.yml` has `paths-ignore` and the 
 ignored paths (`git show --stat --format= "$TIP"`); otherwise, once the tip is 2+ hours old, fail
 as "no CI run for the tip of main". A red `main` is filed first and makes `release-due` not due.
 
-**`flaky-jobs`.** All runs of the last 7 days, every page:
+**`flaky-jobs`.** CI runs only (not `audit.yml` or other schedules), last 7 days, every page:
 
 ```sh
 SINCE=$(date -u -d '7 days ago' +%F)
-gh api --paginate "repos/$REPO/actions/runs?created=>=$SINCE&per_page=100" \
-  --jq '.workflow_runs[] | select(.run_attempt > 1 and .conclusion == "success") | [.id, .name] | @tsv'
+for wf in ci-pr.yml ci-main.yml; do
+  gh api --paginate "repos/$REPO/actions/workflows/$wf/runs?created=>=$SINCE&per_page=100" \
+    --jq '.workflow_runs[] | select(.run_attempt > 1 and .conclusion == "success") | [.id, .name] | @tsv'
+done
 gh api "repos/$REPO/actions/runs/<id>/attempts/1/jobs" --jq '.jobs[] | select(.conclusion == "failure") | .name'
 ```
 
@@ -110,7 +112,10 @@ cuts one. The bot never cuts (`release.manager: none`): this row recommends to a
 ```sh
 jq -r .version package.json
 git log --format='%h %s' "$TAG"..origin/main
-git log --format=%B "$TAG"..origin/main | grep -E '^[a-z]+(\([^)]*\))?!: |^BREAKING[ -]CHANGE: '
+git log --format='%h %s' "$TAG"..origin/main | grep -E '^[0-9a-f]+ [a-z]+(\([^)]*\))?!: '   # `!` in a SUBJECT
+for h in $(git rev-list "$TAG"..origin/main); do   # a BODY line (%b: not the subject) that starts a footer
+  git log -1 --format=%b "$h" | grep -E '^BREAKING[ -]CHANGE: ' | sed "s/^/$h /"
+done
 git diff --name-only "$TAG" origin/main -- src scripts/patch-ssh2.js webpack.config.js .vscodeignore
 for ref in "$TAG" origin/main; do
   git show "$ref:package-lock.json" | jq -S '[.packages | to_entries[]
@@ -124,7 +129,7 @@ equals `$TAG` minus `v`; (4) something shipped changed: a path in the `git diff`
 lockfile version, or `dependencies`/`contributes`/`engines`. Docs, tests, CI, dev-only: no release. If `version` is above `$TAG`, a bump is merged and only its tag is owed: the
 ask gives just the tag step.
 
-Version: the `grep` matches (a `type!:` header or `BREAKING CHANGE:` footer) → major; else any
+Version: a `type!:` subject or a body line starting `BREAKING CHANGE:` (never a quote mid-line) → major; else any
 `feat`/`enhance` subject → minor; else patch. The ask (`Release v<X.Y.Z> is due`) carries the
 evidence per condition, the commits, a draft `## X.Y.Z` `CHANGELOG.md` section in its style, and
 the steps: (a) PR `build(release): X.Y.Z` with `npm version X.Y.Z --no-git-tag-version` and that
