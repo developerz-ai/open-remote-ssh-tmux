@@ -131,9 +131,10 @@ ask gives just the tag step.
 
 Version: a `type!:` subject or a body line starting `BREAKING CHANGE:` (never a quote mid-line) → major; else any
 `feat`/`enhance` subject → minor; else patch. The ask (`Release v<X.Y.Z> is due`) carries the
-evidence per condition, the commits, a draft `## X.Y.Z` `CHANGELOG.md` section in its style, and
-the steps: (a) PR `build(release): X.Y.Z` with `npm version X.Y.Z --no-git-tag-version` and that
-section (`.github/scripts/get-changelog.js` needs the exact heading); (b) after merge,
+evidence per condition, the commits, draft `docs/changelog/X.Y.Z.md` notes in their style, and
+the steps: (a) PR `build(release): X.Y.Z` with `npm version X.Y.Z --no-git-tag-version`, that file
+(`# X.Y.Z`, `_Released <date>_`, the notes: `.github/scripts/get-changelog.js` reads it) and its
+line at the top of the `CHANGELOG.md` index; (b) after merge,
 `git tag -a vX.Y.Z -m "Release version X.Y.Z" <merge sha>` and `git push origin vX.Y.Z`;
 `publish.yml` does the rest. Not due: name the failed condition.
 

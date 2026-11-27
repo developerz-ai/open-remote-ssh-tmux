@@ -71,7 +71,7 @@ Ours alone (no upstream counterpart): `src/tmux/*`, `src/clipboard/*`,
 `src/common/deadline.ts`, `src/common/envCollection.ts`, `src/common/shellQuote.ts`.
 
 Outside `src/`, `package.json` (name, publisher, `contributes`, scripts, pinned
-dependencies), `README.md`, `CHANGELOG.md`, the workflows and the lint/test
+dependencies), `README.md`, `CHANGELOG.md` (ours is an index of `docs/changelog/`), the workflows and the lint/test
 configuration all diverge; see `git diff a00e61a --stat -- . ':!src' ':!docs' ':!test'`.
 For these, keep ours and port upstream's intent by hand.
 

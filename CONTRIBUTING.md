@@ -74,9 +74,10 @@ Similarly:
 
 Do not bump the version number.
 
-### CHANGELOG.md
+### Changelog
 
-Do not add an entry to the `CHANGELOG.md` file; maintainers write it at release time.
+Do not add release notes (`docs/changelog/<version>.md`) or a `CHANGELOG.md` index line;
+maintainers write both at release time.
 
 For a vulnerability, do not open an issue — follow [SECURITY.md](SECURITY.md).
 

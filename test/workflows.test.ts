@@ -25,7 +25,7 @@ const nodeRequire = createRequire(__filename);
 const vsixGuard = nodeRequire(vsixGuardPath) as VsixGuardModule;
 
 interface ChangelogModule {
-    changelogEntry(changelog: string, version: string): string | undefined;
+    changelogBody(contents: string, version: string): string | undefined;
 }
 
 const changelogScript = nodeRequire(path.join(root, '.github', 'scripts', 'get-changelog.js')) as ChangelogModule;
@@ -414,6 +414,17 @@ describe('check-vsix-contents.js', () => {
         expect(vsixGuard.compareEntries(entries, patterns)).toEqual({ unexpected: ['extension/src/extension.ts'], missing: [] });
     });
 
+    // The release notes ship as the root CHANGELOG.md index (the Changelog tab); the
+    // per-release files stay in the repository.
+    it('packages CHANGELOG.md but not docs/changelog/', () => {
+        const real = vsixGuard.whitelistPatterns(fs.readFileSync(path.join(root, '.vscodeignore'), 'utf8'));
+        const entries = [...metadata, 'extension/package.json', 'extension/readme.md', 'extension/changelog.md', 'extension/lib/extension.js',
+            'extension/src/scripts/a.sh', 'extension/LICENSE.txt', 'extension/resources/icon.png', 'extension/docs/changelog/1.5.0.md'];
+
+        expect(real).toContain('CHANGELOG.md');
+        expect(vsixGuard.compareEntries(entries, real).unexpected).toEqual(['extension/docs/changelog/1.5.0.md']);
+    });
+
     it('reports a whitelisted file the vsix lacks', () => {
         const entries = [...metadata, 'extension/package.json', 'extension/readme.md', 'extension/src/scripts/a.sh'];
 
@@ -432,30 +443,43 @@ describe('release checksum file', () => {
     });
 });
 
-// publish.yml builds the release body from `get-changelog.js v<version>`.
+// publish.yml builds the release body from `get-changelog.js v<version>`, which reads
+// docs/changelog/<version>.md: a `# <version>` title, an optional `_Released <date>_`
+// line, then the notes.
 describe('get-changelog.js', () => {
-    const changelog = [
-        '## 1.4.20', '', '- twenty', '',
-        '## 1.4.2', '', '**Connecting**', '', '- two', '', '### Details', '', '- more', '',
-        '## 1.4.1', '', '- one', '',
-    ].join('\n');
+    const scriptPath = path.join(root, '.github', 'scripts', 'get-changelog.js');
+    const runScript = (version: string) => spawnSync(process.execPath, [scriptPath, version], { cwd: root, encoding: 'utf8' });
 
-    it('returns the exact version\'s section, not one it is a prefix of', () => {
-        expect(changelogScript.changelogEntry(changelog, 'v1.4.2')).toBe('**Connecting**\n\n- two\n\n### Details\n\n- more');
+    it('returns the notes under the title and the release date, subheadings included', () => {
+        const file = '# 1.4.2\n\n_Released 2026-11-14_\n\n**Connecting**\n\n- two\n\n## Details\n\n- more\n';
+
+        expect(changelogScript.changelogBody(file, 'v1.4.2')).toBe('**Connecting**\n\n- two\n\n## Details\n\n- more');
     });
 
-    it('reads the last section to the end of the file', () => {
-        expect(changelogScript.changelogEntry(changelog, 'v1.4.1')).toBe('- one');
+    it('needs no release date (versions released before the fork was tagged)', () => {
+        expect(changelogScript.changelogBody('# 0.0.30\n\n- one\n', '0.0.30')).toBe('- one');
     });
 
-    it('treats the version literally, not as a pattern', () => {
-        expect(changelogScript.changelogEntry('## 1x4x2\n\n- wrong\n', 'v1.4.2')).toBeUndefined();
+    it('refuses a file whose title is another version', () => {
+        expect(changelogScript.changelogBody('# 1.4.20\n\n- twenty\n', 'v1.4.2')).toBeUndefined();
     });
 
-    it('finds the section for package.json\'s version in the real CHANGELOG.md', () => {
-        const real = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
+    it('prints package.json\'s version\'s notes from the CLI, with or without the v', () => {
+        const version = readPackageJson().version;
+        const file = fs.readFileSync(path.join(root, 'docs', 'changelog', `${version}.md`), 'utf8');
 
-        expect(changelogScript.changelogEntry(real, `v${readPackageJson().version}`)).toMatch(/\S/);
+        for (const argument of [`v${version}`, version]) {
+            const result = runScript(argument);
+            expect(result.status, result.stderr).toBe(0);
+            expect(result.stdout.trim()).toBe(changelogScript.changelogBody(file, version));
+        }
+    });
+
+    it('fails, naming the file it looked for, when the version has none', () => {
+        const result = runScript('v9.9.9');
+
+        expect(result.status).not.toBe(0);
+        expect(result.stderr).toContain('docs/changelog/9.9.9.md');
     });
 });
 
