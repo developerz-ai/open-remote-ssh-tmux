@@ -1,30 +1,36 @@
 const fs = require('fs');
 const path = require('path');
 
-// Get version from command line argument (with 'v' prefix)
-const version = process.argv[2];
-
-try {
-    const changelog = fs.readFileSync(path.join(process.cwd(), 'CHANGELOG.md'), 'utf8');
-
-    // Regular expression to match a version section with the date
-    // Matches from "## 0.0.48" until the next ## or end of file
-    const versionRegex = new RegExp(`## ${version.slice(1)}([^#]|#(?!#))*(?=## |$)`, 's');
-
-    const match = changelog.match(versionRegex);
-
-    if(match) {
-        // Remove the version header and trim whitespace
-        const notes = match[0].replace(/^## \d+\.\d+\.\d+\n/, '').trim();
-        console.log(notes);
-        process.exit(0);
+/**
+ * The notes under `## <version>` (tag `v<version>`), up to the next `## ` heading or the
+ * end of the file; undefined when there is no such section. The heading must be the
+ * version exactly, so `v1.4.2` never picks up a `## 1.4.20` above it, and `###`
+ * subheadings stay inside the section.
+ */
+function changelogEntry(changelog, tag) {
+    const lines = changelog.split(/\r?\n/);
+    const start = lines.findIndex(line => line.trimEnd() === `## ${tag.replace(/^v/, '')}`);
+    if (start === -1) {
+        return undefined;
     }
-    else {
+    const end = lines.findIndex((line, index) => index > start && line.startsWith('## '));
+    return lines.slice(start + 1, end === -1 ? undefined : end).join('\n').trim();
+}
+
+module.exports = { changelogEntry };
+
+if (require.main === module) {
+    // Version from the command line, with the 'v' prefix.
+    const version = process.argv[2];
+    if (!version) {
+        console.error('Usage: get-changelog.js v<version>');
+        process.exit(1);
+    }
+
+    const notes = changelogEntry(fs.readFileSync(path.join(process.cwd(), 'CHANGELOG.md'), 'utf8'), version);
+    if (notes === undefined) {
         console.error(`No changelog entry found for version ${version}`);
         process.exit(1);
     }
-}
-catch(error) {
-    console.error('Error reading CHANGELOG.md:', error);
-    process.exit(1);
+    console.log(notes);
 }

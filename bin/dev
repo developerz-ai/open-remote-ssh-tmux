@@ -1,4 +1,9 @@
 #!/bin/sh
 # Run development watch
+set -e
+cd "$(dirname "$0")/.."
+. bin/lib/preflight.sh
+preflight_node
+preflight_deps
 
 npm run watch:src

@@ -1,4 +1,8 @@
 #!/bin/sh
 # Install dependencies
+set -e
+cd "$(dirname "$0")/.."
+. bin/lib/preflight.sh
+preflight_node
 
 npm install

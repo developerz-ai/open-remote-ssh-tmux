@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 'use strict';
 
-// Release guard: the packaging toolchain (`vsce`, provided by the @vscode/vsce
-// devDependency that `npm run package` invokes) ships transitive dependencies
-// with their own `engines.node` floors. Those floors are stricter than the
-// repo-wide Node policy in `.nvmrc` (Node 20): @vscode/vsce@3.9.2 pulls in
-// @azure/identity and @azure/core-process, both of which require Node >= 22.
+// Release guard: the locked toolchain — the tree `npm ci` installs, and the
+// packaging subtree under the @vscode/vsce devDependency that `npm run package`
+// invokes — ships transitive dependencies with their own `engines.node` floors
+// (the @azure/* packages under vsce, for one). The workflows run the `.nvmrc`
+// Node; this guard proves the running Node is admitted by every one of them.
 //
 // `npm ci` only *warns* about an unmet engine floor (npm's `engine-strict` is
 // off by default and the repo has no .npmrc), so an incompatible runtime used

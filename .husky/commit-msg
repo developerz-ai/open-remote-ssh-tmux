@@ -1,3 +1,5 @@
 #!/bin/sh
 
-npx commitlint --edit "$1"
+# `--no`: run the locked commitlint, never a registry download (see pre-commit).
+# `--`: without it npm reads `--edit` as its own `--editor` and commitlint gets no message.
+npx --no -- commitlint --edit "$1"
