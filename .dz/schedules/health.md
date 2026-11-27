@@ -113,9 +113,8 @@ cuts one. The bot never cuts (`release.manager: none`): this row recommends to a
 jq -r .version package.json
 git log --format='%h %s' "$TAG"..origin/main
 git log --format='%h %s' "$TAG"..origin/main | grep -E '^[0-9a-f]+ [a-z]+(\([^)]*\))?!: '   # `!` in a SUBJECT
-for h in $(git rev-list "$TAG"..origin/main); do   # BREAKING CHANGE in the FOOTER (last paragraph) only
-  git log -1 --format=%B "$h" | awk 'BEGIN { RS = "" } { last = $0 } END { print last }' \
-    | grep -E '^BREAKING[ -]CHANGE: ' | sed "s/^/$h /"
+for h in $(git rev-list "$TAG"..origin/main); do   # a BODY line (%b: not the subject) that starts a footer
+  git log -1 --format=%b "$h" | grep -E '^BREAKING[ -]CHANGE: ' | sed "s/^/$h /"
 done
 git diff --name-only "$TAG" origin/main -- src scripts/patch-ssh2.js webpack.config.js .vscodeignore
 for ref in "$TAG" origin/main; do
@@ -130,7 +129,7 @@ equals `$TAG` minus `v`; (4) something shipped changed: a path in the `git diff`
 lockfile version, or `dependencies`/`contributes`/`engines`. Docs, tests, CI, dev-only: no release. If `version` is above `$TAG`, a bump is merged and only its tag is owed: the
 ask gives just the tag step.
 
-Version: a `type!:` subject or a `BREAKING CHANGE:` footer above (never a body quote) → major; else any
+Version: a `type!:` subject or a body line starting `BREAKING CHANGE:` (never a quote mid-line) → major; else any
 `feat`/`enhance` subject → minor; else patch. The ask (`Release v<X.Y.Z> is due`) carries the
 evidence per condition, the commits, a draft `## X.Y.Z` `CHANGELOG.md` section in its style, and
 the steps: (a) PR `build(release): X.Y.Z` with `npm version X.Y.Z --no-git-tag-version` and that
