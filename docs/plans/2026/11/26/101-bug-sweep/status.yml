@@ -1,0 +1,18 @@
+plan: 101-bug-sweep
+title: Bug sweep — terminals, connection, tooling, weekly maintenance
+status: complete
+created_by: sebi
+worked_by: "claude (coordinator) + subagents"
+owner: sebi
+percent: 100
+current_focus: "done"
+slices:
+  - file: overview.md
+    status: complete
+    percent: 100
+evidence: ["#86", "#87", "#88", "results-2026-11-26.md"]
+notes: >-
+  Owner decisions applied: toolchain Node 24 (runtime stays VS Code's Electron Node 20);
+  dz maintainer policy is the single stale owner (60 days); weekly Monday health + maintain
+  briefs; off-cycle v1.5.0 release authorised by the owner.
+last_updated: 2026-11-27

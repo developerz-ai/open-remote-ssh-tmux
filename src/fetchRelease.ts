@@ -39,7 +39,16 @@ export async function fetchRelease(serverDownloadUrlTemplate: string, version: s
         return {version, build};
     }
 
-    const downloadUrl = new URL(serverDownloadUrlTemplate);
+    // Fork: a template that is not an absolute URL threw here, and the resolver retries
+    // a non-ServerInstallError forever; fall back to the local version like every other miss.
+    let downloadUrl: URL;
+    try {
+        downloadUrl = new URL(serverDownloadUrlTemplate);
+    } catch {
+        // Fork: never log the template itself — a mirror credential can ride in its query string.
+        logger.info('Cannot parse remote.SSH.serverDownloadUrlTemplate as an absolute URL');
+        return {version, build};
+    }
     const hostname = downloadUrl.hostname;
     if (hostname !== 'github.com') {
         logger.info('Can only fetch releases on github repositories');
@@ -51,7 +60,8 @@ export async function fetchRelease(serverDownloadUrlTemplate: string, version: s
 
     const parts = downloadUrl.pathname.split('/');
     if (parts.length < 3) {
-        logger.info('Cannot parse the Github repository from the url template: ' + downloadUrl);
+        // Fork: not the URL itself (see above) — its query string can carry a credential.
+        logger.info('Cannot parse the Github repository from remote.SSH.serverDownloadUrlTemplate');
         return {version, build};
     }
     // per_page=100 (Github's max) so a repository with more than the default

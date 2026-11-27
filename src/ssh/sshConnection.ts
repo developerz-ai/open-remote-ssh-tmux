@@ -164,7 +164,8 @@ export default class SSHConnection extends EventEmitter {
                         if (!resolved) {
                             return resolve({ stdout, stderr });
                         }
-                    }).on('data', function (data: Buffer | string) {
+                    // Fork: as in exec() — a channel 'error' without 'close' hung this promise.
+                    }).on('error', reject).on('data', function (data: Buffer | string) {
                         if (resolved) {
                             return;
                         }
@@ -355,6 +356,8 @@ export default class SSHConnection extends EventEmitter {
                                     this.sshConnection!.forwardOut('127.0.0.1', 0, SSHTunnelConfig.remoteAddr!, SSHTunnelConfig.remotePort!, (err, stream) => {
                                         if (err) {
                                             this.emit(SSHConstants.CHANNEL.TUNNEL, SSHConstants.STATUS.DISCONNECT, { SSHTunnelConfig: SSHTunnelConfig, err: err });
+                                            // Fork: nothing else owns the accepted socket (see the connect() catch below).
+                                            socket.destroy();
                                             return;
                                         }
                                         // An unhandled 'error' on either end of the pipe (e.g. ECONNRESET when the
@@ -370,6 +373,8 @@ export default class SSHConnection extends EventEmitter {
                                     this.sshConnection!.openssh_forwardOutStreamLocal(SSHTunnelConfig.remoteSocketPath!, (err, stream) => {
                                         if (err) {
                                             this.emit(SSHConstants.CHANNEL.TUNNEL, SSHConstants.STATUS.DISCONNECT, { SSHTunnelConfig: SSHTunnelConfig, err: err });
+                                            // Fork: nothing else owns the accepted socket (see the connect() catch below).
+                                            socket.destroy();
                                             return;
                                         }
                                         // Same rationale as the port-forward branch above.
