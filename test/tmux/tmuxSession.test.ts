@@ -1,4 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { spawnSync } from 'child_process';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { afterAll, describe, expect, it } from 'vitest';
 import {
     buildAttachOrCreateArgv,
     buildClaimSessionCommand,
@@ -332,9 +336,13 @@ describe('buildAttachOrCreateArgv', () => {
     /** As it must be written inside a tmux shell job, which is format-expanded first. */
     const inJob = (text: string): string => text.replace(/#/g, '##');
     /** The `if-shell` job that succeeds when the USER has `key` bound (a binding not ours). */
+    /** A binding's command exactly as `list-keys` prints it back — the same bytes on 2.6,
+     * 3.0a, 3.4, 3.5a and 3.8 (only the `bind-key … <key>` prefix and its padding differ). */
+    const printed = (predicate: string, key: string): string =>
+        `if-shell -F "${predicate}" "send-keys ${key}"${key === 'PPage' ? ' "copy-mode -eu"' : ''}`;
     const userBound = (tmux: string, key: string): string =>
-        `${tmux} list-keys -T root | grep -E -- '-T root +${key} '`
-        + ` | grep -Fv -e '${inJob(PASS_THROUGH)}' | grep -Fqv -e '${inJob(PASS_THROUGH_V1)}'`;
+        `${tmux} list-keys -T root | grep -E -- '-T root +${key} ' | sed -E 's/^bind-key +-T root +${key} +//'`
+        + ` | grep -Fxqv -e '${inJob(printed(PASS_THROUGH, key))}' -e '${inJob(printed(PASS_THROUGH_V1, key))}'`;
     /** The client flags and the create's `-e` on tmux >= 3.4. */
     const CLIENT = ['-u', '-T', 'RGB,hyperlinks,sync'];
     const PANE_ENV = ['-e', 'COLORTERM=truecolor'];
@@ -462,19 +470,87 @@ describe('buildAttachOrCreateArgv', () => {
         expect(argv).toContain(userBound(Q, 'NPage'));
     });
 
-    // A binding is OURS only if it carries one of our complete predicates — today's, or the
-    // one earlier releases bound. A user's own binding that merely starts the same way
-    // (`#{?alternate_on,1,…`) carries neither and must survive (see the rig for the proof).
-    it('tells its own bindings by their complete predicate, never by a shared prefix', () => {
-        const job = userBound(Q, 'PPage');
-        expect(job).toContain(`grep -Fv -e '${inJob(PASS_THROUGH)}'`);
-        expect(job).toContain(`grep -Fqv -e '${inJob(PASS_THROUGH_V1)}'`);
-        // tmux format-expands the job before the shell runs it: every `#` is written `##`,
-        // so no format is left to expand and the shell greps for the literal text.
-        expect(job.replace(/##/g, '')).not.toContain('#');
-        // Neither predicate contains the other, nor a single quote (they sit in '…').
-        expect(PASS_THROUGH).not.toContain(PASS_THROUGH_V1);
+    // A binding is OURS only if it is, whole, one we made: today's, or the one releases up to
+    // 1.4.x bound — predicate AND actions. Matching the predicate alone took a user's own
+    // binding that reuses our predicate with different actions for ours, and overwrote it.
+    it('tells its own bindings by the complete binding, never by the predicate alone', () => {
+        for (const key of ['PPage', 'NPage']) {
+            const job = userBound(Q, key);
+            expect(job).toContain(`sed -E 's/^bind-key +-T root +${key} +//'`);
+            expect(job).toContain(`grep -Fxqv -e '${inJob(printed(PASS_THROUGH, key))}' -e '${inJob(printed(PASS_THROUGH_V1, key))}'`);
+            // tmux format-expands the job before the shell runs it: every `#` is written `##`.
+            expect(job.replace(/##/g, '')).not.toContain('#');
+        }
+        // The patterns sit in '…' in the job.
         expect(PASS_THROUGH + PASS_THROUGH_V1).not.toContain('\'');
+    });
+
+    // The job itself, run by a real `sh` against a stand-in `tmux` that prints root-table
+    // lines in each layout tmux uses (captured from the rig: 2.6, 3.4 and 3.8 pad the
+    // `bind-key … <key>` prefix differently; the command after it is identical). Exit 0 means
+    // "the USER has bound this key" — the chain then leaves it alone.
+    describe.skipIf(process.platform === 'win32')('the "has the user bound this key?" job, run under sh', () => {
+        const dir = mkdtempSync(join(tmpdir(), 'orst-keys-'));
+        const stub = join(dir, 'tmux');
+        const lines = join(dir, 'lines');
+        writeFileSync(stub, `#!/bin/sh\ncat ${escapeShellArg(lines)}\n`);
+        chmodSync(stub, 0o755);
+        afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+        const PREFIXES: Record<string, (key: string) => string> = {
+            2.6: key => `bind-key -T root ${key}            `,
+            3.4: key => `bind-key -T root ${key}                  `,
+            3.8: key => `bind-key  -T root ${key}                     `,
+        };
+        const MOUSE = 'bind-key -T root MouseDown1Pane   select-pane -t = \\; send-keys -M';
+
+        function userHasBound(key: string, rootTable: string[]): boolean {
+            writeFileSync(lines, [MOUSE, ...rootTable].map(line => `${line}\n`).join(''));
+            const argv = buildAttachOrCreateArgv(NAME, '/p', undefined, { tmuxPath: stub });
+            const job = argv.find(arg => arg.includes('list-keys') && arg.includes(`+${key} `))!;
+            // What tmux hands the shell: the job with its `##` escapes expanded.
+            const result = spawnSync('sh', ['-c', job.replace(/##/g, '#')], { encoding: 'utf8' });
+            expect(result.stderr).toBe('');
+            return result.status === 0;
+        }
+
+        describe.each(Object.keys(PREFIXES))('list-keys layout of tmux %s', version => {
+            const line = (key: string, command: string): string => `${PREFIXES[version](key)}${command}`;
+
+            it.each(['PPage', 'NPage'])('%s unbound: not the user\'s', key => {
+                expect(userHasBound(key, [])).toBe(false);
+            });
+
+            it.each(['PPage', 'NPage'])('%s bound by us, today\'s binding or the 1.4.x one: not the user\'s', key => {
+                expect(userHasBound(key, [line(key, printed(PASS_THROUGH, key))])).toBe(false);
+                expect(userHasBound(key, [line(key, printed(PASS_THROUGH_V1, key))])).toBe(false);
+            });
+
+            // The reviewer's case: our exact predicate, the user's own actions.
+            it.each([
+                ['PPage', `if-shell -F "${PASS_THROUGH}" "send-keys PPage" "copy-mode -u"`],
+                ['PPage', `if-shell -F "${PASS_THROUGH}" "send-keys PPage" "copy-mode -eu" "display-message hi"`],
+                ['PPage', `if-shell -F "${PASS_THROUGH_V1}" "send-keys PPage" "copy-mode -e"`],
+                ['PPage', `if-shell -F "${PASS_THROUGH}" "send-keys PPage"`],
+                ['NPage', `if-shell -F "${PASS_THROUGH}" "send-keys NPage" "copy-mode -e"`],
+                ['NPage', `if-shell -F "${PASS_THROUGH_V1}" "send-keys PPage"`],
+                ['PPage', `if-shell -F "#{?alternate_on,1,0}" "send-keys PPage" "copy-mode -eu"`],
+                ['PPage', 'copy-mode -u'],
+            ])('%s bound by the user as %s: theirs', (key, command) => {
+                expect(userHasBound(key, [line(key, command)])).toBe(true);
+            });
+
+            // We never bind with -r (repeat): such a binding is the user's, whatever it runs.
+            it('our command under the user\'s -r flag: theirs', () => {
+                const repeat = PREFIXES[version]('PPage').replace('bind-key', 'bind-key -r');
+                expect(userHasBound('PPage', [`${repeat}${printed(PASS_THROUGH, 'PPage')}`])).toBe(true);
+            });
+
+            it('a binding of the other key never decides this one', () => {
+                expect(userHasBound('PPage', [line('NPage', 'copy-mode')])).toBe(false);
+                expect(userHasBound('NPage', [line('PPage', 'copy-mode -u'), line('NPage', printed(PASS_THROUGH, 'NPage'))])).toBe(false);
+            });
+        });
     });
 
     // The glob in the released predicate matched a user's own `code-a-0`. The shape test is

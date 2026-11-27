@@ -318,6 +318,28 @@ function describePaging(target: RigTarget, rig: () => RigSession, home: () => st
         expect(await userHasBound('NPage')).toBe(false);
     });
 
+    // Our exact predicate, the user's own actions (they copied ours and changed what it does):
+    // it is not our binding, and matching the predicate alone overwrote it.
+    it('a user\'s binding that reuses our predicate with their own actions is left exactly as they made it', async () => {
+        expect((await rig().tmux('new-session', '-d', '-s', 'main')).code).toBe(0);
+        const argv = buildAttachOrCreateArgv(ours(), home(), undefined, { tmuxPath: RIG_TMUX, tmuxVersion: target.version });
+        const theirs = argv.find(arg => arg.startsWith('bind-key -n PPage '))!.replace(`'copy-mode -eu'`, `'copy-mode -u'`);
+        expect(theirs).toContain(`'copy-mode -u'`);
+        expect((await rig().run(`${RIG_TMUX} ${theirs}`)).code).toBe(0);
+        const pageUp = async (): Promise<string[]> =>
+            (await rig().tmux('list-keys', '-T', 'root')).stdout.split('\n').filter(line => /PPage/.test(line));
+        const before = await pageUp();
+        expect(before).toHaveLength(1);
+        expect(await userHasBound('PPage')).toBe(true);
+
+        (await openOurs('fakesh')).close();
+
+        expect(await pageUp()).toEqual(before);
+        // PageDown was unbound, so that one is ours now — the two keys are decided apart.
+        expect(await userHasBound('NPage')).toBe(false);
+        expect((await rig().tmux('list-keys', '-T', 'root')).stdout).toMatch(/NPage.*session_name/);
+    });
+
     // A user's own binding built the same way ours starts — test `alternate_on`, pass the key
     // or scroll — carried the substring an earlier check looked for, and was overwritten.
     it('a user\'s own binding that also tests alternate_on is left exactly as they made it', async () => {

@@ -190,11 +190,32 @@ const PASS_KEYS_THROUGH = `#{?#{m:${OWNED_NAME_GLOB}[0-9]*,#{session_name}},`
  * still acting in the user's own sessions on any server that has not restarted since. */
 const PASS_KEYS_THROUGH_V1 = '#{?alternate_on,1,#{?#{m:*sh,#{pane_current_command}},0,1}}';
 
-/** Every predicate a binding of OURS can carry: today's and each released one. `list-keys`
- * prints a binding's predicate back verbatim (2.6 … 3.8), so a root-table line containing
- * one of these in full is ours to replace. Nothing shorter may stand in: a user's own
- * binding that merely begins `#{?alternate_on,1,…` was taken for ours and overwritten. */
+/** Every predicate a binding of OURS can carry: today's and each released one. */
 const OUR_BINDING_PREDICATES = [PASS_KEYS_THROUGH, PASS_KEYS_THROUGH_V1];
+
+/** The keys we bind in the root table. */
+type PagingKey = 'PPage' | 'NPage';
+
+/** What `key` does once `predicate` says the key is ours to act on: PageUp enters copy mode
+ * already paged up one screen (`-e`: it leaves by itself once PageDown reaches the bottom);
+ * PageDown has nothing to do outside copy mode. */
+function pagingActions(key: PagingKey): string[] {
+    return key === 'PPage' ? [`send-keys ${key}`, 'copy-mode -eu'] : [`send-keys ${key}`];
+}
+
+/** Our binding of `key` as a `bind-key` command string (the `if-shell` else-branch). */
+function pagingBinding(key: PagingKey, predicate: string): string {
+    return `bind-key -n ${key} if-shell -F '${predicate}' ${pagingActions(key).map(action => `'${action}'`).join(' ')}`;
+}
+
+/**
+ * The same binding's command as `list-keys` prints it back: each argument in double quotes,
+ * the predicate verbatim. These bytes are identical on 2.6, 3.0a, 3.4, 3.5a and 3.8 (captured
+ * on the rig); only the `bind-key … <key>` prefix ahead of them is padded differently.
+ */
+function printedPagingBinding(key: PagingKey, predicate: string): string {
+    return `if-shell -F "${predicate}" ${pagingActions(key).map(action => `"${action}"`).join(' ')}`;
+}
 
 /** A parsed row from `tmux list-sessions` (see `buildListSessions` `-F`). */
 export interface TmuxSession {
@@ -378,16 +399,28 @@ function jobTmux(tmuxPath: string): string {
     return escapeShellArg(tmuxPath).replace(/#/g, '##');
 }
 
-/** `if-shell` test that succeeds when the USER has `key` bound in the root table — a binding
- * that carries none of {@link OUR_BINDING_PREDICATES}. Unbound, or bound by an earlier attach
- * of ours (which may carry an older predicate), fails the test and the key is (re)bound.
- * `list-keys -T root <key>` does not exist at 2.6, hence the grep; the line shape
- * `… -T root <key> …` is the same on 2.6 … 3.8. Each predicate is a fixed string (`-F`) in
- * single quotes (it contains none), with `#` doubled: tmux format-expands the job first. */
-function rootKeyBound(tmux: string, key: string): string {
-    const notOurs = OUR_BINDING_PREDICATES.map((predicate, index) =>
-        `grep -F${index === OUR_BINDING_PREDICATES.length - 1 ? 'q' : ''}v -e '${predicate.replace(/#/g, '##')}'`);
-    return `${tmux} list-keys -T root | grep -E -- '-T root +${key} ' | ${notOurs.join(' | ')}`;
+/**
+ * `if-shell` test that succeeds when the USER has `key` bound in the root table: there is a
+ * binding for it that is not, whole, one of ours. Unbound, or bound by an earlier attach of
+ * ours (today's binding or a released one — {@link OUR_BINDING_PREDICATES}), fails the test
+ * and the key is (re)bound.
+ *
+ * "Ours" is the COMPLETE binding, predicate and actions. Matching less overwrote the user's:
+ * first any binding that began like ours, then any that reused our predicate with actions of
+ * their own. So the `bind-key -T root <key>` prefix is cut off (its padding varies by
+ * version) and what is left must EQUAL (`grep -Fx`) a binding we make. A prefix we never
+ * print — `bind-key -r …`, the repeat flag — is not cut, so that line stays the user's.
+ *
+ * `list-keys -T root <key>` does not exist at 2.6, hence the first grep. The patterns are
+ * fixed strings in single quotes (they contain none), with `#` doubled: tmux format-expands
+ * the job before the shell sees it.
+ */
+function rootKeyBound(tmux: string, key: PagingKey): string {
+    const ours = OUR_BINDING_PREDICATES
+        .map(predicate => `-e '${printedPagingBinding(key, predicate).replace(/#/g, '##')}'`)
+        .join(' ');
+    return `${tmux} list-keys -T root | grep -E -- '-T root +${key} '`
+        + ` | sed -E 's/^bind-key +-T root +${key} +//' | grep -Fxqv ${ours}`;
 }
 
 /** `if-shell` test that succeeds when the server's `terminal-overrides` already carry
@@ -534,9 +567,9 @@ export function buildAttachOrCreateArgv(
         // `list-keys | grep` per key, per attach. The then-branch is empty — "the user
         // bound it, leave it". The predicate confines the binding to our own sessions.
         ';', 'if-shell', rootKeyBound(tmux, 'PPage'), '',
-        `bind-key -n PPage if-shell -F '${PASS_KEYS_THROUGH}' 'send-keys PPage' 'copy-mode -eu'`,
+        pagingBinding('PPage', PASS_KEYS_THROUGH),
         ';', 'if-shell', rootKeyBound(tmux, 'NPage'), '',
-        `bind-key -n NPage if-shell -F '${PASS_KEYS_THROUGH}' 'send-keys NPage'`,
+        pagingBinding('NPage', PASS_KEYS_THROUGH),
     ];
 }
 
