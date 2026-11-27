@@ -1,4 +1,6 @@
 #!/bin/sh
 
-npx lint-staged
+# `--no`: never fetch a tool from the registry when node_modules lacks it (npx otherwise
+# installs and runs whatever version is current, unprompted, outside a TTY).
+npx --no lint-staged
 npm run compile:src && npm test

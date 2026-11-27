@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import { createRequire } from 'module';
 import * as os from 'os';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
@@ -1050,18 +1051,20 @@ describe('README fork identity', () => {
 });
 
 describe('CHANGELOG', () => {
-    it('has a first heading that parses as valid semver via get-changelog logic', () => {
+    // The real script, not a copy of its parsing: a copy stays green when the script breaks.
+    const { changelogEntry } = createRequire(__filename)(path.resolve(repoRoot, '.github/scripts/get-changelog.js')) as {
+        changelogEntry(changelog: string, tag: string): string | undefined;
+    };
+
+    it('has a first heading that get-changelog.js finds a non-empty section for', () => {
         const changelog = fs.readFileSync(path.resolve(repoRoot, 'CHANGELOG.md'), 'utf8');
         const firstHeading = changelog.match(/^## (\d+\.\d+\.\d+)/m);
         expect(firstHeading, 'CHANGELOG.md must start with a "## x.y.z" heading').not.toBeNull();
 
         const version = firstHeading![1];
-        const versionRegex = new RegExp(`## ${version}([^#]|#(?!#))*(?=## |$)`, 's');
-        const match = changelog.match(versionRegex);
-        expect(match, `get-changelog regex found no section for ${version}`).not.toBeNull();
-
-        const notes = match![0].replace(/^## \d+\.\d+\.\d+\n/, '').trim();
-        expect(notes.length).toBeGreaterThan(0);
+        const notes = changelogEntry(changelog, `v${version}`);
+        expect(notes, `get-changelog.js found no section for ${version}`).toBeDefined();
+        expect(notes!.length).toBeGreaterThan(0);
     });
 
     // The release workflow tags `v<package.json version>` and then asks

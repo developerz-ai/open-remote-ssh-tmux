@@ -30,16 +30,6 @@ function treeWithRanges(ranges: string[]): Map<string, { name: string; version: 
     return tree;
 }
 
-/**
- * A major-only pin ('22') is resolved by setup-node to the *latest* release of
- * that major. It is therefore safe when the top of the major is admitted by
- * every range — the latest 22.x always is, even though 22.0.0 is not.
- */
-function majorOnlyPinIsAdmitted(major: string, ranges: string[]): boolean {
-    const latestOfMajor = `${major}.999.999`;
-    return ranges.every(range => satisfies(latestOfMajor, range));
-}
-
 interface JsonObject {
     [key: string]: unknown;
 }
@@ -156,10 +146,6 @@ function collectGuardedTree(
     return tree;
 }
 
-function subtreeEntry(packages: Record<string, LockEntry>, lockPath: string): LockEntry | undefined {
-    return packages[lockPath];
-}
-
 function runGuard(nodeVersion: string): { status: number | null; stdout: string; stderr: string } {
     const result = spawnSync(process.execPath, [guardPath, '--node-version', nodeVersion], {
         cwd: root,
@@ -170,66 +156,37 @@ function runGuard(nodeVersion: string): { status: number | null; stdout: string;
     return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
-describe('publish runtime engine contract', () => {
+/** The toolchain Node: what `.nvmrc` pins and every workflow's setup-node resolves. */
+const nvmrcVersion = fs.readFileSync(path.join(root, '.nvmrc'), 'utf8').trim().replace(/^v/, '');
+
+const workflowsDir = path.join(root, '.github', 'workflows');
+const workflowFiles = fs.readdirSync(workflowsDir).filter(name => /\.ya?ml$/.test(name));
+
+// One toolchain Node for everything the repo runs — CI, the unit jobs on every OS, the
+// rig, packaging and release — pinned once in `.nvmrc`. (The extension's *runtime* is
+// VS Code's Electron Node, bounded by engines.vscode; that is a separate contract.) The
+// locked tree carries its own `engines.node` floors, and `npm ci` only warns about an
+// unmet one, so these tests hold the lockfile to the `.nvmrc` Node.
+describe('toolchain engine contract', () => {
     const packages = lockPackages();
+    const rootPath = resolvePackagePath(packages, '', PACKAGING_ROOT);
 
-    describe('locked packaging subtree', () => {
-        it('pins @vscode/vsce as the packaging root and resolves it in the lockfile', () => {
-            const rootPath = resolvePackagePath(packages, '', PACKAGING_ROOT);
+    describe('locked tree', () => {
+        it('resolves @vscode/vsce, the packaging root, at its manifest pin', () => {
+            const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')) as { devDependencies: Record<string, string> };
+
             expect(rootPath, `package-lock.json has no ${PACKAGING_ROOT} entry`).toBeDefined();
-            expect(subtreeEntry(packages, rootPath!)!.version).toBe('3.9.2');
+            expect(packages[rootPath!]!.version).toBe(pkg.devDependencies[PACKAGING_ROOT]);
         });
 
-        it('contains @azure/identity@4.14.1 and @azure/core-process@1.0.0 with engines.node ">=22.0.0"', () => {
-            const rootPath = resolvePackagePath(packages, '', PACKAGING_ROOT)!;
-            const subtree = collectPackagingSubtree(packages, rootPath);
+        it('admits the .nvmrc Node in every engines.node range it declares', () => {
+            const guarded = collectGuardedTree(packages, rootPath!);
+            const excluded = [...guarded.entries()]
+                .filter(([, entry]) => entry.nodeRange !== undefined && !satisfies(nvmrcVersion, entry.nodeRange))
+                .map(([lockPath, entry]) => `${lockPath}@${entry.version} requires node ${entry.nodeRange}`);
 
-            const identity = subtree.get('node_modules/@azure/identity');
-            expect(identity, '@azure/identity is not in the @vscode/vsce subtree').toBeDefined();
-            expect(identity!.version).toBe('4.14.1');
-            expect(identity!.engines?.node).toBe('>=22.0.0');
-
-            const coreProcess = subtree.get('node_modules/@azure/core-process');
-            expect(coreProcess, '@azure/core-process is not in the @vscode/vsce subtree').toBeDefined();
-            expect(coreProcess!.version).toBe('1.0.0');
-            expect(coreProcess!.engines?.node).toBe('>=22.0.0');
-        });
-
-        it('has an effective binding engine floor of 22.13.0', () => {
-            const rootPath = resolvePackagePath(packages, '', PACKAGING_ROOT)!;
-            const subtree = collectGuardedTree(packages, rootPath);
-
-            // The floor is the lowest release admitted by EVERY range in the
-            // tree — a real intersection, not the maximum of per-range minima.
-            // The Azure packages (>=22.0.0) are not the binding constraint:
-            // the devDependency ranges (`^20.19.0 || ^22.13.0 || >=24`) exclude
-            // Node 22.0.0 while admitting 22.13.0.
-            const excludedByTransitive = [...subtree.entries()].filter(
-                ([, entry]) => entry.nodeRange !== undefined
-                    && !satisfies('22.0.0', entry.nodeRange),
-            );
-
-            expect(
-                excludedByTransitive.length,
-                'no locked range excludes Node 22.0.0 — the floor would be lower'
-            ).toBeGreaterThan(0);
-
-            // Every one of those ranges must admit 22.13.0, or the floor is stricter.
-            const stricter = excludedByTransitive
-                .filter(([, entry]) => !satisfies('22.13.0', entry.nodeRange!))
-                .map(([path, entry]) => `${path} requires node ${entry.nodeRange}`);
-
-            expect(
-                stricter,
-                `the locked tree declares ranges stricter than Node 22.13.0: ${stricter.join(', ')}`
-            ).toEqual([]);
-
-            // 22.13.0 satisfies every range in the tree, 22.0.0 does not.
-            const allRanges = [...subtree.values()]
-                .map(entry => entry.nodeRange)
-                .filter((range): range is string => range !== undefined);
-            expect(allRanges.every(range => satisfies('22.13.0', range))).toBe(true);
-            expect(satisfies('22.0.0', '>=22.0.0')).toBe(true);
+            expect(excluded, `packages that cannot run on the .nvmrc Node ${nvmrcVersion}`).toEqual([]);
+            expect(guard.effectiveEngineFloor(guarded), 'the locked tree has no common engine floor').toBeDefined();
         });
     });
 
@@ -253,138 +210,48 @@ describe('publish runtime engine contract', () => {
                 .toBe('22.13.0');
         });
 
-        it('fails with a non-zero exit naming the offending package and its range on an incompatible Node', () => {
-            const result = runGuard('20.20.2');
+        it('fails with a non-zero exit naming an offending package and its range on an incompatible Node', () => {
+            const result = runGuard('18.0.0');
 
             expect(result.status).not.toBe(0);
-            expect(result.stderr).toContain('@azure/identity@4.14.1');
-            expect(result.stderr).toContain('>=22.0.0');
-            expect(result.stderr).toContain('@azure/core-process@1.0.0');
-            expect(result.stderr).toContain('>=22.0.0');
+            expect(result.stderr).toContain('FAIL: Node 18.0.0');
+            expect(result.stderr).toMatch(/\S+@\d+\.\d+\.\d+\S* requires node \S/);
         });
 
-        it('exits zero on a compatible Node 22 LTS runtime', () => {
-            const result = runGuard('22.13.0');
+        it('exits zero on the .nvmrc Node', () => {
+            const result = runGuard(nvmrcVersion);
 
-            expect(result.status).toBe(0);
+            expect(result.status, result.stderr).toBe(0);
             expect(result.stdout).toContain('OK:');
-            expect(result.stdout).toContain('Effective engine floor:  22.13.0');
-        });
-
-        it('exits zero on a Node 24 runtime', () => {
-            const result = runGuard('24.0.0');
-
-            expect(result.status).toBe(0);
-            expect(result.stdout).toContain('OK:');
-        });
-
-        // Regression: Node 22.0.0 satisfies the Azure `>=22.0.0` floors but is
-        // excluded by a transitive range (`^20.19.0 || ^22.13.0 || >=24`),
-        // so it must be rejected even though the Azure packages accept it.
-        it('rejects Node 22.0.0, which satisfies only the Azure floors', () => {
-            const result = runGuard('22.0.0');
-
-            expect(result.status).not.toBe(0);
-            expect(result.stderr).toContain('FAIL: Node 22.0.0');
-            expect(result.stderr).toContain('^20.19.0 || ^22.13.0 || >=24');
-        });
-
-        // The lockfile contains disjunctive engine ranges (`18 || 20 || >=22`,
-        // `20 || >=22`). A guard that collapsed the tree to a single numeric floor
-        // and compared would accept Node 21, which those ranges exclude.
-        it('rejects a Node version excluded only by a disjunctive range', () => {
-            const result = runGuard('21.0.0');
-
-            expect(result.status).not.toBe(0);
-            expect(result.stderr).toContain('||');
         });
     });
 
-    describe('release-packaging workflows', () => {
-        const workflowFiles = [
-            path.join(root, '.github', 'workflows', 'publish.yml'),
-            path.join(root, '.github', 'workflows', 'preview.yml'),
-        ];
+    describe('workflows', () => {
+        it.each(workflowFiles)('takes the toolchain Node from .nvmrc in every setup-node step of %s', (file) => {
+            const contents = fs.readFileSync(path.join(workflowsDir, file), 'utf8');
+            const steps = contents.split(/^\s+- (?:name|uses): /m).filter(step => step.includes('actions/setup-node@'));
 
-        it.each(workflowFiles)('pins an engine-compatible Node in %s instead of resolving .nvmrc', (file) => {
-            const contents = fs.readFileSync(file, 'utf8');
-
-            expect(contents, `${file} must not resolve the packaging Node from .nvmrc`).not.toContain('node-version-file: .nvmrc');
-
-            const pinned = /node-version:\s*'?([^'\s]+)'?/.exec(contents);
-            expect(pinned, `${file} has no explicit node-version`).not.toBeNull();
-
-            const version = pinned![1];
-
-            const rootPath = resolvePackagePath(packages, '', PACKAGING_ROOT)!;
-            const guarded = collectGuardedTree(packages, rootPath);
-            const ranges = [...guarded.values()]
-                .map(entry => entry.nodeRange)
-                .filter((range): range is string => range !== undefined);
-
-            const floor = guard.effectiveEngineFloor(guarded);
-            expect(floor, 'the locked tree has no common engine floor').toBeDefined();
-
-            if (/^\d+$/.test(version)) {
-                // A major-only spec ('22'): setup-node resolves it to the latest
-                // release of that major, which must be admitted by every range.
-                expect(
-                    majorOnlyPinIsAdmitted(version, ranges),
-                    `${file} pins Node ${version}, whose latest release is not admitted by every locked engine range`
-                ).toBe(true);
-            }
-            else {
-                expect(
-                    satisfies(version, `>=${floor}`),
-                    `${file} pins Node ${version}, which is below the packaging floor ${floor}`
-                ).toBe(true);
-            }
+            expect(contents, `${file} pins a node-version instead of reading .nvmrc`).not.toMatch(/^\s+node-version:/m);
+            steps.forEach(step => expect(step).toContain('node-version-file: .nvmrc'));
         });
 
-        it.each(workflowFiles)('runs the guard before the packaging step in %s', (file) => {
-            const contents = fs.readFileSync(file, 'utf8');
+        const packagingWorkflows = ['publish.yml', 'preview.yml', 'ci-pr.yml', 'ci-main.yml'];
 
+        it.each(packagingWorkflows)('runs the guard after `npm ci` and before packaging in %s', (file) => {
+            const contents = fs.readFileSync(path.join(workflowsDir, file), 'utf8');
             const guardIndex = contents.indexOf('node .github/scripts/check-packaging-node.js');
+
             expect(guardIndex, `${file} does not run the packaging engine guard`).toBeGreaterThan(-1);
-
-            const buildIndex = contents.indexOf('npm run package');
-            expect(buildIndex, `${file} has no packaging step`).toBeGreaterThan(-1);
-
-            expect(
-                guardIndex,
-                `${file} runs the guard after the packaging step — the incompatible runtime must be caught first`
-            ).toBeLessThan(buildIndex);
-        });
-
-        // The guard `require`s semver from node_modules, so on a fresh checkout it
-        // can only run once `npm ci` has installed it — before that it dies with
-        // MODULE_NOT_FOUND and the release never gets to package.
-        it.each(workflowFiles)('runs the guard after `npm ci` in %s', (file) => {
-            const contents = fs.readFileSync(file, 'utf8');
-
-            const installIndex = contents.indexOf('npm ci');
-            expect(installIndex, `${file} never runs npm ci`).toBeGreaterThan(-1);
-            expect(
-                installIndex,
-                `${file} runs the guard before npm ci — it cannot load semver yet`
-            ).toBeLessThan(contents.indexOf('node .github/scripts/check-packaging-node.js'));
-        });
-
-        it('pins the same Node version in both workflows', () => {
-            const versions = workflowFiles.map(file => {
-                const contents = fs.readFileSync(file, 'utf8');
-                return /node-version:\s*'?([^'\s]+)'?/.exec(contents)?.[1];
-            });
-
-            expect(versions[0], 'publish.yml has no node-version').toBeDefined();
-            expect(versions[1], 'preview.yml has no node-version').toBeDefined();
-            expect(versions[0]).toBe(versions[1]);
+            // The guard `require`s semver from node_modules: before `npm ci` it dies with
+            // MODULE_NOT_FOUND, and after packaging it is too late to matter.
+            expect(contents.lastIndexOf('npm ci', guardIndex), `${file} runs the guard before npm ci`).toBeGreaterThan(-1);
+            expect(guardIndex).toBeLessThan(contents.indexOf('npm run package'));
         });
     });
 
-    describe('unchanged policies', () => {
-        it('keeps the repo-wide Node policy on .nvmrc at v20.20.2', () => {
-            expect(fs.readFileSync(path.join(root, '.nvmrc'), 'utf8').trim()).toBe('v20.20.2');
+    describe('runtime policy', () => {
+        it('pins the toolchain to a Node 24 LTS release in .nvmrc', () => {
+            expect(fs.readFileSync(path.join(root, '.nvmrc'), 'utf8').trim()).toMatch(/^v24\.\d+\.\d+$/);
         });
 
         it('keeps the extension\'s engines.vscode floor and declares no node engine', () => {
@@ -394,6 +261,17 @@ describe('publish runtime engine contract', () => {
 
             expect(pkg.engines.vscode).toBe('^1.90.0');
             expect(pkg.engines.node, 'the extension must not declare a node engine').toBeUndefined();
+        });
+
+        // The extension runs in VS Code's extension host, not on the toolchain Node: the
+        // engines.vscode floor (1.90, Electron 29) is a Node 20 host. Typing against a newer
+        // @types/node would let code use APIs that host does not have.
+        it('types the code against the extension host\'s Node 20, not the toolchain Node', () => {
+            const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')) as {
+                devDependencies: Record<string, string>;
+            };
+
+            expect(pkg.devDependencies['@types/node']).toMatch(/^20\./);
         });
     });
 });

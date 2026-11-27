@@ -1,5 +1,7 @@
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import { createRequire } from 'node:module';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
@@ -21,6 +23,12 @@ interface VsixGuardModule {
 // way publish-node-engines.test.ts loads the packaging-Node guard.
 const nodeRequire = createRequire(__filename);
 const vsixGuard = nodeRequire(vsixGuardPath) as VsixGuardModule;
+
+interface ChangelogModule {
+    changelogEntry(changelog: string, version: string): string | undefined;
+}
+
+const changelogScript = nodeRequire(path.join(root, '.github', 'scripts', 'get-changelog.js')) as ChangelogModule;
 
 interface PackageJson {
     version: string;
@@ -78,6 +86,15 @@ function jobBlock(contents: string, job: string): string | undefined {
     return lines.slice(start, end === -1 ? undefined : end).join('\n');
 }
 
+/** The names of the top-level jobs (the two-space keys under `jobs:`). */
+function jobNames(contents: string): string[] {
+    const lines = contents.split('\n');
+    const start = lines.indexOf('jobs:');
+    return lines.slice(start + 1)
+        .map(line => /^ {2}([A-Za-z0-9_-]+):\s*$/.exec(line)?.[1])
+        .filter((name): name is string => name !== undefined);
+}
+
 function indexOrFail(contents: string, needle: string, file: string): number {
     const index = contents.indexOf(needle);
     expect(index, `${file} does not run \`${needle}\``).toBeGreaterThan(-1);
@@ -118,6 +135,17 @@ describe('workflow hygiene (every workflow)', () => {
         expect(unpinned, `${name} runs pipx tools without an exact version`).toEqual([]);
     });
 
+    // GitHub's default is 360 minutes: a hung step (an ssh2 handshake, a docker pull)
+    // would otherwise hold a runner for six hours before anyone sees red.
+    it.each(workflowNames)('bounds every job in %s with timeout-minutes', (name) => {
+        const contents = readWorkflow(name);
+        const jobs = jobNames(contents);
+        expect(jobs.length, `${name} has no jobs`).toBeGreaterThan(0);
+
+        const unbounded = jobs.filter(job => !/^ {4}timeout-minutes:\s*\d+\s*$/m.test(jobBlock(contents, job)!));
+        expect(unbounded, `${name} has jobs without timeout-minutes`).toEqual([]);
+    });
+
     it('ignores zizmor findings by rule inline, never by line number in .github/zizmor.yml', () => {
         const config = path.join(root, '.github', 'zizmor.yml');
         if (fs.existsSync(config)) {
@@ -148,11 +176,11 @@ describe('package.json scripts', () => {
 describe('pull-request and main CI', () => {
     const ciWorkflows = ['ci-pr.yml', 'ci-main.yml'];
 
-    it.each(ciWorkflows)('packages the extension on Node 22 and checks the vsix in %s', (name) => {
+    it.each(ciWorkflows)('packages the extension on the .nvmrc Node and checks the vsix in %s', (name) => {
         const job = jobBlock(readWorkflow(name), 'package');
         expect(job, `${name} has no \`package\` job`).toBeDefined();
 
-        expect(job).toMatch(/node-version:\s*'22'/);
+        expect(job).toContain('node-version-file: .nvmrc');
         const guard = indexOrFail(job!, 'node .github/scripts/check-packaging-node.js', name);
         const pack = indexOrFail(job!, 'npm run package', name);
         const contents = indexOrFail(job!, 'node .github/scripts/check-vsix-contents.js', name);
@@ -181,6 +209,43 @@ describe('pull-request and main CI', () => {
         expect(install).toBeLessThan(test);
     });
 
+    // The docs are tested too (docs.test.ts, pr-batching.test.ts, the CHANGELOG checks),
+    // and `check` is the required merge check: a Markdown-only change that skipped CI
+    // could merge a broken doc unchecked, or wait forever on a check that never starts.
+    it.each(ciWorkflows)('runs on every change, Markdown included, in %s', (name) => {
+        expect(readWorkflow(name)).not.toMatch(/^\s+paths(?:-ignore)?:/m);
+    });
+
+    // A new push to a PR makes the running checks moot; finishing them only delays the
+    // ones that matter. Pushes to main are never cancelled: each commit keeps its verdict.
+    it('cancels superseded pull-request runs', () => {
+        expect(readWorkflow('ci-pr.yml')).toMatch(/^concurrency:\n\s+group: [^\n]*github\.event\.pull_request\.number[^\n]*\n\s+cancel-in-progress: true$/m);
+    });
+
+    // Any concurrency group on main is unsafe, `cancel-in-progress: false` included: a
+    // group holds one running and one PENDING run, and a newer push replaces the pending
+    // one, so that commit never gets a verdict.
+    const declaresConcurrency = (contents: string): boolean => /^\s*concurrency:/m.test(contents);
+
+    it('recognises a concurrency group at any level, in any form', () => {
+        expect(declaresConcurrency('on: push\nconcurrency:\n  group: main\n  cancel-in-progress: false\njobs: {}\n')).toBe(true);
+        expect(declaresConcurrency('on: push\nconcurrency: main\njobs: {}\n')).toBe(true);
+        expect(declaresConcurrency('on: push\njobs:\n  check:\n    concurrency: main\n    runs-on: ubuntu-latest\n')).toBe(true);
+        expect(declaresConcurrency('on: push\njobs:\n  check:\n    runs-on: ubuntu-latest\n')).toBe(false);
+    });
+
+    it('never queues main pushes in a concurrency group, so none is replaced while pending', () => {
+        expect(declaresConcurrency(readWorkflow('ci-main.yml'))).toBe(false);
+    });
+
+    // npm ci from the npm cache instead of the registry on every job. Safe here: these
+    // workflows release nothing (the release workflows below never read a cache).
+    it.each(ciWorkflows)('caches npm downloads in every setup-node step of %s', (name) => {
+        const steps = readWorkflow(name).split(/^\s+- name: /m).filter(step => step.includes('actions/setup-node@'));
+        expect(steps.length).toBeGreaterThan(0);
+        steps.forEach(step => expect(step).toMatch(/^\s+cache: npm$/m));
+    });
+
     // npm audit and zizmor judge the outside world (new advisories, new rules),
     // so they would red a PR that changed nothing. They run on a schedule instead.
     it.each(ciWorkflows)('keeps registry- and rule-dependent audits out of %s', (name) => {
@@ -202,6 +267,18 @@ describe('pull-request and main CI', () => {
         expect(pinned, 'audit.yml does not pin a zizmor version').toBeDefined();
         expect(contents).toContain('issues: write');
         expect(contents).toContain('gh issue');
+    });
+});
+
+// A cache written by a PR or main run must never flow into a released vsix (zizmor's
+// cache-poisoning class): the release workflows install from the registry, cold.
+describe('release workflows', () => {
+    it.each(['publish.yml', 'preview.yml'])('never restores a dependency cache in %s', (name) => {
+        const contents = readWorkflow(name);
+
+        expect(contents).not.toMatch(/^\s+cache:/m);
+        expect(contents).not.toContain('actions/cache');
+        expect(contents).toContain('package-manager-cache: false');
     });
 });
 
@@ -249,11 +326,24 @@ describe('preview.yml', () => {
 });
 
 describe('moderation workflows', () => {
-    it('lets the stale workflow act on pull requests, which it is configured to mark and close', () => {
-        const contents = readWorkflow('mod-stale-issue-pr.yml');
+    // Staleness (issues, PRs, branches) is .dz/maintainer/maintainer.yml's alone: a second
+    // sweeper on its own windows (actions/stale at 90/30 days) contradicted its 60.
+    it('leaves stale issues and pull requests to the maintainer config, not actions/stale', () => {
+        expect(workflowNames).not.toContain('mod-stale-issue-pr.yml');
+        workflowNames.forEach(name => expect(readWorkflow(name), name).not.toContain('actions/stale@'));
+        expect(fs.readFileSync(path.join(root, '.dz', 'maintainer', 'maintainer.yml'), 'utf8')).toMatch(/^\s+stale_after_days: \d+/m);
+    });
 
-        expect(contents).toContain('stale-pr-message');
-        expect(contents).toMatch(/permissions:\n(?:\s+\S+: \S+\n)*\s+pull-requests: write/);
+    // @daiyam/artifact-lang-js ships mod-stale-issue-pr.yml: without this, the next
+    // `npm run update:artifacts` would quietly bring the deleted workflow back.
+    it('stops update:artifacts from restoring the deleted stale workflow', () => {
+        const artifactrc = fs.readFileSync(path.join(root, '.artifactrc.yml'), 'utf8');
+
+        expect(artifactrc).toMatch(/^ {6}\.github\/workflows\/mod-stale-issue-pr\.yml:\n {8}if_missing: skip$/m);
+    });
+
+    it('keeps locking long-closed threads', () => {
+        expect(readWorkflow('mod-lock-closed-threads.yml')).toContain('dessant/lock-threads@');
     });
 });
 
@@ -272,12 +362,24 @@ describe('release-it', () => {
 });
 
 describe('.tazerc.json', () => {
-    it('excludes the real (scoped) commitlint CLI package from taze bumps', () => {
-        const taze = JSON.parse(fs.readFileSync(path.join(root, '.tazerc.json'), 'utf8')) as { exclude: string[] };
+    const taze = JSON.parse(fs.readFileSync(path.join(root, '.tazerc.json'), 'utf8')) as {
+        exclude: string[];
+        packageMode: Record<string, string>;
+    };
 
-        expect(readPackageJson().devDependencies).toHaveProperty(['@commitlint/cli']);
-        expect(taze.exclude).toContain('@commitlint/cli');
-        expect(taze.exclude).not.toContain('commitlint/cli');
+    // The runtime contracts, not the toolchain: @types/vscode is fetched to match
+    // engines.vscode (update:dts), and @types/node types the Node 20 extension host.
+    it('never bumps the runtime typings past the extension host', () => {
+        expect(taze.exclude).toContain('@types/vscode');
+        expect(taze.packageMode['@types/node']).toBe('minor');
+    });
+
+    // These were held back only while the toolchain ran on Node 20 (their current
+    // majors need Node 22+); on the .nvmrc Node they update like everything else.
+    it('no longer holds back tooling that only needed a newer Node', () => {
+        for (const name of ['@commitlint/cli', '@commitlint/config-conventional', 'lint-staged']) {
+            expect(taze.exclude).not.toContain(name);
+        }
     });
 });
 
@@ -327,5 +429,68 @@ describe('release checksum file', () => {
         const contents = readWorkflow(name);
         expect(contents).toMatch(/sha256sum "?\$VSIX_NAME"? > "\$VSIX_NAME\.sha256"/);
         expect(contents).not.toMatch(/echo "\$CHECKSUM" > "\$VSIX_NAME\.sha256"/);
+    });
+});
+
+// publish.yml builds the release body from `get-changelog.js v<version>`.
+describe('get-changelog.js', () => {
+    const changelog = [
+        '## 1.4.20', '', '- twenty', '',
+        '## 1.4.2', '', '**Connecting**', '', '- two', '', '### Details', '', '- more', '',
+        '## 1.4.1', '', '- one', '',
+    ].join('\n');
+
+    it('returns the exact version\'s section, not one it is a prefix of', () => {
+        expect(changelogScript.changelogEntry(changelog, 'v1.4.2')).toBe('**Connecting**\n\n- two\n\n### Details\n\n- more');
+    });
+
+    it('reads the last section to the end of the file', () => {
+        expect(changelogScript.changelogEntry(changelog, 'v1.4.1')).toBe('- one');
+    });
+
+    it('treats the version literally, not as a pattern', () => {
+        expect(changelogScript.changelogEntry('## 1x4x2\n\n- wrong\n', 'v1.4.2')).toBeUndefined();
+    });
+
+    it('finds the section for package.json\'s version in the real CHANGELOG.md', () => {
+        const real = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
+
+        expect(changelogScript.changelogEntry(real, `v${readPackageJson().version}`)).toMatch(/\S/);
+    });
+});
+
+// bin/check is the local gate and release-it's `before:init`: a failed step must fail it.
+// `set -e` does not stop on a failure inside an `a && b && c` list (only on its last
+// command), so a stub npm on PATH proves each step's failure reaches the exit status.
+describe.runIf(process.platform !== 'win32')('bin/check', () => {
+    function runCheck(failing: string, args: string[] = []): { status: number | null; calls: string[] } {
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bin-check-'));
+        try {
+            const calls = path.join(directory, 'calls');
+            fs.writeFileSync(path.join(directory, 'npm'),
+                '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\n[ "$*" = "$FAILING" ] && exit 3\nexit 0\n', { mode: 0o755 });
+            const result = spawnSync('sh', [path.join(root, 'bin', 'check'), ...args], {
+                encoding: 'utf8',
+                env: { ...process.env, PATH: `${directory}${path.delimiter}${process.env.PATH}`, CALLS: calls, FAILING: failing },
+                timeout: 15000,
+            });
+            expect(result.error).toBeUndefined();
+            return { status: result.status, calls: fs.readFileSync(calls, 'utf8').trim().split('\n') };
+        } finally {
+            fs.rmSync(directory, { recursive: true, force: true });
+        }
+    }
+
+    it.each(['run compile:src', 'run lint', 'test'])('fails, and stops, when `npm %s` fails', (step) => {
+        const { status, calls } = runCheck(step, ['--full']);
+
+        expect(status).toBe(3);
+        expect(calls[calls.length - 1]).toBe(step);
+        expect(calls).not.toContain('run test:tmux');
+    });
+
+    it('runs compile, lint and the unit tests, then the rig with --full', () => {
+        expect(runCheck('none')).toEqual({ status: 0, calls: ['run compile:src', 'run lint', 'test'] });
+        expect(runCheck('none', ['--full']).calls).toEqual(['run compile:src', 'run lint', 'test', 'run test:tmux']);
     });
 });

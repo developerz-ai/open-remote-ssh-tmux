@@ -39,5 +39,6 @@ describe('eslint gate', () => {
         const rules = report.messages.map(m => m.ruleId);
         expect(rules).toEqual(['@typescript-eslint/no-floating-promises']);
         expect(report.messages[0].severity, 'the rule must be an error, not a warning').toBe(2);
-    });
+    // A real type-aware eslint run: well past vitest's 5 s default on a loaded CI runner.
+    }, 60_000);
 });

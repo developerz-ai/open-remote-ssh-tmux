@@ -4,6 +4,14 @@ artifacts:
     version: 0.14.7
     requires:
       - "20"
+    update:
+      # Deleted on purpose: staleness is .dz/maintainer/maintainer.yml's alone, and this
+      # actions/stale copy contradicted its windows. Never restore it.
+      .github/workflows/mod-stale-issue-pr.yml:
+        if_missing: skip
+      # The toolchain is on Node 24 LTS; this artifact's "20" variant ships v20.20.2.
+      .nvmrc:
+        if_exists: skip
   "@daiyam/artifact-lang-ts":
     version: 0.10.6
     update:

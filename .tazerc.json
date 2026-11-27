@@ -1,9 +1,6 @@
 {
 	"exclude": [
-		"@types/vscode",
-		"@commitlint/cli",
-		"@commitlint/config-conventional",
-		"lint-staged"
+		"@types/vscode"
 	],
 	"force": true,
 	"includeLocked": true,

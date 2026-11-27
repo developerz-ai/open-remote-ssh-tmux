@@ -100,6 +100,9 @@ interface Task {
 // PATH and acquire tools (eslint shims, pipx) the way a Linux dev box does. The Linux CI job
 // covers them; the Windows/macOS jobs exist to exercise the extension's own code.
 describe.runIf(process.platform === 'linux')('staged tooling', () => {
+    const zizmorVersion = '1.31.1';
+    const zizmor = `pipx run --spec zizmor==${zizmorVersion} zizmor`;
+
     it('sends root and nested TypeScript, but not unrelated files, to ESLint', () => {
         const tasks: Task[] = JSON.parse(native('console.log(JSON.stringify(tasks));', [
             'root.ts', 'src/tmux/nested.ts', 'src/notes.md', 'README.md', '.github/workflows/check.yml',
@@ -114,8 +117,15 @@ describe.runIf(process.platform === 'linux')('staged tooling', () => {
 
     it('keeps standalone workflow lint and fix scripts on the same acquisition path', () => {
         const manifest = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
-        expect(manifest.scripts['ci:lint']).toBe('pipx run zizmor .');
-        expect(manifest.scripts['ci:lint:fix']).toBe('pipx run zizmor . --fix=all');
+        expect(manifest.scripts['ci:lint']).toBe(`${zizmor} .`);
+        expect(manifest.scripts['ci:lint:fix']).toBe(`${zizmor} . --fix=all`);
+    });
+
+    // A newer zizmor brings new rules: unpinned, the local hook could red a workflow that
+    // CI's scheduled audit (audit.yml) passes, or pass one it reds.
+    it('pins local zizmor to the version the scheduled audit runs', () => {
+        const audit = readFileSync(path.join(root, '.github/workflows/audit.yml'), 'utf8');
+        expect(/ZIZMOR_VERSION:\s*'([^']+)'/.exec(audit)?.[1]).toBe(zizmorVersion);
     });
 
     // The stubs below are `#!/bin/sh` scripts found on PATH, which Windows cannot execute.
@@ -145,9 +155,9 @@ console.log(JSON.stringify({ command: task.commands, failed }));
                 ARGUMENTS_FILE: argumentsFile,
                 CHECKER_STATUS: String(status),
             });
-            expect(JSON.parse(output)).toEqual({ command: 'pipx run zizmor', failed: status !== 0 });
+            expect(JSON.parse(output)).toEqual({ command: zizmor, failed: status !== 0 });
             expect(readFileSync(argumentsFile, 'utf8').trim().split('\n')).toEqual([
-                'run', 'zizmor', path.resolve(root, '.github/workflows/ci-pr.yml'),
+                'run', '--spec', `zizmor==${zizmorVersion}`, 'zizmor', path.resolve(root, '.github/workflows/ci-pr.yml'),
                 path.resolve(root, '.github/workflows/ci-main.yml'),
             ]);
         } finally {
@@ -221,7 +231,7 @@ console.log(JSON.stringify({ command: task.commands, failed }));
             };
             console.info(`Prerequisites: Node ${process.version}; Python ${version('python3', ['--version'])}; pipx ${version('pipx', ['--version'])}`);
             // This cold-cache call must acquire the package, not find a global binary.
-            console.info(`Acquired: ${version('pipx', ['run', 'zizmor', '--version'])}; version exit=0`);
+            console.info(`Acquired: ${version('pipx', ['run', '--spec', `zizmor==${zizmorVersion}`, 'zizmor', '--version'])}; version exit=0`);
             const workflows = path.join(directory, '.github/workflows');
             mkdirSync(workflows, { recursive: true });
             const workflow = (run: string) => `name: probe\non: issues\npermissions: {}\njobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ${run}\n`;
@@ -268,6 +278,28 @@ console.log(JSON.stringify({ command: task.commands, failed }));
         }
     });
 
+    // The real hook with the real locked commitlint: `npx --no commitlint --edit` made npm 11
+    // read `--edit` as its own `--editor`, so commitlint got no message and refused every commit.
+    it.runIf(posixStubs).each([
+        ['fix: a valid message\n', 0],
+        ['not conventional\n', 1],
+    ])('commit-msg hook lints the message file %j (exit %i)', (message, status) => {
+        const directory = mkdtempSync(path.join(tmpdir(), 'commit-msg-hook-'));
+        try {
+            const file = path.join(directory, 'COMMIT_EDITMSG');
+            writeFileSync(file, message);
+            const result = spawnSync('sh', ['-e', path.join(root, '.husky/commit-msg'), file], {
+                cwd: root,
+                encoding: 'utf8',
+                timeout: 60000,
+            });
+            expect(result.error).toBeUndefined();
+            expect(result.status, result.stdout + result.stderr).toBe(status);
+        } finally {
+            rmSync(directory, { recursive: true, force: true });
+        }
+    }, 60000);
+
     it.runIf(posixStubs).each([0, 23])('propagates stubbed checker exit %i under Husky-equivalent sh -e', (status) => {
         const directory = mkdtempSync(path.join(tmpdir(), 'staged-hook-'));
         try {
@@ -283,8 +315,8 @@ console.log(JSON.stringify({ command: task.commands, failed }));
             expect(result.error).toBeUndefined();
             expect(result.status, result.stdout + result.stderr).toBe(status);
             expect(readFileSync(calls, 'utf8')).toBe(status === 0
-                ? 'npx lint-staged\nnpm run compile:src\nnpm test\n'
-                : 'npx lint-staged\n');
+                ? 'npx --no lint-staged\nnpm run compile:src\nnpm test\n'
+                : 'npx --no lint-staged\n');
         } finally {
             rmSync(directory, { recursive: true, force: true });
         }
