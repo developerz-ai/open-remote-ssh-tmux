@@ -45,7 +45,8 @@ export async function fetchRelease(serverDownloadUrlTemplate: string, version: s
     try {
         downloadUrl = new URL(serverDownloadUrlTemplate);
     } catch {
-        logger.info('Cannot parse the download url template as a URL: ' + serverDownloadUrlTemplate);
+        // Fork: never log the template itself — a mirror credential can ride in its query string.
+        logger.info('Cannot parse remote.SSH.serverDownloadUrlTemplate as an absolute URL');
         return {version, build};
     }
     const hostname = downloadUrl.hostname;
@@ -59,7 +60,8 @@ export async function fetchRelease(serverDownloadUrlTemplate: string, version: s
 
     const parts = downloadUrl.pathname.split('/');
     if (parts.length < 3) {
-        logger.info('Cannot parse the Github repository from the url template: ' + downloadUrl);
+        // Fork: not the URL itself (see above) — its query string can carry a credential.
+        logger.info('Cannot parse the Github repository from remote.SSH.serverDownloadUrlTemplate');
         return {version, build};
     }
     // per_page=100 (Github's max) so a repository with more than the default

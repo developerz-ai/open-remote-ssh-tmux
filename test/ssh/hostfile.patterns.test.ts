@@ -89,6 +89,38 @@ describe('verifyHostKey — plaintext host patterns', () => {
     });
 });
 
+// Only the *pattern's* `*` and `?` are special. A lookup name may contain them too — a
+// HostKeyAlias is free text — and there they are ordinary characters.
+describe('verifyHostKey — glob characters in the lookup name', () => {
+    it('lets the pattern\'s * match a name that itself starts with *', () => {
+        expect(verifyHostKey('*edge-dev', keyB, `*dev ssh-ed25519 ${b64(keyA)}\n`)).toBe('mismatch');
+        expect(verifyHostKey('*edge-dev', keyA, `*dev ssh-ed25519 ${b64(keyA)}\n`)).toBe('known');
+    });
+
+    it('lets the pattern\'s ? match a literal ? or * in the name, one character each', () => {
+        expect(verifyHostKey('a?b', keyB, `a?b ssh-ed25519 ${b64(keyA)}\n`)).toBe('mismatch');
+        expect(verifyHostKey('a*b', keyB, `a?b ssh-ed25519 ${b64(keyA)}\n`)).toBe('mismatch');
+    });
+
+    it('does not let a * in the name act as a wildcard', () => {
+        expect(verifyHostKey('*', keyB, `box ssh-ed25519 ${b64(keyA)}\n`)).toBe('unknown');
+        expect(verifyHostKey('b*', keyB, `box ssh-ed25519 ${b64(keyA)}\n`)).toBe('unknown');
+    });
+});
+
+describe('verifyHostKey — a hostile pattern cannot stall the connect', () => {
+    it('decides a many-star pattern against a long name in bounded time', () => {
+        const name = 'a'.repeat(20_000);
+        const pattern = `${'*a'.repeat(200)}*b`;
+        const started = performance.now();
+
+        expect(verifyHostKey(name, keyB, `${pattern} ssh-ed25519 ${b64(keyA)}\n`)).toBe('unknown');
+        expect(verifyHostKey(name, keyB, `${'*a'.repeat(200)}* ssh-ed25519 ${b64(keyA)}\n`)).toBe('mismatch');
+
+        expect(performance.now() - started).toBeLessThan(2000);
+    });
+});
+
 describe('verifyHostKey — host name case', () => {
     it('finds a lower-case plaintext record for a mixed-case host (changed key → mismatch)', () => {
         expect(verifyHostKey('MyBox.Example.com', keyB, `mybox.example.com ssh-ed25519 ${b64(keyA)}\n`)).toBe('mismatch');

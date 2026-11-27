@@ -306,13 +306,25 @@ Scheduled checkups, briefs in [`.dz/schedules/`](.dz/schedules/), every Monday: 
 - **ProxyCommand** is run without a shell: the line is split into arguments (double
   quotes, and on Linux/macOS single quotes and backslash escapes) and `%h`, `%n`,
   `%p`, `%r`, `%%` are expanded — no pipes, redirects or `$VAR` unless the command is
-  itself `sh -c '…'`. A host or user name OpenSSH would refuse on its command line (a
-  leading `-`, quotes, `;`, `|`, `&`, `$`, backticks, brackets, whitespace in a host)
-  is refused before the command starts. Between `ProxyJump` and `ProxyCommand`, the
-  one that comes first in the SSH config wins, and `none` cancels both.
+  itself `sh -c '…'`. The one exception is a Windows `.bat`/`.cmd` ProxyCommand,
+  which Windows can only run through `cmd.exe`; a host or user name containing a
+  `cmd.exe` metacharacter (`&`, `|`, `<`, `>`, `^`, `%`, `"`, `!`, brackets) is
+  refused there. Between `ProxyJump` and `ProxyCommand`, the one that comes first
+  in the SSH config wins, and `none` cancels both.
+- **Host and user names that reach a ProxyCommand are vetted, more strictly than
+  `ssh` does.** A `%h`, `%n` or `%r` value the command uses is refused before the
+  command starts if it begins with `-` or contains anything a shell or a glob
+  could interpret: quotes, backticks, `$`, `\`, `;`, `&`, `|`, `<`, `>`, brackets
+  and braces, whitespace, `%`, `!`, `*`, `?`, `~`, `#` or a control character
+  (`%p` must be a number). OpenSSH allows `$`, spaces and `\` in a user name; here
+  they are refused too, because your own `sh -c "… %r"` would interpret them — so
+  a login such as `CORP\me` or `John Smith` cannot be combined with a ProxyCommand
+  that uses `%r`. IPv6 literals, including a zone (`fe80::1%eth0`), are accepted. A
+  token the command does not use is not checked.
 - **`user@host:port` beats the SSH config.** A user or port written in the destination
   (or in a `ProxyJump` entry) is used even when the config sets `User`/`Port` for that
-  host, as with `ssh`.
+  host, as with `ssh`. A `ProxyJump` host without a user of its own (in the entry or
+  in its config) is logged in to as your local user, not as the destination's user.
 
 Report vulnerabilities privately — see [SECURITY.md](SECURITY.md).
 

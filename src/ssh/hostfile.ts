@@ -71,8 +71,13 @@ function parseKnownHostsLine(line: string): KnownHostsRecord | undefined {
 
 /**
  * OpenSSH's `match_pattern`: `*` matches any run of characters (including none), `?`
- * exactly one, everything else itself. Hand-rolled rather than compiled to a RegExp, so
- * a hostile known_hosts line can neither inject regex syntax nor backtrack without bound.
+ * exactly one, everything else itself. Only the *pattern's* `*` and `?` are special:
+ * `text` is a name (a HostKeyAlias may hold any character), so the pattern's `*` is
+ * tried before literal equality — otherwise a `*` in the name consumed it as a literal.
+ *
+ * The standard iterative matcher with a single backtrack point (the last `*` and where
+ * in `text` it resumed), O(text × pattern) at worst — not a RegExp and not recursive,
+ * so a hostile known_hosts line can neither inject regex syntax nor stall the connect.
  */
 function matchPattern(text: string, pattern: string): boolean {
     let t = 0;
@@ -80,12 +85,12 @@ function matchPattern(text: string, pattern: string): boolean {
     let star = -1;
     let resume = 0;
     while (t < text.length) {
-        if (p < pattern.length && (pattern[p] === '?' || pattern[p] === text[t])) {
-            t++;
-            p++;
-        } else if (p < pattern.length && pattern[p] === '*') {
+        if (p < pattern.length && pattern[p] === '*') {
             star = p++;
             resume = t;
+        } else if (p < pattern.length && (pattern[p] === '?' || pattern[p] === text[t])) {
+            t++;
+            p++;
         } else if (star !== -1) {
             p = star + 1;
             t = ++resume;

@@ -271,12 +271,16 @@ export function resolveHopPort(configuredPort: string | undefined, jumpPort: num
 
 /**
  * Fork: the login user — the one written in the destination (`admin@box`, the
- * equivalent of `ssh admin@box` / `-l`), else ssh_config `User`, else `fallback`.
+ * equivalent of `ssh admin@box` / `-l`), else ssh_config `User`, else the local user.
  * Upstream let the config win, so `admin@box` logged in as the config's user; OpenSSH
  * never lets the config override a user given on the command line.
+ *
+ * `localUser` is a function so it is only looked up as the last resort:
+ * `os.userInfo()` throws for a UID with no passwd entry (containers), which must not
+ * stop a connect that names its user.
  */
-export function resolveUser(destinationUser: string | undefined, configuredUser: string | undefined, fallback: string): string {
-    return destinationUser || configuredUser || fallback;
+export function resolveUser(destinationUser: string | undefined, configuredUser: string | undefined, localUser: () => string): string {
+    return destinationUser || configuredUser || localUser();
 }
 
 /**
@@ -287,6 +291,25 @@ export function resolveUser(destinationUser: string | undefined, configuredUser:
  */
 export function resolveHostName(configuredHostName: string | undefined, alias: string): string {
     return configuredHostName ? expandTokens(configuredHostName, { h: alias }) : alias;
+}
+
+/**
+ * Fork: who and where a ProxyJump hop is. A hop is its own `ssh` invocation, so each
+ * part comes from its ProxyJump entry (`user@host:port`), else from *that hop's* config,
+ * else the default — the local user, port 22. The destination's login is deliberately
+ * not a parameter: upstream fell back to it, and `admin@box` behind `ProxyJump bastion`
+ * tried to log in to bastion as admin.
+ */
+export function resolveProxyJumpHop(
+    hop: { hostname: string; user?: string; port?: number },
+    hopConfig: { HostName?: string; User?: string; Port?: string },
+    localUser: () => string
+): { hostName: string; user: string; port: number } {
+    return {
+        hostName: resolveHostName(hopConfig.HostName, hop.hostname),
+        user: resolveUser(hop.user, hopConfig.User, localUser),
+        port: resolveHopPort(hopConfig.Port, hop.port),
+    };
 }
 
 /**
@@ -447,13 +470,33 @@ export function hostKeyAlgorithms(knownKeyTypes: readonly string[]): Pick<ssh2.C
     return { algorithms: { serverHostKey: serverHostKey as unknown as ssh2.AlgorithmList<ssh2.ServerHostKeyAlgorithm> } };
 }
 
-// OpenSSH's own checks on a host or user name given on the command line (ssh.c
-// `valid_hostname` / `valid_ruser`, CVE-2023-51385): no leading `-` (it would be an
-// option of the proxy program), no shell metacharacter, whitespace or control
-// character in a host; for a user, whitespace is fine unless a `-` follows it, `$` is
-// fine, and a trailing backslash is not.
-const UNSAFE_HOST_NAME = /^-|['`"$\\;&<>|(){}\s]|\p{Cc}/u;
-const UNSAFE_USER_NAME = /^-|['`";&<>|(){}]|\p{Cc}|\s-|\\$/u;
+// What a `%h`/`%n`/`%r` value expanded into a ProxyCommand may not contain. It starts
+// from OpenSSH's own checks on a host or user name given on the command line (ssh.c
+// `valid_hostname` / `valid_ruser`, CVE-2023-51385): no leading `-` (an option of the
+// proxy program), no quote, no `;&<>|(){}`, no control character. It is deliberately
+// stricter than OpenSSH from there: `valid_ruser` lets `$`, whitespace and `\` through,
+// and the value may land inside the user's own `sh -c "… %r"` or a remote shell
+// (`ssh bastion nc %h %p`). So anything a POSIX shell or a glob could interpret is
+// refused for both: `$`, `\`, whitespace, `%`, `!`, `*`, `?`, `[`, `]`, `~`, `#`.
+const UNSAFE_TOKEN_VALUE = /^-|['`"$\\;&<>|(){}\s%!*?[\]~#]|\p{Cc}/u;
+// The one `%` a host name may carry: the zone of a link-local IPv6 literal (`fe80::1%eth0`).
+const IPV6_ZONE = /^([0-9a-f.]*:[0-9a-f:.]*)%[A-Za-z0-9_.-]+$/i;
+
+/**
+ * The characters that follow a `%` in a ProxyCommand's words — i.e. the tokens it really
+ * expands. Scanned as {@link expandTokens} does, so `%%r` is a literal `%r`, not a use.
+ */
+function usedTokens(templates: readonly string[]): Set<string> {
+    const used = new Set<string>();
+    for (const template of templates) {
+        for (let i = 0; i < template.length - 1; i++) {
+            if (template[i] === '%') {
+                used.add(template[++i]);
+            }
+        }
+    }
+    return used;
+}
 
 // cmd.exe metacharacters (plus line breaks): inside a `%x` token they would be
 // command syntax, not text — see buildProxyCommandSpawn().
@@ -465,9 +508,12 @@ const CMD_METACHARACTERS = /[&|<>^%"!()\r\n]/;
  *
  * `%h`, `%n` and `%r` come from the remote authority — a link, a workspace file — and
  * the command passes them on: `ssh bastion nc %h %p` to the bastion's shell,
- * `sh -c "nc %h %p"` to a local one. So on every platform a value OpenSSH itself would
- * refuse is refused here before anything is spawned, and `%p` must be a number. The
- * error names the token, never the value.
+ * `sh -c "nc %h %p"` to a local one. So on every platform a value that a shell could
+ * interpret is refused before anything is spawned (`UNSAFE_TOKEN_VALUE` — stricter than
+ * OpenSSH on purpose), and `%p` must be a number. Only the tokens the command really
+ * uses are vetted: a value that is never expanded reaches nothing, and must not stop
+ * `O'Brien@box` from connecting through `nc %h %p`. The error names the token, never
+ * the value.
  *
  * A Windows `.bat`/`.cmd` must run through cmd.exe
  * (`shell: true`, verbatim args), where a token value from the remote authority — a
@@ -483,16 +529,25 @@ export function buildProxyCommandSpawn(
     tokens: { h: string; n: string; p: string; r: string },
     windows: boolean = isWindows
 ): { command: string; args: string[]; options: cp.SpawnOptionsWithoutStdio } {
-    const unsafe = UNSAFE_HOST_NAME.test(tokens.h) ? 'h' : UNSAFE_HOST_NAME.test(tokens.n) ? 'n' : UNSAFE_USER_NAME.test(tokens.r) ? 'r' : !/^\d+$/.test(tokens.p) ? 'p' : undefined;
-    if (unsafe) {
-        throw new ProxyCommandRejectedError(`Refusing to run the ProxyCommand: the %${unsafe} value is not a safe ${unsafe === 'r' ? 'user name' : unsafe === 'p' ? 'port' : 'host name'}`);
+    const words = splitProxyCommand(value, windows);
+    const used = usedTokens(words);
+    const isUnsafe: Record<'h' | 'n' | 'r' | 'p', (tokenValue: string) => boolean> = {
+        h: (host) => UNSAFE_TOKEN_VALUE.test(host.replace(IPV6_ZONE, '$1')),
+        n: (host) => UNSAFE_TOKEN_VALUE.test(host.replace(IPV6_ZONE, '$1')),
+        r: (user) => UNSAFE_TOKEN_VALUE.test(user),
+        p: (port) => !/^\d+$/.test(port),
+    };
+    for (const token of ['h', 'n', 'r', 'p'] as const) {
+        if (used.has(token) && isUnsafe[token](tokens[token])) {
+            throw new ProxyCommandRejectedError(`Refusing to run the ProxyCommand: the %${token} value is not a safe ${token === 'r' ? 'user name' : token === 'p' ? 'port' : 'host name'}`);
+        }
     }
-    let args = splitProxyCommand(value, windows).map((arg) => expandTokens(arg, tokens));
+    let args = words.map((arg) => expandTokens(arg, tokens));
     let command = args.shift()!;
     let options: cp.SpawnOptionsWithoutStdio = {};
     if (windows && /\.(bat|cmd)$/.test(command)) {
         for (const [token, tokenValue] of Object.entries(tokens)) {
-            if (CMD_METACHARACTERS.test(tokenValue)) {
+            if (used.has(token) && CMD_METACHARACTERS.test(tokenValue)) {
                 throw new ProxyCommandRejectedError(`Refusing to run a .bat/.cmd ProxyCommand: the %${token} value contains a cmd.exe metacharacter`);
             }
         }
@@ -764,7 +819,8 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                 const sshHostConfig = sshconfig.getHostConfiguration(sshDest.hostname);
                 const sshHostName = resolveHostName(sshHostConfig['HostName'], sshDest.hostname);
                 // Fork: a user/port written in the destination beats ssh_config, as in OpenSSH — see resolveUser(), resolveHopPort().
-                const sshUser = resolveUser(sshDest.user, sshHostConfig['User'], os.userInfo().username || ''); // https://github.com/openssh/openssh-portable/blob/5ec5504f1d328d5bfa64280cd617c3efec4f78f3/sshconnect.c#L1561-L1562
+                const localUser = () => os.userInfo().username || '';
+                const sshUser = resolveUser(sshDest.user, sshHostConfig['User'], localUser); // https://github.com/openssh/openssh-portable/blob/5ec5504f1d328d5bfa64280cd617c3efec4f78f3/sshconnect.c#L1561-L1562
                 const sshPort = resolveHopPort(sshHostConfig['Port'], sshDest.port);
 
                 this.sshAgentSock = sshHostConfig['IdentityAgent'] || process.env['SSH_AUTH_SOCK'] || (isWindows ? '\\\\.\\pipe\\openssh-ssh-agent' : undefined);
@@ -792,9 +848,8 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                         });
                     for (let i = 0; i < proxyJumps.length; i++) {
                         const [proxy, proxyHostConfig] = proxyJumps[i];
-                        const proxyHostName = resolveHostName(proxyHostConfig['HostName'], proxy.hostname);
-                        const proxyUser = resolveUser(proxy.user, proxyHostConfig['User'], sshUser);
-                        const proxyPort = resolveHopPort(proxyHostConfig['Port'], proxy.port);
+                        // Fork: the hop's own user/host/port, never the destination's login — see resolveProxyJumpHop().
+                        const { hostName: proxyHostName, user: proxyUser, port: proxyPort } = resolveProxyJumpHop(proxy, proxyHostConfig, localUser);
 
                         const proxyAgentForward = enableAgentForwarding && (proxyHostConfig['ForwardAgent'] || 'no').toLowerCase() === 'yes';
                         const proxyAgent = proxyAgentForward && this.sshAgentSock ? new ssh2.OpenSSHAgent(this.sshAgentSock) : undefined;

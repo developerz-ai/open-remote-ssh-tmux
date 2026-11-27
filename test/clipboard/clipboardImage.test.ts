@@ -48,6 +48,37 @@ describe('buildLocalCaptureCandidates: read the LOCAL clipboard (extension runs 
         expect(decodePowerShell(wpf)).toMatch(/finally \{[^}]*\$stream\.Dispose\(\)/);
     });
 
+    // A temp path under a profile like `C:\\Users\\O\u2019Brien` carries a typographic apostrophe.
+    // PowerShell treats U+2018-U+201B as single quotes, so an undoubled one closes the string
+    // early and the rest of the path is parsed as code.
+    it('doubles typographic apostrophes in the output path of both Windows readers', () => {
+        for (const candidate of buildLocalCaptureCandidates('win32', 'C:\\Users\\O\u2019Brien\\a\'b.png')) {
+            expect(decodePowerShell(candidate)).toContain('\'C:\\Users\\O\u2019\u2019Brien\\a\'\'b.png\'');
+        }
+    });
+
+    // Needs a real PowerShell, so only the Windows CI job runs it. The runner has no clipboard
+    // image, so the scripts exit 1 at the "no image" check before reaching Save: a failing Save
+    // cannot be provoked from here. What this does pin is the strongest reachable contract on
+    // the real interpreter: both scripts parse (a bad quote would be a ParserError on stderr),
+    // exit non-zero, and leave nothing behind, even for a path the scripts could not write.
+    it.runIf(process.platform === 'win32')('runs both Windows readers under real PowerShell: parse cleanly, exit non-zero, write nothing', () => {
+        const dir = mkdtempSync(join(tmpdir(), 'orst-ps-'));
+        try {
+            const outPath = join(dir, 'missing\u2019dir', 'shot.png');
+            for (const candidate of buildLocalCaptureCandidates('win32', outPath)) {
+                const [command, ...args] = candidate.argv;
+                const run = spawnSync(command, args, { encoding: 'utf8', timeout: 60_000, windowsHide: true });
+                expect(run.error, candidate.label).toBeUndefined();
+                expect(run.status, candidate.label).not.toBe(0);
+                expect(run.stderr, candidate.label).not.toMatch(/ParserError|ParseException|Unexpected token|missing the terminator/i);
+                expect(() => statSync(outPath), candidate.label).toThrow();
+            }
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 120_000);
+
     it('offers a PowerShell reader on win32 that writes a PNG to the given path', () => {
         const [first] = buildLocalCaptureCandidates('win32', 'C:\\tmp\\shot.png');
         expect(first.argv[0]).toBe('powershell.exe');

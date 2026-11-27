@@ -88,27 +88,19 @@ function normalizeSSHConfig(config: SSHConfig) {
 }
 
 /**
- * Fork: the pathname patterns of one `Include` directive.
+ * Fork: the pathname patterns of one `Include` directive, as OpenSSH reads it:
+ * separated by whitespace only, a quoted one being the way to write a pathname with
+ * spaces. ssh-config (5.3+) hands the value over already split that way — a list of
+ * `{ val }` words when there are several, a plain string when there is one, quotes
+ * stripped — so there is nothing left to split.
  *
- * OpenSSH's Include takes *whitespace*-separated pathnames, a quoted one being the way
- * to write a pathname with spaces. ssh-config (5.3+) hands the value over already
- * split: a list of `{ val, quoted }` words when there are several, a plain string when
- * there is one — quotes stripped, and for that single word with no flag saying whether
- * it was quoted. (Before 5.3 the whole value was one string, and reading `Include a b`
- * as the single pattern "a b" made every host in both files disappear without an error.)
- *
- * A comma also separates pathnames here: it was the only separator upstream honoured,
- * so configs written for it keep working. It is not applied to a word known to be
- * quoted, nor to a single word containing whitespace (which can only have been quoted).
+ * Upstream split the value on commas instead (and only on commas). A comma is part of
+ * the pathname in OpenSSH, so `Include a.conf,b.conf` now names the one file
+ * `a.conf,b.conf`; write `Include a.conf b.conf`.
  */
 export function includePatterns(value: Directive['value']): string[] {
-    const words = typeof value === 'string'
-        ? [{ val: value, quoted: /\s/.test(value) }]
-        : value;
-    return words
-        .flatMap(({ val, quoted }) => quoted ? [val] : val.split(','))
-        .map(s => s.trim())
-        .filter(s => !!s);
+    const words = typeof value === 'string' ? [value] : value.map(({ val }) => val);
+    return words.map(s => s.trim()).filter(s => !!s);
 }
 
 // OpenSSH caps nested Include expansion at 16 levels (sshd's `includedepth`)

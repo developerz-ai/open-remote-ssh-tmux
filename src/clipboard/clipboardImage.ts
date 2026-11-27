@@ -22,7 +22,7 @@
 // quoting and path construction are auditable in one file (tmux's are built separately
 // in `src/tmux/*`).
 
-import { escapeShellArg } from '../common/shellQuote';
+import { escapePowerShellArg, escapeShellArg } from '../common/shellQuote';
 
 /** Directory, relative to the remote user's `$HOME`, under which every uploaded image
  * lives. `.cache` is the XDG-conventional home for regenerable data, so nothing here is
@@ -99,7 +99,7 @@ export function buildLocalCaptureCandidates(platform: string, outPath: string): 
                         + 'if ($img -eq $null) { exit 1 }; '
                         + '$stream = $null; '
                         + 'try { '
-                        + `$stream = [IO.File]::Open('${psQuote(outPath)}', 'Create'); `
+                        + `$stream = [IO.File]::Open(${escapePowerShellArg(outPath)}, 'Create'); `
                         + '$encoder = New-Object Windows.Media.Imaging.PngBitmapEncoder; '
                         + '$encoder.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($img)) | Out-Null; '
                         + '$encoder.Save($stream) | Out-Null '
@@ -119,7 +119,7 @@ export function buildLocalCaptureCandidates(platform: string, outPath: string): 
                         // overload picks a format from nothing and can emit a non-PNG payload
                         // under a .png name, which anything sniffing by extension mis-reads.
                         + 'try { '
-                        + `$img.Save('${psQuote(outPath)}', [System.Drawing.Imaging.ImageFormat]::Png) `
+                        + `$img.Save(${escapePowerShellArg(outPath)}, [System.Drawing.Imaging.ImageFormat]::Png) `
                         + '} catch { exit 1 } finally { $img.Dispose() }; exit 0'
                     )],
                 },
@@ -163,13 +163,6 @@ const PS_STOP_ON_ERROR = '$ErrorActionPreference = \'Stop\'; ';
  * this way instead of as inline `-Command` text. */
 function encodePowerShellCommand(script: string): string {
     return Buffer.from(script, 'utf16le').toString('base64');
-}
-
-/** Escape a value for a PowerShell single-quoted string, where a literal quote is doubled.
- * Without this a username containing an apostrophe (`C:\Users\O'Brien\…`) would close the
- * string early and hand the rest of the path to the parser as code. */
-function psQuote(value: string): string {
-    return value.replace(/'/g, `''`);
 }
 
 /**

@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { expandTokens, resolveHopPort, resolveHostName, resolveUser, buildKeyboardInteractiveFinish, connectionsToClose } from '../src/authResolver';
+import { describe, expect, it, vi } from 'vitest';
+import { expandTokens, resolveHopPort, resolveHostName, resolveProxyJumpHop, resolveUser, buildKeyboardInteractiveFinish, connectionsToClose } from '../src/authResolver';
 import type SSHConnection from '../src/ssh/sshConnection';
 
 // `expandTokens` replaces OpenSSH-style `%x` config tokens (HostName, ProxyCommand
@@ -56,16 +56,52 @@ describe('resolveHopPort', () => {
 });
 
 // `ssh admin@box` logs in as admin whatever `User` the config sets for box; the
-// resolver let the config win, so `admin@box` silently became `deploy@box`.
+// resolver let the config win, so `admin@box` silently became `deploy@box`. The local
+// user name is the last resort and is only looked up then: `os.userInfo()` throws for a
+// UID with no passwd entry, which must not stop a connect that names its user.
 describe('resolveUser', () => {
+    const local = () => 'local';
+
     it('prefers the user written in the destination over ssh_config User', () => {
-        expect(resolveUser('admin', 'deploy', 'local')).toBe('admin');
+        expect(resolveUser('admin', 'deploy', local)).toBe('admin');
     });
 
-    it('falls back to ssh_config User, then to the given fallback', () => {
-        expect(resolveUser(undefined, 'deploy', 'local')).toBe('deploy');
-        expect(resolveUser(undefined, undefined, 'local')).toBe('local');
-        expect(resolveUser('', '', 'local')).toBe('local');
+    it('falls back to ssh_config User, then to the local user', () => {
+        expect(resolveUser(undefined, 'deploy', local)).toBe('deploy');
+        expect(resolveUser(undefined, undefined, local)).toBe('local');
+        expect(resolveUser('', '', local)).toBe('local');
+    });
+
+    it('does not look the local user up when a user is given', () => {
+        const noPasswdEntry = vi.fn(() => {
+            throw new Error('ENOENT: no such user');
+        });
+
+        expect(resolveUser('admin', undefined, noPasswdEntry)).toBe('admin');
+        expect(resolveUser(undefined, 'deploy', noPasswdEntry)).toBe('deploy');
+        expect(noPasswdEntry).not.toHaveBeenCalled();
+    });
+});
+
+// A ProxyJump hop is its own `ssh` invocation: its user is the `user@` of its ProxyJump
+// entry, else that hop's own config `User`, else the local user — never the login of the
+// final destination, which `admin@box` behind `ProxyJump bastion` used to hand to bastion.
+describe('resolveProxyJumpHop', () => {
+    const local = () => 'local';
+
+    it('takes user, host and port from the ProxyJump entry first', () => {
+        expect(resolveProxyJumpHop({ hostname: 'bastion', user: 'jump', port: 2201 }, { HostName: '%h.corp', User: 'cfg', Port: '2200' }, local))
+            .toEqual({ hostName: 'bastion.corp', user: 'jump', port: 2201 });
+    });
+
+    it('falls back to the hop\'s own config', () => {
+        expect(resolveProxyJumpHop({ hostname: 'bastion' }, { User: 'cfg', Port: '2200' }, local))
+            .toEqual({ hostName: 'bastion', user: 'cfg', port: 2200 });
+    });
+
+    it('falls back to the local user and port 22 — it has no way to see the destination\'s', () => {
+        expect(resolveProxyJumpHop({ hostname: 'bastion' }, {}, local)).toEqual({ hostName: 'bastion', user: 'local', port: 22 });
+        expect(resolveProxyJumpHop.length).toBe(3);
     });
 });
 
