@@ -238,7 +238,7 @@ export interface TmuxSession {
      * in {@link reapVerdict}: the later of `#{session_activity}` (client input, attach) and
      * the newest `#{window_activity}` (pane output) of ANY of its windows, so a detached
      * task that is still printing — in whichever window — is not idle. Needs the output
-     * side: a session no window line was reported for has an unknown age. `undefined` for a row that carried neither — and then the session is never aged out. */
+     * side in full: unless every one of its `windows` reported, its age is unknown. `undefined` for a row that carried neither — and then the session is never aged out. */
     readonly activityEpoch?: number;
     /** `#{@orst_owner}` — the client id of the window that last attached, or `undefined` for
      * a session that carries no tag (created before tags existed, or never attached by us). */
@@ -644,7 +644,8 @@ export function isDuplicateSession(stderr: string): boolean {
  * listed, its output was not, and a session still printing could be reaped. Verified on
  * 2.6, 3.0a, 3.4, 3.5a and 3.8: both outputs in order with exit 0; with no server, one
  * "error connecting"/"no server running" on stderr and exit 1 — what callers already
- * classify. A session that still has no window line has unknown output and is never aged.
+ * classify. A session whose window lines do not number its `#{session_windows}` — none, or
+ * fewer — has a window nobody observed: unknown output, and it is never aged.
  */
 export function buildListSessions(tmuxPath = TMUX_BIN): string {
     return `printf '${NOW_TAG} %s\\n' "$(date +%s)"; ${escapeShellArg(tmuxPath)} `
@@ -893,7 +894,7 @@ export function classifyTmuxFailure(stderr: string, code: number | undefined): T
 export function parseListSessions(stdout: string): TmuxSession[] {
     const sessions: TmuxSession[] = [];
     const lines = stdout.split('\n').map(line => line.trim());
-    const windowActivity = newestWindowActivity(lines);
+    const observed = observedWindows(lines);
     for (const line of lines) {
         if (line === '' || line.startsWith('no server running') || line.startsWith(`${WINDOW_TAG} `) || line === WINDOW_TAG) {
             continue;
@@ -926,7 +927,10 @@ export function parseListSessions(stdout: string): TmuxSession[] {
             createdEpoch,
             activityEpoch: lastAlive(
                 activityToken === undefined ? undefined : toNonNegativeInt(activityToken.slice(ACTIVITY_FIELD.length)),
-                windowActivity.get(name),
+                // The output side counts only when EVERY window of the session reported
+                // (`#{session_windows}` of them): with one unobserved, the live task may be
+                // printing in exactly that one, so the age stays unknown — never reaped.
+                observed.get(name)?.count === windows ? observed.get(name)?.newest : undefined,
             ),
             owner: ownerToken === undefined || ownerToken === OWNER_FIELD ? undefined : ownerToken.slice(OWNER_FIELD.length),
             closed: closedToken === undefined ? undefined : parseClosedMarker(closedToken.slice(CLOSED_FIELD.length)),
@@ -1002,11 +1006,12 @@ function popTagged(tokens: string[], prefix: string): string | undefined {
     return tokens.length > 0 && tokens[tokens.length - 1].startsWith(prefix) ? tokens.pop() : undefined;
 }
 
-/** Newest `#{window_activity}` per session name, from the {@link WINDOW_TAG} lines of a
- * {@link buildListSessions} run. Names are joined the way `parseListSessions` joins a row's,
- * so the two agree; a line without an epoch and a name is skipped. */
-function newestWindowActivity(lines: readonly string[]): Map<string, number> {
-    const newest = new Map<string, number>();
+/** What the {@link WINDOW_TAG} lines of a {@link buildListSessions} run say per session name:
+ * the newest `#{window_activity}` and how many windows reported one. Names are joined the way
+ * `parseListSessions` joins a row's, so the two agree; a line without an epoch and a name is
+ * skipped — and so not counted as an observation of its window. */
+function observedWindows(lines: readonly string[]): Map<string, { newest: number; count: number }> {
+    const observed = new Map<string, { newest: number; count: number }>();
     for (const line of lines) {
         const tokens = line.split(/\s+/);
         const epoch = tokens.length >= 3 && tokens[0] === WINDOW_TAG ? toNonNegativeInt(tokens[1]) : undefined;
@@ -1014,13 +1019,14 @@ function newestWindowActivity(lines: readonly string[]): Map<string, number> {
             continue;
         }
         const name = tokens.slice(2).join(' ');
-        newest.set(name, Math.max(epoch, newest.get(name) ?? 0));
+        const seen = observed.get(name);
+        observed.set(name, { newest: Math.max(epoch, seen?.newest ?? 0), count: (seen?.count ?? 0) + 1 });
     }
-    return newest;
+    return observed;
 }
 
 /** When a session was last alive: the later of its last input and its newest window output.
- * `undefined` without the output side — no window line came back for it, so its real age is
+ * `undefined` without the output side — its windows did not all report, so its real age is
  * unknown, and unknown is never old enough to reap. */
 function lastAlive(input: number | undefined, output: number | undefined): number | undefined {
     if (output === undefined) {

@@ -26,8 +26,9 @@ const NOW = 1_700_000_000;
 const OLD = NOW - 3600;
 
 /**
- * One session as the list command reports it: its window's `__win <activity> <name>` line
- * (left out with `windowRow: false` — a session the window list did not cover), then the
+ * One session as the list command reports it: a `__win <activity> <name>` line per window
+ * (`windowRows` overrides how many — fewer than `windows` is a session the window list did
+ * not fully cover; `windowRow: false` is none at all), then the
  * `tmux list-sessions -F` line: `<name> <attached> <windows> <created> <paneDead>`.
  * A reapable corpse is detached with a dead pane (`paneDead: true`); a live session
  * has `paneDead: false`. `windows` is ≥1 for any real session and is never the reap gate.
@@ -35,13 +36,14 @@ const OLD = NOW - 3600;
 const row = (
     name: string,
     attached: boolean,
-    opts: { windows?: number; paneDead?: boolean; created?: number; activity?: number; windowRow?: boolean } = {},
+    opts: { windows?: number; paneDead?: boolean; created?: number; activity?: number; windowRow?: boolean; windowRows?: number } = {},
 ): string => {
     const windows = opts.windows ?? 1;
     const created = opts.created ?? OLD;
     const activity = opts.activity ?? created;
     const session = `${name} ${attached ? 1 : 0} ${windows} ${created} ${opts.paneDead ? 1 : 0} a:${activity} o:`;
-    return opts.windowRow === false ? session : `__win ${activity} ${name}\n${session}`;
+    const rows = opts.windowRow === false ? 0 : opts.windowRows ?? windows;
+    return [...Array.from({ length: rows }, () => `__win ${activity} ${name}`), session].join('\n');
 };
 
 /**
@@ -410,6 +412,20 @@ describe('reap — ages against the remote clock, never the local one', () => {
             list: [
                 row(ours(0), false, { activity: NOW - 99 * DAY, windowRow: false }),
                 row(ours(1), false, { activity: NOW - 99 * DAY }),
+            ],
+        });
+        const { reaper } = makeReaper({ exec, orphanMaxAgeDays: 14 });
+
+        expect(await reaper.reap()).toEqual({ killed: 1, orphansKept: 1, orphansTotal: 2 });
+        expect(killCommands(exec)).toEqual([buildKillSession(ours(1))]);
+    });
+
+    // Two windows, one reported: the other may hold the live task. Kept, and counted.
+    it('a session with a window the list did not report is never aged out', async () => {
+        const exec = fakeExec({
+            list: [
+                row(ours(0), false, { activity: NOW - 99 * DAY, windows: 2, windowRows: 1 }),
+                row(ours(1), false, { activity: NOW - 99 * DAY, windows: 2 }),
             ],
         });
         const { reaper } = makeReaper({ exec, orphanMaxAgeDays: 14 });

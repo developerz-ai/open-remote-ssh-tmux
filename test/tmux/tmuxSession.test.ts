@@ -1152,6 +1152,27 @@ describe('parseListSessions with the activity field (05: orphan aging)', () => {
         expect(shouldReap(parseListSessions(`code-${HASH_PROJ}-0 0 1 1700000000 0 a:1700000500 o: c:`)[0], 1900000000, { orphanMaxAgeDays: 14 })).toBe(false);
     });
 
+    // `#{session_windows}` says how many windows the session has; the output side is only
+    // known when EVERY one of them reported. Two windows and one line means a window nobody
+    // observed — the task may be printing in exactly that one — so the age is unknown.
+    it('leaves activityEpoch undefined for a partially observed session (fewer window lines than windows)', () => {
+        const partial = '__win 1700050000 code-x-0\ncode-x-0 0 2 1700000000 0 a:1700000500 o: c:';
+        expect(parseListSessions(partial)[0]).toMatchObject({ windows: 2, activityEpoch: undefined });
+        // A malformed line is not an observation of its window.
+        const garbled = '__win 1700050000 code-x-0\n__win soon code-x-0\ncode-x-0 0 2 1700000000 0 a:1700000500 o: c:';
+        expect(parseListSessions(garbled)[0].activityEpoch).toBeUndefined();
+        // Complete: as many valid lines as windows.
+        const complete = '__win 1700050000 code-x-0\n__win 1700060000 code-x-0\ncode-x-0 0 2 1700000000 0 a:1700000500 o: c:';
+        expect(parseListSessions(complete)[0].activityEpoch).toBe(1700060000);
+        // More lines than windows is not a count we can explain either (two names that read
+        // alike once whitespace is folded): unknown, kept.
+        const surplus = '__win 1 code-x-0\n__win 2 code-x-0\ncode-x-0 0 1 1700000000 0 a:3 o: c:';
+        expect(parseListSessions(surplus)[0].activityEpoch).toBeUndefined();
+        // And the verdict that follows: never reaped, however old the part we did see.
+        const ours = parseListSessions(`__win 1700050000 code-${HASH_PROJ}-0\ncode-${HASH_PROJ}-0 0 2 1700000000 0 a:1700000500 o: c:`)[0];
+        expect(shouldReap(ours, 1900000000, { orphanMaxAgeDays: 14 })).toBe(false);
+    });
+
     it('window lines are never sessions, and malformed ones are ignored', () => {
         // The first would read as a session row if it were not recognised by its tag.
         const out = '__win 5 a 1 2 3 4\n__win soon code-x-0\n__win\n__win 9\n__win 8 code-x-0\ncode-x-0 0 1 1700000000 0 a:7 o: c:';
