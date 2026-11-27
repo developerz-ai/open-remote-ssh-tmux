@@ -6,7 +6,7 @@ Bug sweep (plan `101-bug-sweep`, #86 #87 #88): eight adversarial reviewers, fixe
 
 - fix: full-screen TUIs such as Claude Code render correctly. A client whose locale is not UTF-8 no longer turns every non-ASCII glyph into `_` (tmux `-u`). 24-bit colour, synchronized output and (tmux 3.4+) hyperlinks are declared for our own client only on tmux 3.2+, with no server state written; older tmux gets a guarded `xterm*:Tc` override that respects any `Tc` setting of yours. `COLORTERM=truecolor` is set in new panes on 3.2+
 - fix: a session is no longer reaped while a detached task is printing output: age is measured on the remote's clock (a client clock days ahead used to reap live sessions) and on the newest activity of every window, read in one tmux snapshot
-- fix: no second client on a session after closing and reopening the window. VS Code sometimes revives terminals through its pty host without their launch arguments; they were not recognised, so after 10 s a second client was attached to each session and a session you had exited in between came back. Such terminals are now recognised by process id (found by the real-VSCodium acceptance run; present in 1.4.2)
+- fix: no second client on a session after closing and reopening the window. VS Code sometimes revives terminals through its pty host without their launch arguments; they were not recognised, so after 10 s a second client was attached to each session and a session you had exited in between came back. Such terminals are now recognised by process id when VS Code reports it within 2 s (a later report is not yet picked up; found by the real-VSCodium acceptance run; present in 1.4.2)
 - fix: a revived tab is never handed a session that is already on screen; a session you just closed is never reopened by a reconcile that races its kill; a queued reclaim never takes a session over from another machine that picked it up meanwhile
 - fix: wiring races: a superseded connect no longer turns every New Terminal into a plain shell; a `remote.SSH.tmux.*` change made during the first connect is applied, not dropped; turning persistent terminals off takes effect at once and leaves no default-profile value behind; the "tmux required" error shows once per window per host
 - fix: the PageUp/PageDown scroll binding applies only to our own sessions (your own tmux sessions, and `ssh` inside ours, get the keys untouched) and never replaces a binding of yours
@@ -26,7 +26,7 @@ Bug sweep (plan `101-bug-sweep`, #86 #87 #88): eight adversarial reviewers, fixe
 
 **Clipboard image paste**
 
-- fix: an image over 20 MB reports "too large"; the upload is bounded at 60 s; the Windows readers fail cleanly and quote paths with smart apostrophes; a remote home with control characters is refused
+- fix: an image over 20 MB reports "too large"; the extension stops waiting for the upload after 60 s (the transfer itself is not cancelled); the Windows readers fail cleanly and quote paths with smart apostrophes; a remote home with control characters is refused
 
 **Tooling and maintenance**
 
