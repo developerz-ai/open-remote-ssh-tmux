@@ -296,6 +296,14 @@ export const SLOT_MAPPING_STATE_KEY = 'tmux.slotSessions.v1';
  * so an upgraded client sheds the stale data instead of carrying it forever. */
 const LEGACY_TOMBSTONE_STATE_KEY = 'tmux.tombstonedSlots.v1';
 
+/** A session waiting for a terminal ({@link TmuxTerminalProvider#pendingRestores}). */
+interface PendingRestore {
+    readonly slot: number;
+    readonly takeOver: boolean;
+    readonly revivable: boolean;
+    readonly heldBy?: string;
+}
+
 /** One of this workspace's sessions as seen on the remote right now. */
 interface RemoteSession {
     readonly slot: number;
@@ -303,6 +311,8 @@ interface RemoteSession {
     readonly attached: boolean;
     readonly windows: number;
     readonly owner: SlotOwner;
+    /** The raw `@orst_owner` tag, to tell one foreign client from another. */
+    readonly ownerTag?: string;
     /** When the window that owns the session went away (its close marker), if the marker
      * names the session's CURRENT owner — one left by an earlier owner says nothing about the
      * client on it now. Remote epoch seconds. */
@@ -368,8 +378,11 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
      * `revivable` records whether the entry came from THIS client's own mapping. Only those
      * can have a persisted VS Code terminal behind them, so only those are worth waiting on
      * ({@link awaitRevive}) — a session adopted from another machine has none, and waiting
-     * would just delay a hand-off for the whole deadline. */
-    private readonly pendingRestores: Array<{ slot: number; takeOver: boolean; revivable: boolean }> = [];
+     * would just delay a hand-off for the whole deadline.
+     *
+     * `heldBy` is the owner tag of the client a take-over (`-D`) entry was planned against, so
+     * the drain can tell that client from one that attached since ({@link stillWanted}). */
+    private readonly pendingRestores: PendingRestore[] = [];
     /** Tail of the serialised persist chain — see {@link persist}. */
     private persistChain: Promise<void> = Promise.resolve();
     /** Backing store for {@link initialized} — resolves when the queue above is final. */
@@ -432,6 +445,9 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         this.disposed = true;
         this.pendingRestores.length = 0;
         this.reservedSlots.clear();
+        this.awaitingPid.clear();
+        clearTimeout(this.pidRetry);
+        this.pidRetry = undefined;
     }
 
     /** Resolves once the restore *decision* is made — the queue in {@link pendingRestores}
@@ -537,7 +553,7 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
                 return;
             }
             this.adoptRevivedTerminals();
-            await this.adoptTerminalsByPid(this.listTerminals());
+            await this.scanByPid(true);
             if (this.disposed) {
                 return;
             }
@@ -591,7 +607,7 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         // this its slot reads as held by our own stale client and is queued with `-D`, which
         // would evict it the moment a profile request is served that entry. No round-trip
         // unless such a terminal is in the window and the list above got an answer.
-        await this.adoptTerminalsByPid(this.listTerminals());
+        await this.scanByPid(true);
         // Could not list → act as if nothing is there: nothing is adopted, and every mapped
         // slot is still settled by the has-session probe below, which never prunes on doubt.
         const remote = listed === undefined ? [] : this.absorbRemote(listed);
@@ -658,7 +674,12 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
                     if (verdict === 'present') {
                         // From our own mapping, so this client's VS Code may well have a
                         // persisted terminal for it — worth waiting on ({@link awaitRevive}).
-                        this.pendingRestores.push({ slot, takeOver: action === 'restore-takeover', revivable: true });
+                        this.pendingRestores.push({
+                            slot,
+                            takeOver: action === 'restore-takeover',
+                            revivable: true,
+                            heldBy: remoteBySlot.get(slot)?.ownerTag,
+                        });
                         if (action === 'restore-takeover') {
                             counts.reclaimed++;
                         } else {
@@ -695,7 +716,7 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
                     // 1.7 s after the take-over in EDH row 23. Opened directly first, the
                     // relaunch found the queue empty and minted a second session. Waiting
                     // costs only the backstop when no relaunch comes (a different server).
-                    this.pendingRestores.push({ slot, takeOver: true, revivable: true });
+                    this.pendingRestores.push({ slot, takeOver: true, revivable: true, heldBy: remoteBySlot.get(slot)!.ownerTag });
                     counts.handedOff++;
                     break;
                 case 'offer':
@@ -937,8 +958,11 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
      * old by now. A queued session that has since ended (the user typed `exit` into a tab VS
      * Code revived unseen) must not be re-created empty by `-A`, and one that was detached at
      * plan time but has a client now was attached by someone else in the meantime — most
-     * likely VS Code itself — so another client would only mirror it. A reclaim (`-D`) entry
-     * is left alone: its session was held at plan time already, so a client proves nothing.
+     * likely VS Code itself — so another client would only mirror it. A take-over (`-D`) entry
+     * was planned against the client holding it then, so it goes ahead only while that same
+     * client (owner tag) still holds it, or nobody does: `-D` against a client that attached
+     * since — another machine taking the session, say — is exactly the eviction `slotState.ts`
+     * forbids, and the next reconcile decides that session afresh (an offer, for a live one).
      * The queue stays served while these round-trips are out, so a late revive still claims.
      */
     private async drainPendingRestores(waited: boolean): Promise<void> {
@@ -947,7 +971,7 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         }
         let current: Map<number, RemoteSession> | undefined;
         if (waited && this.outstandingRestores() > 0) {
-            await this.adoptTerminalsByPid(this.listTerminals());
+            await this.scanByPid(true);
             const remote = this.outstandingRestores() > 0 ? await this.refreshRemote() : undefined;
             current = remote && new Map(remote.map(session => [session.slot, session]));
             if (this.disposed) {
@@ -971,7 +995,7 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
 
     /** Whether a queued entry should still be opened, given the re-read remote (`undefined`:
      * not re-read, or unreadable — the plan stands). See {@link drainPendingRestores}. */
-    private stillWanted(entry: { slot: number; takeOver: boolean }, current: Map<number, RemoteSession> | undefined): boolean {
+    private stillWanted(entry: PendingRestore, current: Map<number, RemoteSession> | undefined): boolean {
         if (current === undefined) {
             return true;
         }
@@ -983,6 +1007,10 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         }
         if (!entry.takeOver && session.attached) {
             this.log.trace(`tmux terminals: slot ${entry.slot} gained a client while queued — not attaching another`);
+            return false;
+        }
+        if (entry.takeOver && session.attached && session.ownerTag !== entry.heldBy) {
+            this.log.trace(`tmux terminals: slot ${entry.slot} changed hands while queued — not taking it over`);
             return false;
         }
         return true;
@@ -998,19 +1026,62 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
      * this workspace's own sessions count — a match on any other session (a user's own tmux,
      * another workspace) is a miss, so a pid can never adopt something that is not ours.
      *
-     * Bounded and never throws: each pid wait is capped ({@link PROCESS_ID_WAIT_MS}), the
-     * round-trip is deadline-bounded, nothing is asked while the remote is unreachable, and a
-     * terminal missed {@link PID_MISS_LIMIT} times is not asked about again.
+     * One scan at a time, shared: callers arriving while one is out join it (and get one more
+     * pass after it), so a burst of N plain shells costs one round-trip, not N. `retryMissed`
+     * also re-asks about terminals a scan has already missed (below {@link PID_MISS_LIMIT}); the
+     * reconcile's own calls pass it, a pid arriving does not. Never rejects.
      */
-    private async adoptTerminalsByPid(terminals: readonly vscode.Terminal[]): Promise<void> {
-        const candidates = terminals.filter(terminal => this.isUnaccounted(terminal));
+    private scanByPid(retryMissed: boolean): Promise<void> {
+        if (this.disposed) {
+            return Promise.resolve();
+        }
+        this.pidRescanMissed ||= retryMissed;
+        if (this.pidScan !== undefined) {
+            this.pidRescan = true;
+            return this.pidScan;
+        }
+        const scan = (async (): Promise<void> => {
+            do {
+                const missed = this.pidRescanMissed;
+                this.pidRescan = false;
+                this.pidRescanMissed = false;
+                await this.matchReadyPids(missed);
+            } while (this.pidRescan && !this.disposed);
+        })()
+            .catch(err => this.log.trace(`tmux terminal: recognising terminals by process failed: ${errorText(err)}`))
+            .finally(() => {
+                this.pidScan = undefined;
+            });
+        this.pidScan = scan;
+        return scan;
+    }
+
+    /**
+     * One scan: ask the remote about the unaccounted terminals whose pid is already known. A
+     * pid still on its way is never waited for (a terminal whose process has not started must
+     * not hold up the reconcile, or the terminals that are ready); its arrival starts a scan of
+     * its own ({@link watchPid}). Checks {@link disposed} after every await: a lookup that lands
+     * once the layer is off must not dispose a tab, touch the mapping, or persist.
+     */
+    private async matchReadyPids(retryMissed: boolean): Promise<void> {
+        const candidates = [...new Set([...this.listTerminals(), ...this.awaitingPid])].filter(t => this.isUnaccounted(t));
+        for (const terminal of this.awaitingPid) {
+            if (!candidates.includes(terminal)) {
+                this.awaitingPid.delete(terminal);
+            }
+        }
         if (candidates.length === 0 || this.unreachableAt !== undefined) {
             return;
         }
-        const pids = await Promise.all(candidates.map(processIdOf));
-        const known = candidates.flatMap((terminal, index) => {
-            const pid = pids[index];
-            return pid === undefined ? [] : [{ terminal, pid }];
+        candidates.forEach(terminal => this.watchPid(terminal));
+        await delay(0); // lets a pid VS Code already knows settle — never one that is not ready
+        if (this.disposed) {
+            return;
+        }
+        const known = candidates.flatMap(terminal => {
+            const pid = this.pidOf.get(terminal);
+            const asked = (this.pidMisses.get(terminal) ?? 0) > 0;
+            return typeof pid === 'number' && this.isUnaccounted(terminal) && (retryMissed || !asked) ? [{ terminal, pid }] : [];
         });
         if (known.length === 0) {
             return;
@@ -1018,6 +1089,9 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
         let sessionByPid: Map<number, string>;
         try {
             const { stdout, code } = await this.exec(buildListClientPidsCommand(this.tmuxPath));
+            if (this.disposed) {
+                return;
+            }
             if (code !== 0) {
                 this.log.trace(`tmux list-clients (pids) unusable (rc ${code ?? 'unknown'})`);
                 return;
@@ -1027,6 +1101,8 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
             this.log.trace(`tmux list-clients (pids) failed: ${errorText(err)}`);
             return;
         }
+        let matched = false;
+        let retry = false;
         for (const { terminal, pid } of known) {
             if (!this.isUnaccounted(terminal)) {
                 continue; // accounted for while the round-trip was out
@@ -1034,38 +1110,63 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
             const session = sessionByPid.get(pid);
             const slot = session === undefined ? undefined : this.slotOfSession(session);
             if (slot === undefined) {
-                this.pidMisses.set(terminal, (this.pidMisses.get(terminal) ?? 0) + 1);
+                const misses = (this.pidMisses.get(terminal) ?? 0) + 1;
+                this.pidMisses.set(terminal, misses);
+                retry ||= misses < PID_MISS_LIMIT;
                 continue;
             }
             if (this.takeTerminal(terminal, slot)) {
                 this.mapping.set(slot, sessionName(this.ctx.hostKey, this.ctx.workspaceKey, slot));
                 this.log.trace(`tmux terminal: slot ${slot} revived by VS Code without its arguments — recognised by its process`);
+                matched = true;
             }
         }
+        if (retry) {
+            this.scheduleMissedRetry();
+        }
+        if (matched) {
+            await this.persist().catch(err => this.log.trace(`tmux terminal: mapping not saved: ${errorText(err)}`));
+        }
+    }
+
+    /** Start resolving `terminal`'s pid, once ({@link processIdOf}: bounded, never rejects). Its
+     * arrival starts a scan while the terminal is still unaccounted. */
+    private watchPid(terminal: vscode.Terminal): void {
+        if (this.pidOf.has(terminal) || this.pidPending.has(terminal)) {
+            return;
+        }
+        this.pidPending.add(terminal);
+        void processIdOf(terminal).then(pid => {
+            this.pidPending.delete(terminal);
+            this.pidOf.set(terminal, pid ?? null);
+            if (pid !== undefined && this.isUnaccounted(terminal)) {
+                void this.scanByPid(false);
+            }
+        });
+    }
+
+    /** One shared re-ask, a beat later, for terminals a scan missed: a revived tmux client can
+     * report its pid a moment before it has attached. */
+    private scheduleMissedRetry(): void {
+        if (this.pidRetry !== undefined || this.disposed) {
+            return;
+        }
+        this.pidRetry = setTimeout(() => {
+            this.pidRetry = undefined;
+            void this.scanByPid(true);
+        }, REVIVE_POLL_MS);
     }
 
     /** A terminal this provider has not placed, that names no session, and that is still worth
      * asking the remote about. */
     private isUnaccounted(terminal: vscode.Terminal): boolean {
-        return !this.terminalSlots.has(terminal)
+        return !this.disposed
+            && !this.terminalSlots.has(terminal)
             && !this.discardedDuplicates.has(terminal)
             && terminal.exitStatus === undefined
+            && this.pidOf.get(terminal) !== null
             && this.slotFromCreationOptions(terminal.creationOptions) === undefined
             && (this.pidMisses.get(terminal) ?? 0) < PID_MISS_LIMIT;
-    }
-
-    /** {@link adoptTerminalsByPid} for one terminal that opened outside a revive wait: asked
-     * again once a beat later, since its client may not have attached when the pid arrived. */
-    private async recogniseByPid(terminal: vscode.Terminal): Promise<void> {
-        for (let attempt = 0; attempt < PID_MISS_LIMIT && !this.disposed && this.isUnaccounted(terminal); attempt++) {
-            if (attempt > 0) {
-                await delay(REVIVE_POLL_MS);
-            }
-            await this.adoptTerminalsByPid([terminal]);
-        }
-        if (this.terminalSlots.has(terminal)) {
-            await this.persist();
-        }
     }
 
     /**
@@ -1306,6 +1407,21 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
 
     /** Terminals whose pid `list-clients` did not report, and how often ({@link PID_MISS_LIMIT}). */
     private readonly pidMisses = new WeakMap<vscode.Terminal, number>();
+    /** Resolved terminal pids; `null` when VS Code reported none in time ({@link processIdOf}). */
+    private readonly pidOf = new WeakMap<vscode.Terminal, number | null>();
+    /** Terminals whose pid is still being resolved ({@link watchPid}). */
+    private readonly pidPending = new WeakSet<vscode.Terminal>();
+    /** Unlabelled terminals seen opening that are not recognised yet — scanned alongside the
+     * window's own list, which a test (or an early event) may not include yet. */
+    private readonly awaitingPid = new Set<vscode.Terminal>();
+    /** The shared pid scan in flight, if any ({@link scanByPid}). */
+    private pidScan: Promise<void> | undefined;
+    /** Another pass was asked for while {@link pidScan} was out. */
+    private pidRescan = false;
+    /** …and whether it must re-ask about terminals already missed. */
+    private pidRescanMissed = false;
+    /** The pending shared retry ({@link scheduleMissedRetry}). */
+    private pidRetry: ReturnType<typeof setTimeout> | undefined;
 
     /**
      * Wire from `vscode.window.onDidOpenTerminal`. Records the slot (parsed back
@@ -1316,9 +1432,12 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
     handleTerminalOpened(terminal: vscode.Terminal): void {
         const slot = this.slotFromCreationOptions(terminal.creationOptions);
         if (slot === undefined) {
-            // Possibly one of ours revived without its arguments ({@link adoptTerminalsByPid}).
-            this.recogniseByPid(terminal)
-                .catch(err => this.log.trace(`tmux terminal: recognising a terminal by its process failed: ${errorText(err)}`));
+            // Possibly one of ours revived without its arguments ({@link scanByPid}): recognised
+            // once its pid is known.
+            if (this.isUnaccounted(terminal)) {
+                this.awaitingPid.add(terminal);
+                this.watchPid(terminal);
+            }
             return;
         }
         this.takeTerminal(terminal, slot);
@@ -1378,6 +1497,7 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
             this.discardedDuplicates.delete(terminal);
             return;
         }
+        this.awaitingPid.delete(terminal);
         const slot = this.terminalSlots.get(terminal);
         if (slot === undefined) {
             return;
@@ -1590,6 +1710,7 @@ export class TmuxTerminalProvider implements vscode.TerminalProfileProvider {
                 attached: session.attached,
                 windows: session.windows,
                 owner: this.ownerOf(session.owner),
+                ownerTag: session.owner,
                 closedAt: closed !== undefined && closed.client === session.owner ? closed.at : undefined,
                 closedByMe: closed?.client === this.clientId,
             });

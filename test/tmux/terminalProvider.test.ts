@@ -2788,7 +2788,8 @@ describe('a terminal VS Code revived without its launch arguments (EDH row 11)',
                 command.includes('#{client_pid}') ? answer() : fakeExec()(command)) as unknown as ReturnType<typeof fakeExec>;
             const { provider } = makeProvider({ exec });
             provider.handleTerminalOpened(unlabelled(PID));
-            await vi.waitFor(() => expect(exec.mock.calls.filter(c => c[0].includes('#{client_pid}')).length).toBe(2));
+            await vi.waitFor(() => expect(exec.mock.calls.filter(c => c[0].includes('#{client_pid}')).length).toBe(1));
+            await new Promise(res => setTimeout(res, 50));
             expect(provider.mappedSlots()).toEqual([]);
         }
 
@@ -2814,6 +2815,96 @@ describe('a terminal VS Code revived without its launch arguments (EDH row 11)',
 
         expect(opened).toEqual([]);
         expect(provider.mappedSlots()).toEqual([0]);
+    });
+
+    it('never lets one terminal\'s pending pid hold up the plan or the terminals that are ready', async () => {
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const exec = liveExec({ list: [owned(name(0), true, ME)], pids: `${PID} ${name(0)}\n` });
+        const stuck = { creationOptions: {}, processId: new Promise<number>(() => undefined) } as unknown as import('vscode').Terminal;
+        const ready = unlabelled(PID);
+        const { provider } = makeProvider({ state, exec, listTerminals: () => [stuck, ready], reviveGraceMs: 10, reviveDeadlineMs: 30 });
+
+        const started = Date.now();
+        const init = provider.initialize();
+        await provider.initialized;
+        const planned = Date.now() - started;
+        const next = optionsOf(await provider.provideTerminalProfile());
+        await init;
+
+        expect(planned).toBeLessThan(1000); // the stuck pid would cost its full 2 s wait
+        expect(targetSession(next)).toBe(name(1)); // the ready one was still recognised
+    });
+
+    it('leaves no trace of a pid lookup that lands after the provider was disposed', async () => {
+        let release!: () => void;
+        const gate = new Promise<void>(res => { release = res; });
+        const base = liveExec({ list: [owned(name(0), true, ME)], pids: `${PID} ${name(0)}\n${PID + 1} ${name(1)}\n` });
+        const exec = vi.fn(async (command: string): Promise<ExecResult> => {
+            if (command.includes('#{client_pid}')) {
+                await gate;
+            }
+            return base(command);
+        }) as unknown as ReturnType<typeof fakeExec>;
+        const state = fakeState();
+        const { provider } = makeProvider({ state, exec });
+        provider.handleTerminalOpened({
+            creationOptions: { shellArgs: ['new-session', '-A', '-s', name(0)] },
+            dispose: vi.fn(),
+        } as unknown as import('vscode').Terminal);
+        const duplicate = unlabelled(PID);
+        const fresh = unlabelled(PID + 1);
+        provider.handleTerminalOpened(duplicate);
+        provider.handleTerminalOpened(fresh);
+        await vi.waitFor(() => expect(exec.mock.calls.some(c => c[0].includes('#{client_pid}'))).toBe(true));
+
+        provider.dispose(); // persistent terminals switched off meanwhile
+        const update = vi.spyOn(state, 'update');
+        release();
+        await new Promise(res => setTimeout(res, 50));
+
+        expect(duplicate.dispose).not.toHaveBeenCalled();
+        expect(provider.mappedSlots()).toEqual([]);
+        expect(update).not.toHaveBeenCalled();
+    });
+
+    it('asks the remote once (and retries once) for a burst of ordinary shells, not once per tab', async () => {
+        const exec = liveExec({ list: [], pids: '' });
+        const { provider } = makeProvider({ exec });
+
+        for (let pid = 100; pid < 105; pid++) {
+            provider.handleTerminalOpened(unlabelled(pid));
+        }
+        await new Promise(res => setTimeout(res, 700));
+
+        expect(exec.mock.calls.filter(c => c[0].includes('#{client_pid}')).length).toBe(2);
+        expect(provider.mappedSlots()).toEqual([]);
+    });
+
+    it('drops a queued reclaim once another machine\'s live client holds the session', async () => {
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const remote = { list: [owned(name(0), true, ME)], pids: '' };
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ state, exec: liveExec(remote), opened, reviveGraceMs: 10, reviveDeadlineMs: 30 });
+
+        const init = provider.initialize();
+        await provider.initialized; // queued as a reclaim (-D) of our own stale client
+        remote.list = [owned(name(0), true, OTHER)]; // the laptop attached it meanwhile
+        await init;
+
+        expect(opened).toEqual([]); // no -D against a live client of another machine
+    });
+
+    it('still reclaims when the re-read shows our own client on it', async () => {
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({
+            state, exec: liveExec({ list: [owned(name(0), true, ME)], pids: '' }), opened, reviveGraceMs: 10, reviveDeadlineMs: 30,
+        });
+
+        await provider.initialize();
+
+        expect(opened.map(targetSession)).toEqual([name(0)]);
+        expect(opened[0].shellArgs).toContain('-D');
     });
 
     it('still opens what the re-read confirms is wanted', async () => {
