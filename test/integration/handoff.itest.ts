@@ -1,5 +1,13 @@
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it } from 'vitest';
-import { buildCloseWatchCommand, buildListClientsCommand, buildListSessions, parseListClients, parseListSessions } from '../../src/tmux/tmuxSession';
+import {
+    buildCloseWatchCommand,
+    buildListClientPidsCommand,
+    buildListClientsCommand,
+    buildListSessions,
+    parseListClientPids,
+    parseListClients,
+    parseListSessions,
+} from '../../src/tmux/tmuxSession';
 import { describeRig, PtyClient, RIG_TMUX, RigSession, sleep, WORKERS } from './rig';
 import { MachineState, RigWindow } from './window';
 
@@ -222,5 +230,20 @@ describeRig('hand-off between machines (real tmux)', target => {
         const activity = clients.find(c => c.session === terminalA.session)?.activity;
         expect(activity).toBeGreaterThan(1_700_000_000);
         expect(now! - activity!).toBeLessThan(60);
+    });
+
+    // A terminal VS Code revived through its pty host carries no launch arguments; the provider
+    // recognises it by its process, which is the tmux client (EDH row 11). The pid has to be the
+    // one the terminal's process really has, on every tmux version the rig runs.
+    it('reports each client\'s pid as the pid of the process that runs it', async () => {
+        const windowA = new RigWindow(rigA, new MachineState(), CTX);
+        await windowA.connect();
+        const terminalA = await windowA.newTerminal();
+        await rigB.waitUntil('A attached', () => rigB.heldClientAttached(terminalA.holderPid, terminalA.session));
+
+        const { stdout, code } = await rigB.exec(buildListClientPidsCommand(RIG_TMUX));
+        expect(code).toBe(0);
+        const process = Number((await rigB.run(`pgrep -P ${terminalA.holderPid}`)).stdout.trim());
+        expect(parseListClientPids(stdout).filter(c => c.session === terminalA.session).map(c => c.pid)).toEqual([process]);
     });
 });

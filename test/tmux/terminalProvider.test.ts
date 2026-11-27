@@ -2336,8 +2336,10 @@ describe('overlapping reconciles (05 d: a reconnect inside the revive window)', 
         const passes = [provider.initialize(), provider.initialize({ awaitRevive: false }), provider.initialize({ awaitRevive: false }), provider.initialize({ awaitRevive: false })];
         await Promise.all(passes);
 
+        // The first pass's plan and its pre-drain re-read (it waited on a revive), then ONE
+        // follow-up plan; the reconnects' passes do not wait, so they do not re-read.
         const lists = exec.mock.calls.filter(call => call[0].includes('list-sessions')).length;
-        expect(lists).toBe(2);
+        expect(lists).toBe(3);
     });
 
     it('a pass that fails does not wedge the next one', async () => {
@@ -2644,5 +2646,184 @@ describe('legacy identity adoption (05 c: alias-keyed sessions move to the canon
 
         expect(opened).toEqual([]);
         expect(provider.mappedSlots()).toEqual([]);
+    });
+});
+
+describe('a terminal VS Code revived without its launch arguments (EDH row 11)', () => {
+    // After a window CLOSE (not a reload) VS Code may revive its persisted terminals through
+    // its own pty host (`attachPersistentProcess`): the stored tmux argv is re-spawned, but the
+    // terminal the extension sees carries no `shellArgs`, so the session name it is attached to
+    // cannot be read off it. Unrecognised, the revive wait saw no progress, the backstop fired,
+    // and the drain put a second client on the session — and re-created one the user had
+    // exited in the meantime. Such a terminal is recognised by its process instead: the tmux
+    // client's pid, as `list-clients` reports it, is the terminal's own process id.
+
+    const PID = 11126;
+    const flush = (): Promise<void> => new Promise<void>(res => setTimeout(res, 0));
+
+    /** A window terminal with no launch arguments whose process is `pid`. */
+    const unlabelled = (pid: number) => ({
+        creationOptions: {},
+        processId: Promise.resolve(pid),
+        exitStatus: undefined,
+        dispose: vi.fn(),
+    } as unknown as import('vscode').Terminal);
+
+    /** The terminal as VS Code reports it once the user closed it. */
+    const userClosed = (terminal: import('vscode').Terminal) =>
+        Object.assign(terminal, { exitStatus: { code: undefined, reason: 3 } });
+
+    /** `fakeExec` whose list can change mid-test and which answers the client-pid query. */
+    function liveExec(state: { list: string[]; pids: string }) {
+        return vi.fn(async (command: string): Promise<ExecResult> => {
+            if (command.includes('#{client_pid}')) {
+                return { stdout: state.pids, stderr: '', code: 0 };
+            }
+            return fakeExec({ list: state.list, existing: state.list.map(line => line.split(' ')[0]) })(command);
+        }) as unknown as ReturnType<typeof fakeExec>;
+    }
+
+    it('counts a pid-matched terminal as revived, opens nothing, and kills on a user close', async () => {
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const remote = { list: [owned(name(0), false, ME)], pids: `${PID} ${name(0)}\n` };
+        const exec = liveExec(remote);
+        const terminals: import('vscode').Terminal[] = [];
+        const opened: LaunchOptions[] = [];
+        const { provider, log } = makeProvider({
+            state, exec, opened, listTerminals: () => terminals,
+            reviveGraceMs: 10, reviveDeadlineMs: 400, reviveQuietMs: 20,
+        });
+
+        const init = provider.initialize();
+        await provider.initialized;
+        const revivedTerminal = unlabelled(PID);
+        terminals.push(revivedTerminal); // VS Code's pty-host revive, after the plan
+        remote.list = [owned(name(0), true, ME)];
+        await init;
+
+        expect(opened).toEqual([]);
+        expect(log.trace.mock.calls.map(c => String(c[0])).some(m => m.includes('no revive after'))).toBe(false);
+
+        provider.handleTerminalClosed(userClosed(revivedTerminal));
+        await flush();
+        expect(exec.mock.calls.map(c => c[0]).filter(c => c.includes('kill-session'))).toEqual([buildKillSession(name(0))]);
+    });
+
+    it('recognises a revived terminal already attached at plan time, so its slot is never queued with -D', async () => {
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const exec = liveExec({ list: [owned(name(0), true, ME)], pids: `${PID} ${name(0)}\n` });
+        const opened: LaunchOptions[] = [];
+        const revivedTerminal = unlabelled(PID);
+        const { provider } = makeProvider({
+            state, exec, opened, listTerminals: () => [revivedTerminal], reviveGraceMs: 10, reviveDeadlineMs: 30,
+        });
+
+        const init = provider.initialize();
+        await provider.initialized;
+        const next = optionsOf(await provider.provideTerminalProfile()); // a request right after the plan
+        await init;
+
+        expect(targetSession(next)).toBe(name(1));
+        expect(next.shellArgs).not.toContain('-D');
+        expect(opened).toEqual([]);
+        expect(provider.mappedSlots()).toEqual([0, 1]);
+    });
+
+    it('discards a pid-matched terminal that arrives after its slot is already on screen', async () => {
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const remote = { list: [owned(name(0), false, ME)], pids: '' };
+        const exec = liveExec(remote);
+        const { provider } = makeProvider({ state, exec });
+        await provider.initialize(); // the drain opened slot 0 itself
+        provider.handleTerminalOpened({
+            creationOptions: { shellArgs: ['new-session', '-A', '-s', name(0)] },
+            dispose: vi.fn(),
+        } as unknown as import('vscode').Terminal);
+
+        remote.pids = `${PID} ${name(0)}\n7 ${name(0)}\n`;
+        const late = unlabelled(PID);
+        provider.handleTerminalOpened(late);
+        await vi.waitFor(() => expect(late.dispose).toHaveBeenCalled());
+        provider.handleTerminalClosed(userClosed(late));
+        await flush();
+
+        expect(exec.mock.calls.map(c => c[0]).filter(c => c.includes('kill-session'))).toEqual([]);
+    });
+
+    it('never adopts a user session by pid', async () => {
+        const remote = { list: [], pids: `${PID} dev\n` };
+        const exec = liveExec(remote);
+        const { provider } = makeProvider({ exec });
+        const terminal = unlabelled(PID);
+
+        provider.handleTerminalOpened(terminal);
+        await vi.waitFor(() => expect(exec.mock.calls.filter(c => c[0].includes('#{client_pid}')).length).toBe(2));
+        await flush();
+        provider.handleTerminalClosed(userClosed(terminal));
+        await flush();
+
+        expect(terminal.dispose).not.toHaveBeenCalled();
+        expect(exec.mock.calls.map(c => c[0]).filter(c => c.includes('kill-session'))).toEqual([]);
+        expect(provider.mappedSlots()).toEqual([]);
+    });
+
+    it('records and saves a pid-matched terminal that opens outside a revive wait', async () => {
+        const state = fakeState();
+        const exec = liveExec({ list: [owned(name(0), true, ME)], pids: `${PID} ${name(0)}\n` });
+        const { provider } = makeProvider({ state, exec });
+
+        provider.handleTerminalOpened(unlabelled(PID));
+
+        await vi.waitFor(() => expect(state.get(SLOT_MAPPING_STATE_KEY)).toEqual({ '0': name(0) }));
+        expect(targetSession(optionsOf(await provider.provideTerminalProfile()))).toBe(name(1));
+    });
+
+    it('adopts nothing when the client list cannot be read, and asks nothing without a pid', async () => {
+        const answers = [
+            async (): Promise<ExecResult> => { throw new Error('channel closed'); },
+            async (): Promise<ExecResult> => ({ stdout: '', stderr: 'boom', code: 1 }),
+        ];
+        for (const answer of answers) {
+            const exec = vi.fn(async (command: string): Promise<ExecResult> =>
+                command.includes('#{client_pid}') ? answer() : fakeExec()(command)) as unknown as ReturnType<typeof fakeExec>;
+            const { provider } = makeProvider({ exec });
+            provider.handleTerminalOpened(unlabelled(PID));
+            await vi.waitFor(() => expect(exec.mock.calls.filter(c => c[0].includes('#{client_pid}')).length).toBe(2));
+            expect(provider.mappedSlots()).toEqual([]);
+        }
+
+        const exec = liveExec({ list: [], pids: `${PID} ${name(0)}\n` });
+        const { provider } = makeProvider({ exec });
+        provider.handleTerminalOpened({ creationOptions: {}, processId: Promise.reject(new Error('gone')) } as unknown as import('vscode').Terminal);
+        await new Promise(res => setTimeout(res, 300));
+        expect(exec).not.toHaveBeenCalled();
+        expect(provider.mappedSlots()).toEqual([]);
+    });
+
+    it('re-reads the remote before opening: drops a session that ended and one that gained a client', async () => {
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0), '1': name(1) } });
+        const remote = { list: [owned(name(0), false, ME), owned(name(1), false, ME)], pids: '' };
+        const exec = liveExec(remote);
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ state, exec, opened, reviveGraceMs: 10, reviveDeadlineMs: 30 });
+
+        const init = provider.initialize();
+        await provider.initialized;
+        remote.list = [owned(name(0), true, ME)]; // 0 revived unseen; 1's shell exited
+        await init;
+
+        expect(opened).toEqual([]);
+        expect(provider.mappedSlots()).toEqual([0]);
+    });
+
+    it('still opens what the re-read confirms is wanted', async () => {
+        const state = fakeState({ [SLOT_MAPPING_STATE_KEY]: { '0': name(0) } });
+        const remote = { list: [owned(name(0), false, ME)], pids: '' };
+        const opened: LaunchOptions[] = [];
+        const { provider } = makeProvider({ state, exec: liveExec(remote), opened, reviveGraceMs: 10, reviveDeadlineMs: 30 });
+
+        await provider.initialize();
+
+        expect(opened.map(targetSession)).toEqual([name(0)]);
     });
 });

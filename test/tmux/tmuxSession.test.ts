@@ -11,6 +11,7 @@ import {
     buildHasSession,
     buildHasSessionsCommand,
     buildKillSession,
+    buildListClientPidsCommand,
     buildListClientsCommand,
     buildListSessions,
     buildRenameSession,
@@ -22,6 +23,7 @@ import {
     isDuplicateSession,
     isOurSession,
     parseHasSessions,
+    parseListClientPids,
     parseListClients,
     parseListSessions,
     parseListSessionsClock,
@@ -1016,6 +1018,27 @@ describe('buildListClientsCommand / parseListClients (staleness evidence)', () =
 
     it('skips noise and reports a missing clock as undefined', () => {
         expect(parseListClients('banner\nno server running on /tmp/x\n')).toEqual({ now: undefined, clients: [] });
+    });
+});
+
+describe('buildListClientPidsCommand / parseListClientPids (a terminal recognised by its process)', () => {
+    it('lists every client\'s process id and session', () => {
+        expect(buildListClientPidsCommand()).toBe(`'tmux' list-clients -F '#{client_pid} #{client_session}'`);
+    });
+
+    it('runs the given tmux binary, quoted', () => {
+        expect(buildListClientPidsCommand('/home/a b/tmux')).toBe(`'/home/a b/tmux' list-clients -F '#{client_pid} #{client_session}'`);
+    });
+
+    it('parses pid and session (session names read from the right of the pid)', () => {
+        expect(parseListClientPids('11126 code-x-0\n11655 my session\n')).toEqual([
+            { pid: 11126, session: 'code-x-0' },
+            { pid: 11655, session: 'my session' },
+        ]);
+    });
+
+    it('skips noise, a missing session and a non-positive pid', () => {
+        expect(parseListClientPids('no server running on /tmp/x\n42\n0 code-x-0\n-3 code-x-1\n\n')).toEqual([]);
     });
 });
 

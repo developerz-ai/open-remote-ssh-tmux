@@ -735,6 +735,36 @@ export function parseListClients(stdout: string): { now: number | undefined; cli
 }
 
 /**
+ * Every client on the server as `<pid> <session>` — the process id of the `tmux` client
+ * itself, which for one of our terminals is the terminal's own process (tmux is its
+ * `shellPath`). How a terminal VS Code revived without its launch arguments is told apart
+ * (`TmuxTerminalProvider`). Parse with {@link parseListClientPids}.
+ */
+export function buildListClientPidsCommand(tmuxPath = TMUX_BIN): string {
+    return `${escapeShellArg(tmuxPath)} list-clients -F ${escapeShellArg('#{client_pid} #{client_session}')}`;
+}
+
+/** One client as {@link buildListClientPidsCommand} reports it. */
+export interface TmuxClientPid {
+    readonly pid: number;
+    readonly session: string;
+}
+
+/** Read {@link buildListClientPidsCommand} output. The pid is the left-most token, so a session
+ * name with spaces survives; a line without a positive pid and a name is skipped. */
+export function parseListClientPids(stdout: string): TmuxClientPid[] {
+    const clients: TmuxClientPid[] = [];
+    for (const rawLine of stdout.split('\n')) {
+        const match = /^(\d+) (.+)$/.exec(rawLine.trim());
+        const pid = match ? toNonNegativeInt(match[1]) : undefined;
+        if (match && pid !== undefined && pid > 0) {
+            clients.push({ pid, session: match[2] });
+        }
+    }
+    return clients;
+}
+
+/**
  * The close watch: one remote command per SSH connection of a window, started when the tmux
  * layer wires and left running. It reads its stdin — the ssh channel — until EOF, which only
  * comes when the connection that started it is gone, and then marks every session this
