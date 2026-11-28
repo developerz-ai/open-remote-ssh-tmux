@@ -98,8 +98,7 @@ For these, keep ours and port upstream's intent by hand.
    terminal layer without touching `src/tmux/*`.
 6. Regenerate the table above and update the fork point section in the same PR.
 
-**Cadence:** checked weekly by the maintainer bot (`.dz/schedules/health.md`, row
-`upstream-drift`), and immediately when upstream ships a security fix. Prefer
+**Cadence:** checked by a member (the weekly `upstream-drift` bot row was retired 2026-11-28), and immediately when upstream ships a security fix. Prefer
 several small merges to one large one.
 
 ## Never use GitHub's "Sync fork" → "Discard commits"

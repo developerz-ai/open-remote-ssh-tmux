@@ -62,12 +62,12 @@ escalate:
 
 schedules:
   # Weekly, Monday (owner, 2026-11-06 and 2026-11-26: routine maintenance weekly, CVE daily through
-  # Dependabot security groups, at most one release a week judged Monday). No overlap: `health`
-  # reads and files asks (incl. the release judgement), `maintain` fixes in one pull request.
-  - name: health
+  # Dependabot security groups, at most one release a week judged Monday). No overlap: `release-due`
+  # files the release judgement, `maintain` fixes in one pull request.
+  - name: release-due
     days: [mon]
     hours_utc: [7]
-    brief_file: .dz/schedules/health.md
+    brief_file: .dz/schedules/release-due.md
   - name: maintain
     days: [mon]
     hours_utc: [8]
@@ -89,7 +89,12 @@ branches:
 scout:
   survey: broken_only
 
-# devops: off (owner, 2026-11-26): one PR per advisory was noise. Dependabot security updates
-# (.github/dependabot.yml `*-security` groups, one PR per ecosystem) are the advisory lane.
+# devops: advisories (decision of record 2026-11-28): the extension ships to users, so the platform
+# watches published advisories itself. Dependabot still groups the dependency bumps
+# (.github/dependabot.yml).
 devops:
-  watch: off
+  watch: advisories
+
+# care: docs_drift off (47 tasks -> 8 docs-only merges, 33 failed over 30 days, both accounts).
+care:
+  docs_drift: "off"
