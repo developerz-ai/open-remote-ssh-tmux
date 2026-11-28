@@ -269,7 +269,7 @@ of those checks. The harness must record their real statuses separately.
 Fixpack, ESLint and zizmor remain enabled and enforced in the hook. `npm audit`
 audits the whole resolved dependency tree, not the staged `package.json`, so it
 deliberately does not gate per-file commits. It is not silenced — `npm run
-lint:all` still runs it locally (`package.json` script `lint:all`), the daily
+lint:all` still runs it locally (`package.json` script `lint:all`), the weekly
 `audit.yml` workflow runs it together with zizmor and opens a tracking issue
 on findings, and `npm run audit:fix` is the remediation path. Pull-request and
 `main` CI run `lint:package` and `lint` instead, so a newly published advisory

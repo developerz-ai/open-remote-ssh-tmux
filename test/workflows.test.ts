@@ -195,8 +195,11 @@ describe('pull-request and main CI', () => {
     });
 
     // Windows-only code (ProxyCommand splitting, the PowerShell install path, path
-    // handling) otherwise never executes in CI.
-    it.each(ciWorkflows)('runs the unit suite on Windows and macOS in %s', (name) => {
+    // handling) otherwise never executes in CI. Pull requests run Linux only (cost); every
+    // push to main runs the Windows and macOS legs.
+    it('runs the unit suite on Windows and macOS on main only', () => {
+        const name = 'ci-main.yml';
+        expect(jobBlock(readWorkflow('ci-pr.yml'), 'unit-os')).toBeUndefined();
         const job = jobBlock(readWorkflow(name), 'unit-os');
         expect(job, `${name} has no \`unit-os\` job`).toBeDefined();
 
