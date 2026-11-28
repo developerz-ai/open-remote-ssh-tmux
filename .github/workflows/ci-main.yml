@@ -7,6 +7,11 @@ on:
 
 permissions: {}
 
+# Every main push is a release candidate: queue behind a running one, never cancel it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   check:
     runs-on: ubuntu-latest

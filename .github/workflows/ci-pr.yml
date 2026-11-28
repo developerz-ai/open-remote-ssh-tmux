@@ -12,6 +12,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+# Pull requests run Linux only, with the oldest and newest tmux; Windows and macOS unit tests and the
+# full tmux matrix run on every push to main (ci-main.yml).
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -82,45 +84,6 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
 
-  unit-os:
-    # The unit suite on the other client platforms the extension runs on: Windows-only
-    # code (ProxyCommand splitting, the PowerShell install path, path handling) otherwise
-    # never executes in CI. Linux runs it in `check`, under the coverage ratchet.
-    name: unit tests (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, macos-latest]
-    steps:
-      # The Windows runner checks out CRLF by default; the repo and its tests are LF.
-      - name: Keep LF line endings
-        run: |
-          git config --global core.autocrlf false
-
-      - name: Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-
-      - name: Setup Node.js environment
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version-file: .nvmrc
-          cache: npm
-
-      # No git hooks on a CI runner; `prepare` (husky) is POSIX-shell shaped anyway.
-      - name: Install dependencies
-        run: |
-          npm ci
-        env:
-          HUSKY: '0'
-
-      - name: Test
-        run: |
-          npm test
-
   package:
     # Package exactly as a release does, so packaging breakage surfaces here and not at
     # release: the engine guard, `vsce package`, and the vsix held to the .vscodeignore
@@ -163,7 +126,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        tmux: ["2.6", "3.0a", "3.4", "3.5a", "3.8"]
+        tmux: ["2.6", "3.8"]
     steps:
       - name: Checkout code
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
