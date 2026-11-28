@@ -278,7 +278,7 @@ open-remote-ssh-tmux is maintained by AI: by [developerz.ai](https://developerz.
 
 What keeps agent-written code honest is mechanical, not trust: unit TDD (~1500 tests), the real-tmux docker rig ([`test/rig/`](test/rig/), tmux 2.6, 3.0a, 3.4, 3.5a, 3.8 on every pull request), the real-VSCodium end-to-end driver ([`test/rig/edh/`](test/rig/edh/), the full acceptance matrix with no manual steps), zero-warning typed lint, a coverage ratchet and Windows/macOS unit jobs. The *why* lives in [`docs/idea/`](docs/idea/README.md); each body of work is a plan with results under [`docs/plans/`](docs/plans/).
 
-Scheduled checkups, briefs in [`.dz/schedules/`](.dz/schedules/), every Monday: `health` catches the failures nothing announces and judges the weekly release; `maintain` lands the week's upkeep (tmux rig, tool pins, docs truth) in one pull request.
+Scheduled checkups, briefs in [`.dz/schedules/`](.dz/schedules/), every Monday: `release-due` judges the weekly release; `maintain` lands the week's upkeep (tmux rig, tool pins, docs truth) in one pull request.
 
 ## Security
 

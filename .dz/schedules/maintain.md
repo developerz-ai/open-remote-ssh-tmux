@@ -2,9 +2,8 @@
 
 Fired every Monday at 08:00 UTC by `schedules: maintain` (`mode: devops`, `outcome: pr`): one task
 with a shell that delivers **at most one pull request**, or a stated reason none was owed.
-Reporting-only signals (red `main`, flaky jobs, Dependabot, upstream drift, shipped dependencies,
-acceptance freshness, the release judgement) belong to `health` (`.dz/schedules/health.md`, 07:00 UTC);
-do not repeat them here.
+The release judgement belongs to `release-due` (`.dz/schedules/release-due.md`, 07:00 UTC) and a red
+`main` to the platform's red-main ask; do not repeat them here.
 
 `CLAUDE.md` binds every change; `triage.non_goals` in `.dz/maintainer/maintainer.yml` are off limits.
 
@@ -26,7 +25,7 @@ npm ci
 ```
 
 If the newest push run of `ci-main.yml` on the `origin/main` tip did not conclude `success`, stop:
-no PR is owed, `health` files a red `main`. If an open pull request titled
+no PR is owed, the platform's red-main ask files a red `main`. If an open pull request titled
 `chore(maintain): weekly maintenance …` exists, stop: last week's run is still in review.
 
 ## Tasks, in order
@@ -43,7 +42,7 @@ bin/check
 - **Pass:** exit 0.
 - **Fail:** fix the root cause (a test that fails on `main` first, then the code), never a retry, a
   skip or a weakened assertion. If the fix is bigger than this run, stop: no PR is owed; name the
-  failure in the reason so `health`'s next run or a member can pick it up.
+  failure in the reason so a member can pick it up.
 
 ### 2. `tmux-release`: a new tmux release not in the rig
 
